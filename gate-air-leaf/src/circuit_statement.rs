@@ -416,6 +416,10 @@ pub struct GateAirStatement<Value: IValue> {
     /// (x_limbs, y_limbs) per shot (shot_id = index) for the public state boundary.
     boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     total_pc: u32,
+    /// Main-trace + program-table log sizes — needed to reproduce the DYNAMIC preprocessed column
+    /// order (pc_in_prog is sized with the main trace, so the size-sorted order depends on it).
+    main_log_size: u32,
+    program_log_size: u32,
 }
 
 impl<Value: IValue> GateAirStatement<Value> {
@@ -441,6 +445,8 @@ impl<Value: IValue> GateAirStatement<Value> {
             preprocessed_root,
             boundary,
             total_pc,
+            main_log_size,
+            program_log_size,
         }
     }
 }
@@ -458,7 +464,7 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         &self.component_log_sizes
     }
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
-        preprocessed_column_ids()
+        preprocessed_column_ids(self.main_log_size, self.program_log_size)
     }
     fn get_preprocessed_root(&self, context: &mut Context<Value>) -> HashValue<Var> {
         HashValue(

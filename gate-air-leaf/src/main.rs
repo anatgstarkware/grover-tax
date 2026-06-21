@@ -1112,24 +1112,42 @@ fn pp_id(id: &str) -> PreProcessedColumnId {
     PreProcessedColumnId { id: id.to_owned() }
 }
 
-fn preprocessed_column_ids() -> Vec<PreProcessedColumnId> {
-    // Order MUST be ascending by column size: stwo's lifted Merkle commits each tree's columns
-    // sorted by length (`sorted_by_key(|c| c.len())`), and the in-circuit verifier does NOT
-    // re-sort the preprocessed tree (only the trace/interaction trees — see
-    // get_opt_column_log_sizes_by_trace). So we list (and `extend_evals` below) them already
-    // size-sorted (stable): qdecode(2^9)×4, prog_slot(2^12), pc_in_prog(2^14), rc_lo/rc_hi(2^16)×4.
-    vec![
-        pp_id("gate_qdecode_q"),
-        pp_id("gate_qdecode_limb"),
-        pp_id("gate_qdecode_pos"),
-        pp_id("gate_qdecode_mask"),
-        pp_id("gate_prog_slot"),
-        pp_id("gate_pc_in_prog"),
-        pp_id("gate_rc_lo_pos"),
-        pp_id("gate_rc_lo_val"),
-        pp_id("gate_rc_hi_pos"),
-        pp_id("gate_rc_hi_val"),
-    ]
+/// Number of preprocessed columns (count-only uses; the order is `preprocessed_column_ids`).
+const N_PREPROCESSED_COLS: usize = 10;
+
+/// Each preprocessed column paired with its log_size, in a fixed canonical listing order, then
+/// STABLE-sorted ascending by size. The committed preprocessed tree MUST be size-sorted (stwo's
+/// lifted Merkle sorts each tree's columns by length, and the in-circuit verifier does NOT re-sort
+/// the preprocessed tree). The sizes are DYNAMIC: `gate_pc_in_prog` is sized with the main trace
+/// (`main_log_size = log_n_rows`) and `gate_prog_slot` with the program table — so when the main
+/// trace grows past the range-check tables (RC_LOG_SIZE = 16) the sort order changes (pc_in_prog
+/// moves after rc). A static order is only correct while main_log_size <= 16.
+fn preprocessed_columns_sorted(
+    main_log_size: u32,
+    program_log_size: u32,
+) -> Vec<(PreProcessedColumnId, u32)> {
+    let q = N_QUBITS.ilog2();
+    let mut cols = vec![
+        (pp_id("gate_qdecode_q"), q),
+        (pp_id("gate_qdecode_limb"), q),
+        (pp_id("gate_qdecode_pos"), q),
+        (pp_id("gate_qdecode_mask"), q),
+        (pp_id("gate_prog_slot"), program_log_size),
+        (pp_id("gate_pc_in_prog"), main_log_size),
+        (pp_id("gate_rc_lo_pos"), RC_LOG_SIZE),
+        (pp_id("gate_rc_lo_val"), RC_LOG_SIZE),
+        (pp_id("gate_rc_hi_pos"), RC_LOG_SIZE),
+        (pp_id("gate_rc_hi_val"), RC_LOG_SIZE),
+    ];
+    cols.sort_by_key(|&(_, s)| s); // stable: ties keep the listing order above
+    cols
+}
+
+fn preprocessed_column_ids(main_log_size: u32, program_log_size: u32) -> Vec<PreProcessedColumnId> {
+    preprocessed_columns_sorted(main_log_size, program_log_size)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -1180,7 +1198,7 @@ impl Components {
         // preprocessed sizes by component instead, mismatching the committed tree ("Root mismatch").
         stwo::core::air::Components {
             components: self.component_refs(),
-            n_preprocessed_columns: preprocessed_column_ids().len(),
+            n_preprocessed_columns: N_PREPROCESSED_COLS,
         }
         .column_log_sizes()
     }
@@ -1197,8 +1215,9 @@ fn build_components(
     rc_hi_sum: SecureField,
     program_sum: SecureField,
 ) -> Components {
-    let mut allocator =
-        TraceLocationAllocator::new_with_preprocessed_columns(&preprocessed_column_ids());
+    let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(
+        &preprocessed_column_ids(log_n_rows, program_log_size),
+    );
     let main = GateComponent::new(
         &mut allocator,
         GateEval {
@@ -1903,15 +1922,21 @@ fn main() -> Result<()> {
     // verifier consumes.
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed. Order MUST match preprocessed_column_ids() AND be ascending by size
-    // (the lifted Merkle commits columns sorted by length; the in-circuit verifier doesn't re-sort
-    // this tree): qdecode(2^9)×4, prog_slot(2^12), pc_in_prog(2^14), rc_lo(2^16)×2, rc_hi(2^16)×2.
+    // Tree 0: preprocessed. The committed order MUST equal preprocessed_column_ids(...) AND be
+    // ascending by size (the lifted Merkle commits columns sorted by length; the in-circuit verifier
+    // does NOT re-sort this tree). Build the columns in the SAME canonical listing order as
+    // preprocessed_columns_sorted, tag each with its size, then STABLE-sort by size — so for ANY
+    // main_log_size the committed order matches the ids (e.g. pc_in_prog moves after rc when main>16).
     let mut tree_builder = commitment_scheme.tree_builder();
-    let mut pp = generate_qdecode_preprocessed();
-    pp.push(generate_prog_slot_preprocessed(&program));
-    pp.push(generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates));
-    pp.extend(generate_rc_preprocessed(&rc_lo_index));
-    pp.extend(generate_rc_preprocessed(&rc_hi_index));
+    let qsz = N_QUBITS.ilog2();
+    let mut tagged: Vec<(u32, CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>)> =
+        generate_qdecode_preprocessed().into_iter().map(|c| (qsz, c)).collect();
+    tagged.push((program.log_size, generate_prog_slot_preprocessed(&program)));
+    tagged.push((log_n_rows, generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates)));
+    tagged.extend(generate_rc_preprocessed(&rc_lo_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
+    tagged.extend(generate_rc_preprocessed(&rc_hi_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
+    tagged.sort_by_key(|(s, _)| *s); // stable: identical key+listing order as preprocessed_columns_sorted
+    let pp: Vec<_> = tagged.into_iter().map(|(_, c)| c).collect();
     tree_builder.extend_evals(pp);
     tree_builder.commit(prover_channel);
 
@@ -2211,7 +2236,7 @@ fn main() -> Result<()> {
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
         use circuits_stark_verifier::verify::verify as circuit_verify;
 
-        let n_pp = preprocessed_column_ids().len();
+        let n_pp = N_PREPROCESSED_COLS;
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
         let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
@@ -2275,7 +2300,7 @@ fn main() -> Result<()> {
         const LOG_BLOWUP_FACTOR: u32 = 3;
         let n_leaves: usize = fold_var.parse().unwrap_or(4);
 
-        let n_pp = preprocessed_column_ids().len();
+        let n_pp = N_PREPROCESSED_COLS;
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
         let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
