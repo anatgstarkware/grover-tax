@@ -2267,8 +2267,10 @@ fn main() -> Result<()> {
         use circuits::ivalue::NoValue;
         use circuits_stark_verifier::proof::ProofConfig;
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
-        use leaf::{GateAirLeafParams, derive_aggregate_config, prove_gate_air_leaf};
-        use recursive_aggregate::{PoolSet, recursive_aggregate_prove};
+        use leaf::{GateAirLeafParams, derive_aggregate_config, leaf_pcs_config, prove_gate_air_leaf};
+        use recursive_aggregate::{
+            PoolSet, ZkBlind, prove_root_verification, recursive_aggregate_prove,
+        };
 
         const LOG_BLOWUP_FACTOR: u32 = 3;
         let n_leaves: usize = fold_var.parse().unwrap_or(4);
@@ -2328,13 +2330,28 @@ fn main() -> Result<()> {
         eprintln!("gate-air: {n_leaves} leaves proved in {:.1}s", t.elapsed().as_secs_f64());
 
         let t = Instant::now();
-        let out = recursive_aggregate_prove(leaves, &agg, &pools);
+        let out = recursive_aggregate_prove(leaves.clone(), &agg, &pools);
         eprintln!(
             "gate-air: folded to root in {:.1}s ({} levels)",
             t.elapsed().as_secs_f64(),
             out.n_levels
         );
         eprintln!("gate-air: multiverifier fold OK");
+
+        // Root verification: verify the root proof + unpack the leaf outputs, with the single
+        // zk-blinding (the only published proof). Completes the recursion pipeline.
+        let zk = ZkBlind {
+            seed: [7u8; 32],
+            n_padding: leaf_pcs_config(1, LOG_BLOWUP_FACTOR).fri_config.n_queries,
+        };
+        let t = Instant::now();
+        let rv = prove_root_verification(&out.root, &leaves, &agg, LOG_BLOWUP_FACTOR, Some(zk));
+        eprintln!(
+            "gate-air: root verification OK in {:.1}s (trace 2^{}, {} leaf outputs unpacked + zk-blinded)",
+            t.elapsed().as_secs_f64(),
+            rv.trace_log_size,
+            rv.leaf_outputs.len()
+        );
     }
 
     let proof = extended.proof;
