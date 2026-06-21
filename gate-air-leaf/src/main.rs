@@ -34,12 +34,17 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::{prove, CommitmentSchemeProver};
+use stwo::core::proof_of_work::GrindOps;
+use stwo::prover::{prove_ex, CommitmentSchemeProver};
+use circuits_stark_verifier::proof_from_stark_proof::pack_public_claim;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
     assert_constraints_on_trace, EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator,
     Relation, RelationEntry, TraceLocationAllocator,
 };
+
+// In-circuit verifier of the gate_air STARK proof (Design A, Milestone 2).
+mod circuit_statement;
 
 // ----------------------------------------------------------------------------
 // Encoding constants
@@ -59,6 +64,10 @@ const STATE_WIDTH: usize = 2 + N_LIMBS;
 // per table; we lay them out as a flat table of valid (pos,value) pairs).
 const RC_LOG_SIZE: u32 = 16; // 2^16 padded rows for each dynamic-RC table.
 
+// Interaction-trace proof-of-work bits (canonical transcript; matches the in-circuit verifier's
+// ProofConfig). Tiny grind (~2^8), present so the in-circuit verifier can replay the transcript.
+const INTERACTION_POW_BITS: u32 = 8;
+
 const NO_CTRL: u16 = 0xFFFF;
 
 const M31_MODULUS_U32: u32 = (1 << 31) - 1;
@@ -68,34 +77,50 @@ const LANE_COUNT: usize = 1 << LOG_N_LANES;
 // Relations
 // ----------------------------------------------------------------------------
 
-stwo_constraint_framework::relation!(StateElements, STATE_WIDTH);
-// q-decode membership table: (q, limb_idx, bit_pos, mask).
-stwo_constraint_framework::relation!(QDecodeElements, 4);
-// Dynamic range-check tables: (pos, value).
-stwo_constraint_framework::relation!(RangeLoElements, 2);
-stwo_constraint_framework::relation!(RangeHiElements, 2);
-// Program-consistency table: (slot/pc_in_prog, opcode_scalar, target, ctrl_a, ctrl_b).
-stwo_constraint_framework::relation!(ProgramElements, 5);
+// ONE shared LogUp relation (single drawn (z,α)). The 5 logical relations are
+// distinguished by a distinct id TAG prepended as the first tuple element — this
+// matches the in-circuit verifier's single-relation model (circuits_stark_verifier:
+// one acc.interaction_elements, relation id as a constant in the tuple). Width =
+// widest payload (state = STATE_WIDTH = 34) + 1 tag.
+const GATE_REL_WIDTH: usize = 1 + STATE_WIDTH;
+stwo_constraint_framework::relation!(GateRel, 35);
+const _: () = assert!(GATE_REL_WIDTH <= 35);
 
+// Relation id tags (distinct constants; the prover and the in-circuit verifier must agree).
+const TAG_STATE: u32 = 1;
+const TAG_QDECODE: u32 = 2;
+const TAG_RC_LO: u32 = 3;
+const TAG_RC_HI: u32 = 4;
+const TAG_PROGRAM: u32 = 5;
+
+/// All five logical relations share the SAME drawn `(z,α)`; the fields are clones of
+/// the single `GateRel`, kept under named handles for readable call sites. The tag
+/// prepended at each combine is what keeps the relations separate.
 #[derive(Clone)]
 struct LookupElements {
-    state: StateElements,
-    qdecode: QDecodeElements,
-    rc_lo: RangeLoElements,
-    rc_hi: RangeHiElements,
-    program: ProgramElements,
+    state: GateRel,
+    qdecode: GateRel,
+    rc_lo: GateRel,
+    rc_hi: GateRel,
+    program: GateRel,
 }
 
 impl LookupElements {
     fn draw(channel: &mut impl Channel) -> Self {
+        let rel = GateRel::draw(channel);
         Self {
-            state: StateElements::draw(channel),
-            qdecode: QDecodeElements::draw(channel),
-            rc_lo: RangeLoElements::draw(channel),
-            rc_hi: RangeHiElements::draw(channel),
-            program: ProgramElements::draw(channel),
+            state: rel.clone(),
+            qdecode: rel.clone(),
+            rc_lo: rel.clone(),
+            rc_hi: rel.clone(),
+            program: rel,
         }
     }
+}
+
+/// Packed tag constant for prover-side `combine` tuples.
+fn ptag(tag: u32) -> PackedM31 {
+    PackedM31::broadcast(BaseField::from_u32_unchecked(tag))
 }
 
 // ----------------------------------------------------------------------------
@@ -773,11 +798,14 @@ impl FrameworkEval for GateEval {
         }
 
         // --- State threading (telescoping). ---
-        let mut input_state = Vec::with_capacity(STATE_WIDTH);
+        let state_tag = one.clone() * BaseField::from_u32_unchecked(TAG_STATE);
+        let mut input_state = Vec::with_capacity(GATE_REL_WIDTH);
+        input_state.push(state_tag.clone());
         input_state.push(shot_id.clone());
         input_state.push(pc.clone());
         input_state.extend(in_limb.iter().cloned());
-        let mut output_state = Vec::with_capacity(STATE_WIDTH);
+        let mut output_state = Vec::with_capacity(GATE_REL_WIDTH);
+        output_state.push(state_tag);
         output_state.push(shot_id.clone());
         output_state.push(pc.clone() + one.clone());
         output_state.extend(out_limb.iter().cloned());
@@ -817,6 +845,7 @@ impl FrameworkEval for GateEval {
             + is_cnot.clone() * BaseField::from_u32_unchecked(2)
             + is_toffoli.clone() * BaseField::from_u32_unchecked(3);
         let prog_entry = [
+            one.clone() * BaseField::from_u32_unchecked(TAG_PROGRAM),
             pc_in_prog.clone(),
             opcode_scalar,
             target.q.clone(),
@@ -907,13 +936,19 @@ fn read_masks<E: EvalAtRow>(eval: &mut E) -> ReadMasks<E::F> {
 
 fn add_qdecode_lookup<E: EvalAtRow>(
     eval: &mut E,
-    elements: &QDecodeElements,
+    elements: &GateRel,
     r: &ReadMasks<E::F>,
     active: E::F,
 ) {
     // Membership of (q, limb_idx, bit_pos, mask) in the 512-row table, with
-    // multiplicity = active (0 for inactive reads => inert).
-    let entry = [r.q.clone(), r.limb_idx.clone(), r.bit_pos.clone(), r.mask.clone()];
+    // multiplicity = active (0 for inactive reads => inert). Tagged TAG_QDECODE.
+    let entry = [
+        E::F::one() * BaseField::from_u32_unchecked(TAG_QDECODE),
+        r.q.clone(),
+        r.limb_idx.clone(),
+        r.bit_pos.clone(),
+        r.mask.clone(),
+    ];
     eval.add_to_relation(RelationEntry::new(
         elements,
         E::EF::from(active),
@@ -923,13 +958,21 @@ fn add_qdecode_lookup<E: EvalAtRow>(
 
 fn add_rc_lookup<E: EvalAtRow>(
     eval: &mut E,
-    lo_elements: &RangeLoElements,
-    hi_elements: &RangeHiElements,
+    lo_elements: &GateRel,
+    hi_elements: &GateRel,
     r: &ReadMasks<E::F>,
     active: E::F,
 ) {
-    let lo_entry = [r.bit_pos.clone(), r.lo.clone()];
-    let hi_entry = [r.bit_pos.clone(), r.hi.clone()];
+    let lo_entry = [
+        E::F::one() * BaseField::from_u32_unchecked(TAG_RC_LO),
+        r.bit_pos.clone(),
+        r.lo.clone(),
+    ];
+    let hi_entry = [
+        E::F::one() * BaseField::from_u32_unchecked(TAG_RC_HI),
+        r.bit_pos.clone(),
+        r.hi.clone(),
+    ];
     eval.add_to_relation(RelationEntry::new(
         lo_elements,
         E::EF::from(active.clone()),
@@ -948,7 +991,7 @@ fn add_rc_lookup<E: EvalAtRow>(
 
 #[derive(Clone)]
 struct QDecodeTableEval {
-    elements: QDecodeElements,
+    elements: GateRel,
 }
 
 impl FrameworkEval for QDecodeTableEval {
@@ -964,10 +1007,11 @@ impl FrameworkEval for QDecodeTableEval {
         let bit_pos = eval.get_preprocessed_column(pp_id("gate_qdecode_pos"));
         let mask = eval.get_preprocessed_column(pp_id("gate_qdecode_mask"));
         let multiplicity = eval.next_trace_mask();
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_QDECODE);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
             -E::EF::from(multiplicity),
-            &[q, limb_idx, bit_pos, mask],
+            &[tag, q, limb_idx, bit_pos, mask],
         ));
         eval.finalize_logup();
         eval
@@ -976,7 +1020,7 @@ impl FrameworkEval for QDecodeTableEval {
 
 #[derive(Clone)]
 struct RcLoTableEval {
-    elements: RangeLoElements,
+    elements: GateRel,
 }
 
 impl FrameworkEval for RcLoTableEval {
@@ -990,10 +1034,11 @@ impl FrameworkEval for RcLoTableEval {
         let pos = eval.get_preprocessed_column(pp_id("gate_rc_lo_pos"));
         let val = eval.get_preprocessed_column(pp_id("gate_rc_lo_val"));
         let multiplicity = eval.next_trace_mask();
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC_LO);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
             -E::EF::from(multiplicity),
-            &[pos, val],
+            &[tag, pos, val],
         ));
         eval.finalize_logup();
         eval
@@ -1002,7 +1047,7 @@ impl FrameworkEval for RcLoTableEval {
 
 #[derive(Clone)]
 struct RcHiTableEval {
-    elements: RangeHiElements,
+    elements: GateRel,
 }
 
 impl FrameworkEval for RcHiTableEval {
@@ -1016,10 +1061,11 @@ impl FrameworkEval for RcHiTableEval {
         let pos = eval.get_preprocessed_column(pp_id("gate_rc_hi_pos"));
         let val = eval.get_preprocessed_column(pp_id("gate_rc_hi_val"));
         let multiplicity = eval.next_trace_mask();
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC_HI);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
             -E::EF::from(multiplicity),
-            &[pos, val],
+            &[tag, pos, val],
         ));
         eval.finalize_logup();
         eval
@@ -1033,7 +1079,7 @@ impl FrameworkEval for RcHiTableEval {
 #[derive(Clone)]
 struct ProgramTableEval {
     log_size: u32,
-    elements: ProgramElements,
+    elements: GateRel,
 }
 
 impl FrameworkEval for ProgramTableEval {
@@ -1050,10 +1096,11 @@ impl FrameworkEval for ProgramTableEval {
         let ctrl_a = eval.next_trace_mask();
         let ctrl_b = eval.next_trace_mask();
         let multiplicity = eval.next_trace_mask();
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_PROGRAM);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
             -E::EF::from(multiplicity),
-            &[slot, opcode_scalar, target, ctrl_a, ctrl_b],
+            &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b],
         ));
         eval.finalize_logup();
         eval
@@ -1065,17 +1112,22 @@ fn pp_id(id: &str) -> PreProcessedColumnId {
 }
 
 fn preprocessed_column_ids() -> Vec<PreProcessedColumnId> {
+    // Order MUST be ascending by column size: stwo's lifted Merkle commits each tree's columns
+    // sorted by length (`sorted_by_key(|c| c.len())`), and the in-circuit verifier does NOT
+    // re-sort the preprocessed tree (only the trace/interaction trees — see
+    // get_opt_column_log_sizes_by_trace). So we list (and `extend_evals` below) them already
+    // size-sorted (stable): qdecode(2^9)×4, prog_slot(2^12), pc_in_prog(2^14), rc_lo/rc_hi(2^16)×4.
     vec![
-        pp_id("gate_pc_in_prog"),
         pp_id("gate_qdecode_q"),
         pp_id("gate_qdecode_limb"),
         pp_id("gate_qdecode_pos"),
         pp_id("gate_qdecode_mask"),
+        pp_id("gate_prog_slot"),
+        pp_id("gate_pc_in_prog"),
         pp_id("gate_rc_lo_pos"),
         pp_id("gate_rc_lo_val"),
         pp_id("gate_rc_hi_pos"),
         pp_id("gate_rc_hi_val"),
-        pp_id("gate_prog_slot"),
     ]
 }
 
@@ -1119,11 +1171,17 @@ impl Components {
     }
 
     fn trace_log_sizes(&self) -> TreeVec<ColumnVec<u32>> {
-        TreeVec::concat_cols(
-            self.component_refs()
-                .into_iter()
-                .map(|c| c.trace_log_degree_bounds()),
-        )
+        // Use stwo's CANONICAL column sizes (not a plain component-concat). stwo's verifier
+        // reindexes the PREPROCESSED tree GLOBALLY by each component's preprocessed_column_indices
+        // (i.e. into preprocessed_column_ids() order), so the preprocessed sizes land in the
+        // committed order — which the lifted Merkle commits sorted by size and the in-circuit
+        // verifier (circuits_stark_verifier) does NOT re-sort. A naive concat would order the
+        // preprocessed sizes by component instead, mismatching the committed tree ("Root mismatch").
+        stwo::core::air::Components {
+            components: self.component_refs(),
+            n_preprocessed_columns: preprocessed_column_ids().len(),
+        }
+        .column_log_sizes()
     }
 }
 
@@ -1423,7 +1481,8 @@ fn gen_main_interaction(
 
     // Entry combiners.
     let state_in = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        let mut v = Vec::with_capacity(STATE_WIDTH);
+        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
+        v.push(ptag(TAG_STATE));
         v.push(pack(lane, |r| r.shot_id));
         v.push(pack(lane, |r| r.pc));
         for j in 0..N_LIMBS {
@@ -1432,7 +1491,8 @@ fn gen_main_interaction(
         el.state.combine(&v)
     };
     let state_out = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        let mut v = Vec::with_capacity(STATE_WIDTH);
+        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
+        v.push(ptag(TAG_STATE));
         v.push(pack(lane, |r| r.shot_id));
         v.push(pack(lane, |r| r.pc + 1));
         for j in 0..N_LIMBS {
@@ -1446,6 +1506,7 @@ fn gen_main_interaction(
 
     let qdecode = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
         el.qdecode.combine(&[
+            ptag(TAG_QDECODE),
             pack(lane, |r| sel(r).q),
             pack(lane, |r| sel(r).limb_idx),
             pack(lane, |r| sel(r).bit_pos),
@@ -1453,18 +1514,25 @@ fn gen_main_interaction(
         ])
     };
     let rc_lo = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
-        el.rc_lo
-            .combine(&[pack(lane, |r| sel(r).bit_pos), pack(lane, |r| sel(r).lo)])
+        el.rc_lo.combine(&[
+            ptag(TAG_RC_LO),
+            pack(lane, |r| sel(r).bit_pos),
+            pack(lane, |r| sel(r).lo),
+        ])
     };
     let rc_hi = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
-        el.rc_hi
-            .combine(&[pack(lane, |r| sel(r).bit_pos), pack(lane, |r| sel(r).hi)])
+        el.rc_hi.combine(&[
+            ptag(TAG_RC_HI),
+            pack(lane, |r| sel(r).bit_pos),
+            pack(lane, |r| sel(r).hi),
+        ])
     };
     // Program use-side denominator. pc_in_prog = pc mod n_gates (preprocessed in
     // the AIR; recomputed here for the prover). opcode_scalar from the one-hot.
     let ng = n_gates as u32;
     let program = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
         el.program.combine(&[
+            ptag(TAG_PROGRAM),
             pack(lane, |r| r.pc % ng),
             pack(lane, |r| r.is_not + 2 * r.is_cnot + 3 * r.is_toffoli),
             pack(lane, |r| r.target.q),
@@ -1653,17 +1721,14 @@ fn assert_table_constraints<Ev: FrameworkEval + Sync>(
 
 /// Supply-side interaction trace for a multi-column table looked up with a
 /// single relation. `combine_row(i)` returns the combined denominator for row i.
-fn gen_table_interaction<R>(
+fn gen_table_interaction(
     counts: &[u32],
     log_size: u32,
     combine_row: impl Fn(usize) -> PackedSecureField,
 ) -> (
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     SecureField,
-)
-where
-    R: Sized,
-{
+) {
     let mut gen = LogupTraceGenerator::new(log_size);
     let mut col = gen.new_col();
     for vec_row in 0..(1usize << (log_size - LOG_N_LANES)) {
@@ -1685,10 +1750,17 @@ fn public_boundary_sum(
     cases: &[TestCase],
     n_gates: usize,
     k: usize,
-    state: &StateElements,
+    state: &GateRel,
 ) -> Result<SecureField> {
     let mut sum = SecureField::zero();
     let total_pc = (n_gates * k) as u32;
+    // Tagged state tuple: [TAG_STATE, shot_id, pc, limbs...].
+    let tagged = |t: &[BaseField; STATE_WIDTH]| -> Vec<BaseField> {
+        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
+        v.push(BaseField::from_u32_unchecked(TAG_STATE));
+        v.extend_from_slice(t);
+        v
+    };
     for (shot_id, case) in cases.iter().enumerate() {
         let x = hex::decode(&case.x_hex)?;
         let y = hex::decode(&case.y_hex)?;
@@ -1696,8 +1768,8 @@ fn public_boundary_sum(
         let y_limbs = state_to_limbs(&y);
         let initial = state_tuple(shot_id as u32, 0, &x_limbs);
         let final_ = state_tuple(shot_id as u32, total_pc, &y_limbs);
-        let ci: SecureField = state.combine(&initial);
-        let cf: SecureField = state.combine(&final_);
+        let ci: SecureField = state.combine(&tagged(&initial));
+        let cf: SecureField = state.combine(&tagged(&final_));
         sum += ci.inverse() - cf.inverse();
     }
     Ok(sum)
@@ -1721,6 +1793,7 @@ fn state_tuple(shot_id: u32, pc: u32, limbs: &[u32; N_LIMBS]) -> [BaseField; STA
 fn table_public_sum<R: Relation<BaseField, SecureField>>(
     counts: &[u32],
     elements: &R,
+    tag: u32,
     row_tuple: impl Fn(usize) -> Vec<BaseField>,
 ) -> SecureField {
     let mut sum = SecureField::zero();
@@ -1728,7 +1801,9 @@ fn table_public_sum<R: Relation<BaseField, SecureField>>(
         if count == 0 {
             continue;
         }
-        let denom: SecureField = elements.combine(&row_tuple(i));
+        let mut tuple = vec![BaseField::from_u32_unchecked(tag)];
+        tuple.extend(row_tuple(i));
+        let denom: SecureField = elements.combine(&tuple);
         sum += SecureField::from(BaseField::from_u32_unchecked(count)) * denom.inverse();
     }
     -sum
@@ -1805,8 +1880,11 @@ fn main() -> Result<()> {
     }
 
     // ---- Proving ----
-    let config = PcsConfig::default();
+    let mut config = PcsConfig::default();
     let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+    // Lifted-Merkle size for the recursion-friendly proof; required by the in-circuit verifier
+    // (circuits_stark_verifier), which rejects a PcsConfig with lifting_log_size = None.
+    config.lifting_log_size = Some(max_log_size + config.fri_config.log_blowup_factor);
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -1814,20 +1892,31 @@ fn main() -> Result<()> {
     );
 
     let prover_channel = &mut Blake2sM31Channel::default();
+    // Canonical transcript (matches circuits_stark_verifier::verify replay): salt, then config.
+    let channel_salt = 0u32;
+    prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
     config.mix_into(prover_channel);
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
+    // Store polynomial coefficients so prove_ex emits the ExtendedStarkProof aux the in-circuit
+    // verifier consumes.
+    commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed. Order MUST match preprocessed_column_ids():
-    //   pc_in_prog, qdecode(4), rc_lo(2), rc_hi(2), prog_slot.
+    // Tree 0: preprocessed. Order MUST match preprocessed_column_ids() AND be ascending by size
+    // (the lifted Merkle commits columns sorted by length; the in-circuit verifier doesn't re-sort
+    // this tree): qdecode(2^9)×4, prog_slot(2^12), pc_in_prog(2^14), rc_lo(2^16)×2, rc_hi(2^16)×2.
     let mut tree_builder = commitment_scheme.tree_builder();
-    let mut pp = vec![generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates)];
-    pp.extend(generate_qdecode_preprocessed());
+    let mut pp = generate_qdecode_preprocessed();
+    pp.push(generate_prog_slot_preprocessed(&program));
+    pp.push(generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates));
     pp.extend(generate_rc_preprocessed(&rc_lo_index));
     pp.extend(generate_rc_preprocessed(&rc_hi_index));
-    pp.push(generate_prog_slot_preprocessed(&program));
     tree_builder.extend_evals(pp);
     tree_builder.commit(prover_channel);
+
+    // Public claim (empty for gate_air; the boundary is reconstructed by the verifier).
+    let public_claim = pack_public_claim(&[]);
+    prover_channel.mix_felts(&public_claim);
 
     // Tree 1: main trace + table multiplicities + program witness (op cols+mult).
     let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
@@ -1839,6 +1928,10 @@ fn main() -> Result<()> {
     tree_builder.extend_evals(main_trace);
     tree_builder.commit(prover_channel);
 
+    // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
+    let interaction_pow_nonce = SimdBackend::grind(prover_channel, INTERACTION_POW_BITS);
+    prover_channel.mix_u64(interaction_pow_nonce);
+
     // Draw relation elements.
     let elements = LookupElements::draw(prover_channel);
 
@@ -1848,8 +1941,9 @@ fn main() -> Result<()> {
     let (qdecode_interaction, qdecode_sum) = {
         let el = elements.qdecode.clone();
         let q: Vec<u32> = (0..N_QUBITS as u32).collect();
-        gen_table_interaction::<QDecodeElements>(&counts.qdecode, N_QUBITS.ilog2(), |vec_row| {
+        gen_table_interaction(&counts.qdecode, N_QUBITS.ilog2(), |vec_row| {
             el.combine(&[
+                ptag(TAG_QDECODE),
                 pack_seq(&q, vec_row),
                 pack_decode(vec_row, |qi| qubit_decode(qi as u16).0),
                 pack_decode(vec_row, |qi| qubit_decode(qi as u16).1),
@@ -1859,8 +1953,9 @@ fn main() -> Result<()> {
     };
     let (rc_lo_interaction, rc_lo_sum) = {
         let el = elements.rc_lo.clone();
-        gen_table_interaction::<RangeLoElements>(&counts.rc_lo, RC_LOG_SIZE, |vec_row| {
+        gen_table_interaction(&counts.rc_lo, RC_LOG_SIZE, |vec_row| {
             el.combine(&[
+                ptag(TAG_RC_LO),
                 pack_seq(&rc_lo_index.pos_col, vec_row),
                 pack_seq(&rc_lo_index.val_col, vec_row),
             ])
@@ -1868,8 +1963,9 @@ fn main() -> Result<()> {
     };
     let (rc_hi_interaction, rc_hi_sum) = {
         let el = elements.rc_hi.clone();
-        gen_table_interaction::<RangeHiElements>(&counts.rc_hi, RC_LOG_SIZE, |vec_row| {
+        gen_table_interaction(&counts.rc_hi, RC_LOG_SIZE, |vec_row| {
             el.combine(&[
+                ptag(TAG_RC_HI),
                 pack_seq(&rc_hi_index.pos_col, vec_row),
                 pack_seq(&rc_hi_index.val_col, vec_row),
             ])
@@ -1877,8 +1973,9 @@ fn main() -> Result<()> {
     };
     let (program_interaction, program_sum) = {
         let el = elements.program.clone();
-        gen_table_interaction::<ProgramElements>(&program.multiplicity, program.log_size, |vec_row| {
+        gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
             el.combine(&[
+                ptag(TAG_PROGRAM),
                 pack_seq(&program.slot, vec_row),
                 pack_seq(&program.opcode_scalar, vec_row),
                 pack_seq(&program.target, vec_row),
@@ -2010,7 +2107,7 @@ fn main() -> Result<()> {
     if main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum != boundary {
         bail!("main claimed sum != public boundary sum");
     }
-    let qdecode_expected = table_public_sum(&counts.qdecode, &elements.qdecode, |qi| {
+    let qdecode_expected = table_public_sum(&counts.qdecode, &elements.qdecode, TAG_QDECODE, |qi| {
         let (l, p, m) = qubit_decode(qi as u16);
         vec![
             BaseField::from_u32_unchecked(qi as u32),
@@ -2022,7 +2119,7 @@ fn main() -> Result<()> {
     if qdecode_sum != qdecode_expected {
         bail!("qdecode claimed sum mismatch");
     }
-    let rc_lo_expected = table_public_sum(&counts.rc_lo, &elements.rc_lo, |i| {
+    let rc_lo_expected = table_public_sum(&counts.rc_lo, &elements.rc_lo, TAG_RC_LO, |i| {
         vec![
             BaseField::from_u32_unchecked(rc_lo_index.pos_col[i]),
             BaseField::from_u32_unchecked(rc_lo_index.val_col[i]),
@@ -2031,7 +2128,7 @@ fn main() -> Result<()> {
     if rc_lo_sum != rc_lo_expected {
         bail!("rc_lo claimed sum mismatch");
     }
-    let rc_hi_expected = table_public_sum(&counts.rc_hi, &elements.rc_hi, |i| {
+    let rc_hi_expected = table_public_sum(&counts.rc_hi, &elements.rc_hi, TAG_RC_HI, |i| {
         vec![
             BaseField::from_u32_unchecked(rc_hi_index.pos_col[i]),
             BaseField::from_u32_unchecked(rc_hi_index.val_col[i]),
@@ -2040,7 +2137,7 @@ fn main() -> Result<()> {
     if rc_hi_sum != rc_hi_expected {
         bail!("rc_hi claimed sum mismatch");
     }
-    let program_expected = table_public_sum(&program.multiplicity, &elements.program, |i| {
+    let program_expected = table_public_sum(&program.multiplicity, &elements.program, TAG_PROGRAM, |i| {
         vec![
             BaseField::from_u32_unchecked(program.slot[i]),
             BaseField::from_u32_unchecked(program.opcode_scalar[i]),
@@ -2090,20 +2187,93 @@ fn main() -> Result<()> {
     );
 
     let prove_start = Instant::now();
-    let proof =
-        prove::<SimdBackend, Blake2sM31MerkleChannel>(&prover_refs, prover_channel, commitment_scheme)?;
+    // prove_ex (vs prove) yields the ExtendedStarkProof (proof + aux) the in-circuit verifier needs;
+    // M2a validates it via the native verify below (`extended.proof`). M2d will keep `extended`
+    // whole + align the Fiat-Shamir transcript (salt / interaction-PoW / public-claim) to the
+    // circuits_stark_verifier replay.
+    let extended = prove_ex::<SimdBackend, Blake2sM31MerkleChannel>(
+        &prover_refs,
+        prover_channel,
+        commitment_scheme,
+        false,
+    )?;
     let prove_elapsed = prove_start.elapsed();
+
+    // ---- In-circuit verification (Design A, Milestone 2), gated by GATE_AIR_INCIRCUIT ----
+    if std::env::var("GATE_AIR_INCIRCUIT").is_ok() {
+        use circuit_statement::{GateAirStatement, gate_air_components};
+        use circuits::blake::HashValue;
+        use circuits::context::{Context, TraceContext};
+        use circuits::ivalue::NoValue;
+        use circuits::ops::Guess;
+        use circuits_stark_verifier::proof::{ProofConfig, empty_proof};
+        use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
+        use circuits_stark_verifier::verify::verify as circuit_verify;
+
+        let n_pp = preprocessed_column_ids().len();
+        let cfg =
+            ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
+        let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
+        let mut boundary = Vec::with_capacity(cases.len());
+        for case in cases {
+            let x = state_to_limbs(&hex::decode(&case.x_hex)?);
+            let y = state_to_limbs(&hex::decode(&case.y_hex)?);
+            boundary.push((x, y));
+        }
+        let total_pc = (n_gates * k) as u32;
+        let claim: Vec<SecureField> = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+
+        // NoValue circuit shape (the reference the real assignment is checked against).
+        let novalue_circuit = {
+            let empty = empty_proof(&cfg);
+            let mut nv = Context::<NoValue>::default();
+            let pv = empty.guess(&mut nv);
+            let stmt = GateAirStatement::<NoValue>::new(
+                &mut nv,
+                log_n_rows,
+                program.log_size,
+                pp_root.clone(),
+                boundary.clone(),
+                total_pc,
+            );
+            circuit_verify(&mut nv, &pv, &cfg, &stmt);
+            nv.finalize(false).context.circuit
+        };
+        // Build the real assignment and check it against the NoValue shape.
+        let mut ctx = TraceContext::default();
+        let circuit_proof =
+            proof_from_stark_proof(&extended, &cfg, claim, interaction_pow_nonce, channel_salt);
+        let pv = circuit_proof.guess(&mut ctx);
+        let stmt = GateAirStatement::new(
+            &mut ctx,
+            log_n_rows,
+            program.log_size,
+            pp_root,
+            boundary,
+            total_pc,
+        );
+        circuit_verify(&mut ctx, &pv, &cfg, &stmt);
+        let ctx = ctx.finalize(true);
+        novalue_circuit.check(ctx.values()).expect("gate-air: in-circuit verify FAILED");
+        eprintln!("gate-air: in-circuit verify OK");
+    }
+
+    let proof = extended.proof;
 
     // ---- Verify ----
     let verify_start = Instant::now();
     let verifier_channel = &mut Blake2sM31Channel::default();
+    // Mirror the prover's canonical transcript exactly.
+    verifier_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
     config.mix_into(verifier_channel);
     let commitment_scheme_v = &mut CommitmentSchemeVerifier::<Blake2sM31MerkleChannel>::new(config);
     commitment_scheme_v.commit(proof.commitments[0], &sizes[0], verifier_channel);
+    verifier_channel.mix_felts(&public_claim);
     commitment_scheme_v.commit(proof.commitments[1], &sizes[1], verifier_channel);
+    verifier_channel.mix_u64(interaction_pow_nonce);
     let v_elements = LookupElements::draw(verifier_channel);
     let v_boundary = public_boundary_sum(cases, n_gates, k, &v_elements.state)?;
-    let v_qdecode = table_public_sum(&counts.qdecode, &v_elements.qdecode, |qi| {
+    let v_qdecode = table_public_sum(&counts.qdecode, &v_elements.qdecode, TAG_QDECODE, |qi| {
         let (l, p, m) = qubit_decode(qi as u16);
         vec![
             BaseField::from_u32_unchecked(qi as u32),
@@ -2112,19 +2282,19 @@ fn main() -> Result<()> {
             BaseField::from_u32_unchecked(m),
         ]
     });
-    let v_rc_lo = table_public_sum(&counts.rc_lo, &v_elements.rc_lo, |i| {
+    let v_rc_lo = table_public_sum(&counts.rc_lo, &v_elements.rc_lo, TAG_RC_LO, |i| {
         vec![
             BaseField::from_u32_unchecked(rc_lo_index.pos_col[i]),
             BaseField::from_u32_unchecked(rc_lo_index.val_col[i]),
         ]
     });
-    let v_rc_hi = table_public_sum(&counts.rc_hi, &v_elements.rc_hi, |i| {
+    let v_rc_hi = table_public_sum(&counts.rc_hi, &v_elements.rc_hi, TAG_RC_HI, |i| {
         vec![
             BaseField::from_u32_unchecked(rc_hi_index.pos_col[i]),
             BaseField::from_u32_unchecked(rc_hi_index.val_col[i]),
         ]
     });
-    let v_program = table_public_sum(&program.multiplicity, &v_elements.program, |i| {
+    let v_program = table_public_sum(&program.multiplicity, &v_elements.program, TAG_PROGRAM, |i| {
         vec![
             BaseField::from_u32_unchecked(program.slot[i]),
             BaseField::from_u32_unchecked(program.opcode_scalar[i]),
