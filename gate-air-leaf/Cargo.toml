@@ -28,3 +28,11 @@ circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6
 circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e" }
 circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e" }
 indexmap = "2"
+
+# Milestone 3: turn the verification circuit into a foldable leaf (a circuit-prover proof) and fold
+# N leaves with the multiverifier tree. Same pattern + revs as iadd-recursion (the cairo leaf-gen).
+recursive-aggregate = { path = "../../proving-utils/crates/recursive_aggregate" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e", features = ["prover"] }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e" }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0a6351e" }

@@ -45,6 +45,7 @@ use stwo_constraint_framework::{
 
 // In-circuit verifier of the gate_air STARK proof (Design A, Milestone 2).
 mod circuit_statement;
+mod leaf;
 
 // ----------------------------------------------------------------------------
 // Encoding constants
@@ -2256,6 +2257,84 @@ fn main() -> Result<()> {
         let ctx = ctx.finalize(true);
         novalue_circuit.check(ctx.values()).expect("gate-air: in-circuit verify FAILED");
         eprintln!("gate-air: in-circuit verify OK");
+    }
+
+    // ---- Multiverifier-tree integration (Milestone 3), gated by GATE_AIR_FOLD=<n_leaves> ----
+    // Prove the gate_air verification circuit as a foldable leaf and fold N of them into a root.
+    if let Ok(fold_var) = std::env::var("GATE_AIR_FOLD") {
+        use circuit_statement::gate_air_components;
+        use circuits::blake::HashValue;
+        use circuits::ivalue::NoValue;
+        use circuits_stark_verifier::proof::ProofConfig;
+        use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
+        use leaf::{GateAirLeafParams, derive_aggregate_config, prove_gate_air_leaf};
+        use recursive_aggregate::{PoolSet, recursive_aggregate_prove};
+
+        const LOG_BLOWUP_FACTOR: u32 = 3;
+        let n_leaves: usize = fold_var.parse().unwrap_or(4);
+
+        let n_pp = preprocessed_column_ids().len();
+        let cfg =
+            ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
+        let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
+        let mut boundary = Vec::with_capacity(cases.len());
+        for case in cases {
+            let x = state_to_limbs(&hex::decode(&case.x_hex)?);
+            let y = state_to_limbs(&hex::decode(&case.y_hex)?);
+            boundary.push((x, y));
+        }
+        let claim: Vec<SecureField> = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+        let params = GateAirLeafParams {
+            main_log_size: log_n_rows,
+            program_log_size: program.log_size,
+            preprocessed_root: pp_root,
+            boundary,
+            total_pc: (n_gates * k) as u32,
+        };
+
+        eprintln!("gate-air: deriving aggregate config ...");
+        let t = Instant::now();
+        let agg = derive_aggregate_config(&cfg, &params, LOG_BLOWUP_FACTOR);
+        eprintln!(
+            "gate-air: config derived in {:.1}s (target qm31_ops={})",
+            t.elapsed().as_secs_f64(),
+            agg.target_padding_sizes.qm31_ops
+        );
+
+        // Partition the machine so independent leaf proves run concurrently (POOL_THREADS sweet spot).
+        let pool_threads: usize = std::env::var("POOL_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48);
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(pool_threads);
+        let pools = PoolSet::new((cores / pool_threads).max(1), pool_threads);
+
+        eprintln!("gate-air: proving {n_leaves} leaves ...");
+        let t = Instant::now();
+        let (cfg_ref, params_ref, agg_ref) = (&cfg, &params, &agg);
+        let leaf_jobs: Vec<_> = (0..n_leaves)
+            .map(|_| {
+                let p = proof_from_stark_proof(
+                    &extended,
+                    cfg_ref,
+                    claim.clone(),
+                    interaction_pow_nonce,
+                    channel_salt,
+                );
+                move || prove_gate_air_leaf(p, cfg_ref, params_ref, agg_ref)
+            })
+            .collect();
+        let leaves = pools.map(leaf_jobs);
+        eprintln!("gate-air: {n_leaves} leaves proved in {:.1}s", t.elapsed().as_secs_f64());
+
+        let t = Instant::now();
+        let out = recursive_aggregate_prove(leaves, &agg, &pools);
+        eprintln!(
+            "gate-air: folded to root in {:.1}s ({} levels)",
+            t.elapsed().as_secs_f64(),
+            out.n_levels
+        );
+        eprintln!("gate-air: multiverifier fold OK");
     }
 
     let proof = extended.proof;
