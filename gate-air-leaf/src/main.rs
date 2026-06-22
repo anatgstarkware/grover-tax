@@ -1464,18 +1464,6 @@ fn generate_multiplicity_trace(
 // Interaction traces
 // ----------------------------------------------------------------------------
 
-fn packed_rows(rows: &[Row], padded_rows: usize, mut f: impl FnMut(usize, &[&Row; LANE_COUNT])) {
-    let pad = Row::padding();
-    let n_vec = padded_rows / LANE_COUNT;
-    for vec_row in 0..n_vec {
-        let lane: [&Row; LANE_COUNT] = std::array::from_fn(|lane| {
-            let idx = vec_row * LANE_COUNT + lane;
-            rows.get(idx).unwrap_or(&pad)
-        });
-        f(vec_row, &lane);
-    }
-}
-
 #[inline]
 fn pack(lane: &[&Row; LANE_COUNT], get: impl Fn(&Row) -> u32) -> PackedM31 {
     PackedM31::from_array(std::array::from_fn(|l| {
@@ -1576,32 +1564,52 @@ fn gen_main_interaction(
         &r.ctrl_b
     }
 
-    // Helper to write one logup column for a (+num/denom) pair of relation
-    // entries. num_i = mult_i; combined fraction = m0/d0 + m1/d1.
-    let write_pair = |gen: &mut LogupTraceGenerator,
-                          num0: &dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31,
-                          den0: &dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField,
-                          sign0: i32,
-                          num1: Option<&dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31>,
-                          den1: Option<&dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField>,
-                          sign1: i32| {
-        let mut col = gen.new_col();
-        packed_rows(rows, padded_rows, |vec_row, lane| {
-            let m0 = PackedSecureField::from(num0(lane));
-            let d0 = den0(lane);
+    // Write one logup column for a pair of relation entries: fraction = m0/d0 + m1/d1.
+    // PARALLEL over vec_rows: the per-row combine (35-element dot products) is the cost; computing
+    // the (num, den) fractions in a rayon par_iter and feeding `col_from_par_iter` fans it over all
+    // cores (the old sequential packed_rows loop ran this on one core — the trace-gen bottleneck).
+    // Generic over the closure types (not &dyn) so the Sync bound holds without lifetime grief.
+    #[allow(clippy::too_many_arguments)]
+    fn write_pair_par<N0, D0, N1, D1>(
+        gen: &mut LogupTraceGenerator,
+        rows: &[Row],
+        n_vec: usize,
+        num0: N0,
+        den0: D0,
+        sign0: i32,
+        num1: N1,
+        den1: D1,
+        sign1: i32,
+    ) where
+        N0: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
+        D0: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
+        N1: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
+        D1: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
+    {
+        use rayon::prelude::*;
+        let pad = Row::padding();
+        let col_iter = (0..n_vec).into_par_iter().map(|vec_row| {
+            let lane: [&Row; LANE_COUNT] =
+                std::array::from_fn(|l| rows.get(vec_row * LANE_COUNT + l).unwrap_or(&pad));
+            let m0 = PackedSecureField::from(num0(&lane));
             let m0 = if sign0 < 0 { -m0 } else { m0 };
-            let (num, den) = match (num1, den1) {
-                (Some(n1), Some(d1)) => {
-                    let m1 = PackedSecureField::from(n1(lane));
-                    let m1 = if sign1 < 0 { -m1 } else { m1 };
-                    let dd1 = d1(lane);
-                    (m0 * dd1 + m1 * d0, d0 * dd1)
-                }
-                _ => (m0, d0),
-            };
-            col.write_frac(vec_row, num, den);
+            let d0 = den0(&lane);
+            let m1 = PackedSecureField::from(num1(&lane));
+            let m1 = if sign1 < 0 { -m1 } else { m1 };
+            let d1 = den1(&lane);
+            (m0 * d1 + m1 * d0, d0 * d1)
         });
-        col.finalize_col();
+        gen.col_from_par_iter(col_iter);
+    }
+    let n_vec = padded_rows / LANE_COUNT;
+    let write_pair = |gen: &mut LogupTraceGenerator,
+                      num0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
+                      den0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync),
+                      sign0: i32,
+                      num1: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
+                      den1: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync),
+                      sign1: i32| {
+        write_pair_par(gen, rows, n_vec, num0, den0, sign0, num1, den1, sign1);
     };
 
     // pair0: state_in (+enabler), state_out (-enabler).
@@ -1610,8 +1618,8 @@ fn gen_main_interaction(
         &enabler,
         &state_in,
         1,
-        Some(&enabler),
-        Some(&state_out),
+        &enabler,
+        &state_out,
         -1,
     );
     // pair1: qdecode target (+enabler), qdecode ctrl_a (+a_active).
@@ -1620,8 +1628,8 @@ fn gen_main_interaction(
         &enabler,
         &|l| qdecode(l, sel_t),
         1,
-        Some(&a_active),
-        Some(&|l| qdecode(l, sel_a)),
+        &a_active,
+        &|l| qdecode(l, sel_a),
         1,
     );
     // pair2: qdecode ctrl_b (+b_active), rc_lo target (+enabler).
@@ -1630,8 +1638,8 @@ fn gen_main_interaction(
         &b_active,
         &|l| qdecode(l, sel_b),
         1,
-        Some(&enabler),
-        Some(&|l| rc_lo(l, sel_t)),
+        &enabler,
+        &|l| rc_lo(l, sel_t),
         1,
     );
     // pair3: rc_hi target (+enabler), rc_lo ctrl_a (+a_active).
@@ -1640,8 +1648,8 @@ fn gen_main_interaction(
         &enabler,
         &|l| rc_hi(l, sel_t),
         1,
-        Some(&a_active),
-        Some(&|l| rc_lo(l, sel_a)),
+        &a_active,
+        &|l| rc_lo(l, sel_a),
         1,
     );
     // pair4: rc_hi ctrl_a (+a_active), rc_lo ctrl_b (+b_active).
@@ -1650,8 +1658,8 @@ fn gen_main_interaction(
         &a_active,
         &|l| rc_hi(l, sel_a),
         1,
-        Some(&b_active),
-        Some(&|l| rc_lo(l, sel_b)),
+        &b_active,
+        &|l| rc_lo(l, sel_b),
         1,
     );
     // pair5: rc_hi ctrl_b (+b_active), program (+enabler).
@@ -1660,8 +1668,8 @@ fn gen_main_interaction(
         &b_active,
         &|l| rc_hi(l, sel_b),
         1,
-        Some(&enabler),
-        Some(&program),
+        &enabler,
+        &program,
         1,
     );
 
@@ -1910,7 +1918,12 @@ fn main() -> Result<()> {
     // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
     // the base proof passes the privacy-verifier security test. The in-circuit verifier replays this
     // exact config, so its verification circuit now reflects the real (secure) decommitment cost.
-    let config = leaf::leaf_pcs_config(max_log_size, BASE_LOG_BLOWUP_FACTOR);
+    // Base blowup is a sweep knob (env BASE_BLOWUP overrides the default const).
+    let base_blowup: u32 = std::env::var("BASE_BLOWUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BASE_LOG_BLOWUP_FACTOR);
+    let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -1933,6 +1946,7 @@ fn main() -> Result<()> {
     // does NOT re-sort this tree). Build the columns in the SAME canonical listing order as
     // preprocessed_columns_sorted, tag each with its size, then STABLE-sort by size — so for ANY
     // main_log_size the committed order matches the ids (e.g. pc_in_prog moves after rc when main>16).
+    let t_phase = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     let qsz = N_QUBITS.ilog2();
     let mut tagged: Vec<(u32, CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>)> =
@@ -1945,20 +1959,25 @@ fn main() -> Result<()> {
     let pp: Vec<_> = tagged.into_iter().map(|(_, c)| c).collect();
     tree_builder.extend_evals(pp);
     tree_builder.commit(prover_channel);
+    eprintln!("gate-air: [phase] preprocessed gen+commit {:.3}s", t_phase.elapsed().as_secs_f64());
 
     // Public claim (empty for gate_air; the boundary is reconstructed by the verifier).
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
 
     // Tree 1: main trace + table multiplicities + program witness (op cols+mult).
+    let t_phase = Instant::now();
     let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
     main_trace.extend(generate_multiplicity_trace(&counts.qdecode));
     main_trace.extend(generate_multiplicity_trace(&counts.rc_lo));
     main_trace.extend(generate_multiplicity_trace(&counts.rc_hi));
     main_trace.extend(generate_program_witness(&program));
+    eprintln!("gate-air: [phase] main_trace witness gen {:.3}s", t_phase.elapsed().as_secs_f64());
+    let t_phase = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(main_trace);
     tree_builder.commit(prover_channel);
+    eprintln!("gate-air: [phase] tree1 commit (NTT+Merkle) {:.3}s", t_phase.elapsed().as_secs_f64());
 
     // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
     let interaction_pow_nonce = SimdBackend::grind(prover_channel, INTERACTION_POW_BITS);
@@ -1968,6 +1987,7 @@ fn main() -> Result<()> {
     let elements = LookupElements::draw(prover_channel);
 
     // Interaction traces.
+    let t_phase = Instant::now();
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (qdecode_interaction, qdecode_sum) = {
@@ -2186,7 +2206,9 @@ fn main() -> Result<()> {
     let claimed_sums = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
     prover_channel.mix_felts(&claimed_sums);
 
+    eprintln!("gate-air: [phase] interaction witness gen+sumcheck {:.3}s", t_phase.elapsed().as_secs_f64());
     // Tree 2: interaction (same component order as the claimed sums).
+    let t_phase = Instant::now();
     let mut interaction = main_interaction;
     interaction.extend(qdecode_interaction);
     interaction.extend(rc_lo_interaction);
@@ -2195,6 +2217,7 @@ fn main() -> Result<()> {
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(interaction);
     tree_builder.commit(prover_channel);
+    eprintln!("gate-air: [phase] tree2 commit (NTT+Merkle) {:.3}s", t_phase.elapsed().as_secs_f64());
 
     let components = build_components(
         log_n_rows,
