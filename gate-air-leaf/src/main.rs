@@ -23,7 +23,7 @@ use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
-use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
+use stwo::core::pcs::{CommitmentSchemeVerifier, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::verify;
@@ -68,6 +68,11 @@ const RC_LOG_SIZE: u32 = 16; // 2^16 padded rows for each dynamic-RC table.
 // Interaction-trace proof-of-work bits (canonical transcript; matches the in-circuit verifier's
 // ProofConfig). Tiny grind (~2^8), present so the in-circuit verifier can replay the transcript.
 const INTERACTION_POW_BITS: u32 = 8;
+
+// Blowup factor for the BASE gate_air proof (the shard / "leaves"). The (n_queries, pow_bits) and
+// lifting are derived from this via `leaf::leaf_pcs_config` to a ~96-bit-secure config (passes the
+// privacy-verifier security test: pow + n_queries*blowup >= 96). Sweep knob: 1/2/3.
+const BASE_LOG_BLOWUP_FACTOR: u32 = 1;
 
 const NO_CTRL: u16 = 0xFFFF;
 
@@ -1900,11 +1905,12 @@ fn main() -> Result<()> {
     }
 
     // ---- Proving ----
-    let mut config = PcsConfig::default();
     let max_log_size = log_n_rows.max(RC_LOG_SIZE);
-    // Lifted-Merkle size for the recursion-friendly proof; required by the in-circuit verifier
-    // (circuits_stark_verifier), which rejects a PcsConfig with lifting_log_size = None.
-    config.lifting_log_size = Some(max_log_size + config.fri_config.log_blowup_factor);
+    // SECURE base config (~96-bit) instead of PcsConfig::default() (which is a 13-bit TOY: blowup 1,
+    // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
+    // the base proof passes the privacy-verifier security test. The in-circuit verifier replays this
+    // exact config, so its verification circuit now reflects the real (secure) decommitment cost.
+    let config = leaf::leaf_pcs_config(max_log_size, BASE_LOG_BLOWUP_FACTOR);
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
