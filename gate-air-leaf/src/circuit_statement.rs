@@ -10,7 +10,7 @@
 //! (with the public boundary `public_logup_sum`) + the verify glue follow.
 #![allow(dead_code)]
 
-use circuits::blake::HashValue;
+use circuits::blake::ReducedHashValue;
 use circuits::context::{Context, Var};
 use circuits::eval;
 use circuits::ivalue::{IValue, qm31_from_u32s};
@@ -412,7 +412,7 @@ pub struct GateAirStatement<Value: IValue> {
     components: IndexMap<&'static str, Box<dyn CircuitEval<Value>>>,
     component_log_sizes: Simd,
     /// Preprocessed-trace Merkle root (from the proof's commitments[0], via `.into()`).
-    preprocessed_root: HashValue<QM31>,
+    preprocessed_root: ReducedHashValue<QM31>,
     /// (x_limbs, y_limbs) per shot (shot_id = index) for the public state boundary.
     boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     total_pc: u32,
@@ -428,7 +428,7 @@ impl<Value: IValue> GateAirStatement<Value> {
         context: &mut Context<Value>,
         main_log_size: u32,
         program_log_size: u32,
-        preprocessed_root: HashValue<QM31>,
+        preprocessed_root: ReducedHashValue<QM31>,
         boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
         total_pc: u32,
     ) -> Self {
@@ -466,8 +466,8 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
         preprocessed_column_ids(self.main_log_size, self.program_log_size)
     }
-    fn get_preprocessed_root(&self, context: &mut Context<Value>) -> HashValue<Var> {
-        HashValue(
+    fn get_preprocessed_root(&self, context: &mut Context<Value>) -> ReducedHashValue<Var> {
+        ReducedHashValue(
             context.constant(self.preprocessed_root.0),
             context.constant(self.preprocessed_root.1),
         )

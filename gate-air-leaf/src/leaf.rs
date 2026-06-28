@@ -8,7 +8,7 @@
 //! binds the verified state boundary (x→y). The full secret-circuit `H_i = blake(H_P ‖ x ‖ y)`
 //! (folding in the program commitment `H_P`) is the next refinement.
 
-use circuits::blake::{HashValue, blake};
+use circuits::blake::{ReducedHashValue, blake2s_m31};
 use circuits::context::{Context, FinalizedContext};
 use circuits::ivalue::{IValue, NoValue, qm31_from_u32s};
 use circuits::ops::Guess;
@@ -39,7 +39,7 @@ use crate::circuit_statement::GateAirStatement;
 pub struct GateAirLeafParams {
     pub main_log_size: u32,
     pub program_log_size: u32,
-    pub preprocessed_root: HashValue<QM31>,
+    pub preprocessed_root: ReducedHashValue<QM31>,
     pub boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     pub total_pc: u32,
 }
@@ -103,7 +103,7 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
             preimage.push(context.constant(qm31_from_u32s(limb, 0, 0, 0)));
         }
     }
-    let output_hash = blake(&mut context, &preimage, 16 * preimage.len());
+    let output_hash = blake2s_m31(&mut context, &preimage, 16 * preimage.len());
     context.set_outputs(&[output_hash.0, output_hash.1]);
 
     context.finalize(false)

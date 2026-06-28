@@ -30,7 +30,15 @@ use stwo::core::verifier::verify;
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::m31::{PackedM31, LOG_N_LANES};
 use stwo::prover::backend::simd::qm31::PackedSecureField;
-use stwo::prover::backend::simd::SimdBackend;
+// Trace-gen backend: ALWAYS SimdBackend. All witness/interaction/preprocessed columns are built
+// with cheap per-element CPU column ops (`Col::set`, `BaseColumn::from_simd`, LogupTraceGenerator),
+// which require a SimdBackend-layout column. The prover backend may differ (see `ProverBackend`);
+// `to_prover` bridges trace-gen columns to the prover backend at the `extend_evals` boundary.
+use stwo::prover::backend::simd::SimdBackend as TraceBackend;
+// Prover backend (commit + prove_ex). The trace-gen and prover backends are kept as distinct
+// aliases so a pluggable (e.g. device-resident) prover backend can be swapped in without touching
+// the trace-gen code; `to_prover` bridges columns at the `extend_evals` boundary.
+use stwo::prover::backend::simd::SimdBackend as ProverBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
@@ -122,6 +130,7 @@ impl LookupElements {
             program: rel,
         }
     }
+
 }
 
 /// Packed tag constant for prover-side `combine` tuples.
@@ -1184,13 +1193,13 @@ impl Components {
         ]
     }
 
-    fn prover_refs(&self) -> Vec<&dyn stwo::prover::ComponentProver<SimdBackend>> {
+    fn prover_refs(&self) -> Vec<&dyn stwo::prover::ComponentProver<ProverBackend>> {
         vec![
-            &self.main as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.qdecode as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.rc_lo as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.rc_hi as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.program as &dyn stwo::prover::ComponentProver<SimdBackend>,
+            &self.main as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.qdecode as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.rc_lo as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.rc_hi as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.program as &dyn stwo::prover::ComponentProver<ProverBackend>,
         ]
     }
 
@@ -1354,7 +1363,7 @@ fn generate_main_trace(
     rows: &[Row],
     padded_rows: usize,
     log_n_rows: u32,
-) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     use rayon::prelude::*;
     use stwo::prover::backend::simd::column::BaseColumn;
 
@@ -1374,7 +1383,7 @@ fn generate_main_trace(
                     }))
                 })
                 .collect();
-            CircleEvaluation::<SimdBackend, _, BitReversedOrder>::new(
+            CircleEvaluation::<TraceBackend, _, BitReversedOrder>::new(
                 domain,
                 BaseColumn::from_simd(col_data),
             )
@@ -1382,17 +1391,29 @@ fn generate_main_trace(
         .collect()
 }
 
-fn col_from_values(values: &[u32]) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
+fn col_from_values(values: &[u32]) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
     let log_size = values.len().ilog2();
-    let mut col = Col::<SimdBackend, BaseField>::zeros(values.len());
+    let mut col = Col::<TraceBackend, BaseField>::zeros(values.len());
     for (i, &v) in values.iter().enumerate() {
         col.set(i, BaseField::from_u32_unchecked(v));
     }
     CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
 }
 
+/// Converts trace-gen (SimdBackend) columns to the prover backend at the `extend_evals` boundary.
+///
+/// `ProverBackend == SimdBackend`, whose columns are layout-identical to the trace-gen backend —
+/// a cheap rewrap (`CircleEvaluation::new(domain, values)`).
+fn to_prover(
+    cols: Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
+) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
+    cols.into_iter()
+        .map(|e| CircleEvaluation::new(e.domain, e.values))
+        .collect()
+}
+
 fn generate_qdecode_preprocessed(
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     let mut q = vec![0u32; N_QUBITS];
     let mut limb = vec![0u32; N_QUBITS];
     let mut pos = vec![0u32; N_QUBITS];
@@ -1414,7 +1435,7 @@ fn generate_qdecode_preprocessed(
 
 fn generate_rc_preprocessed(
     idx: &RcIndex,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     vec![col_from_values(&idx.pos_col), col_from_values(&idx.val_col)]
 }
 
@@ -1424,7 +1445,7 @@ fn generate_pc_in_prog_preprocessed(
     rows: &[Row],
     padded_rows: usize,
     n_gates: usize,
-) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
+) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
     let ng = n_gates as u32;
     let mut vals = vec![0u32; padded_rows];
     for (i, r) in rows.iter().enumerate() {
@@ -1436,7 +1457,7 @@ fn generate_pc_in_prog_preprocessed(
 /// Preprocessed slot-index column for the program table.
 fn generate_prog_slot_preprocessed(
     prog: &ProgramTable,
-) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
+) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
     col_from_values(&prog.slot)
 }
 
@@ -1444,7 +1465,7 @@ fn generate_prog_slot_preprocessed(
 /// the order ProgramTableEval reads them.
 fn generate_program_witness(
     prog: &ProgramTable,
-) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     vec![
         col_from_values(&prog.opcode_scalar),
         col_from_values(&prog.target),
@@ -1456,7 +1477,7 @@ fn generate_program_witness(
 
 fn generate_multiplicity_trace(
     counts: &[u32],
-) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     vec![col_from_values(counts)]
 }
 
@@ -1487,7 +1508,7 @@ fn gen_main_interaction(
     n_gates: usize,
     el: &LookupElements,
 ) -> (
-    ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
     SecureField,
 ) {
     let mut gen = LogupTraceGenerator::new(log_n_rows);
@@ -1673,7 +1694,10 @@ fn gen_main_interaction(
         1,
     );
 
-    gen.finalize_last()
+    // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
+    // prover backend happens later via `to_prover` at the `extend_evals` boundary.
+    let (cols, sum) = gen.finalize_last();
+    (cols, sum)
 }
 
 /// Debug-only: assert the main component's AIR constraints (algebraic + logup)
@@ -1686,7 +1710,7 @@ fn assert_main_constraints(
     log_n_rows: u32,
     n_gates: usize,
     elements: &LookupElements,
-    main_interaction: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+    main_interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
     main_sum: SecureField,
 ) {
     // Main trace columns as plain M31 vectors (circle-domain / bit-reversed
@@ -1728,9 +1752,9 @@ fn assert_main_constraints(
 /// its committed columns. Trees: `[preprocessed, multiplicity, interaction]`.
 fn assert_table_constraints<Ev: FrameworkEval + Sync>(
     log_size: u32,
-    preprocessed: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
-    multiplicity: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
-    interaction: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+    preprocessed: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    multiplicity: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
     claimed_sum: SecureField,
     eval: Ev,
 ) {
@@ -1759,7 +1783,7 @@ fn gen_table_interaction(
     log_size: u32,
     combine_row: impl Fn(usize) -> PackedSecureField,
 ) -> (
-    ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
     SecureField,
 ) {
     let mut gen = LogupTraceGenerator::new(log_size);
@@ -1772,7 +1796,10 @@ fn gen_table_interaction(
         col.write_frac(vec_row, -PackedSecureField::from(packed_counts), denom);
     }
     col.finalize_col();
-    gen.finalize_last()
+    // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
+    // prover backend happens later via `to_prover` at the `extend_evals` boundary.
+    let (cols, sum) = gen.finalize_last();
+    (cols, sum)
 }
 
 // ----------------------------------------------------------------------------
@@ -1841,6 +1868,10 @@ fn table_public_sum<R: Relation<BaseField, SecureField>>(
     }
     -sum
 }
+
+// ----------------------------------------------------------------------------
+// GPU trace-gen inputs (device path)
+// ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
 // main
@@ -1924,7 +1955,7 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(BASE_LOG_BLOWUP_FACTOR);
     let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
@@ -1936,7 +1967,7 @@ fn main() -> Result<()> {
     prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
     config.mix_into(prover_channel);
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
+        CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
     // Store polynomial coefficients so prove_ex emits the ExtendedStarkProof aux the in-circuit
     // verifier consumes.
     commitment_scheme.set_store_polynomials_coefficients();
@@ -1949,7 +1980,7 @@ fn main() -> Result<()> {
     let t_phase = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     let qsz = N_QUBITS.ilog2();
-    let mut tagged: Vec<(u32, CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>)> =
+    let mut tagged: Vec<(u32, CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>)> =
         generate_qdecode_preprocessed().into_iter().map(|c| (qsz, c)).collect();
     tagged.push((program.log_size, generate_prog_slot_preprocessed(&program)));
     tagged.push((log_n_rows, generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates)));
@@ -1957,7 +1988,7 @@ fn main() -> Result<()> {
     tagged.extend(generate_rc_preprocessed(&rc_hi_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
     tagged.sort_by_key(|(s, _)| *s); // stable: identical key+listing order as preprocessed_columns_sorted
     let pp: Vec<_> = tagged.into_iter().map(|(_, c)| c).collect();
-    tree_builder.extend_evals(pp);
+    tree_builder.extend_evals(to_prover(pp));
     tree_builder.commit(prover_channel);
     eprintln!("gate-air: [phase] preprocessed gen+commit {:.3}s", t_phase.elapsed().as_secs_f64());
 
@@ -1967,20 +1998,26 @@ fn main() -> Result<()> {
 
     // Tree 1: main trace + table multiplicities + program witness (op cols+mult).
     let t_phase = Instant::now();
-    let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
-    main_trace.extend(generate_multiplicity_trace(&counts.qdecode));
-    main_trace.extend(generate_multiplicity_trace(&counts.rc_lo));
-    main_trace.extend(generate_multiplicity_trace(&counts.rc_hi));
-    main_trace.extend(generate_program_witness(&program));
-    eprintln!("gate-air: [phase] main_trace witness gen {:.3}s", t_phase.elapsed().as_secs_f64());
-    let t_phase = Instant::now();
+    let small_main = {
+        let mut v = generate_multiplicity_trace(&counts.qdecode);
+        v.extend(generate_multiplicity_trace(&counts.rc_lo));
+        v.extend(generate_multiplicity_trace(&counts.rc_hi));
+        v.extend(generate_program_witness(&program));
+        v
+    };
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(main_trace);
+    {
+        let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+        main_trace.extend(small_main);
+        eprintln!("gate-air: [phase] main_trace witness gen {:.3}s", t_phase.elapsed().as_secs_f64());
+        tree_builder.extend_evals(to_prover(main_trace));
+    }
+    let t_phase = Instant::now();
     tree_builder.commit(prover_channel);
     eprintln!("gate-air: [phase] tree1 commit (NTT+Merkle) {:.3}s", t_phase.elapsed().as_secs_f64());
 
     // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
-    let interaction_pow_nonce = SimdBackend::grind(prover_channel, INTERACTION_POW_BITS);
+    let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
     prover_channel.mix_u64(interaction_pow_nonce);
 
     // Draw relation elements.
@@ -2207,15 +2244,23 @@ fn main() -> Result<()> {
     prover_channel.mix_felts(&claimed_sums);
 
     eprintln!("gate-air: [phase] interaction witness gen+sumcheck {:.3}s", t_phase.elapsed().as_secs_f64());
-    // Tree 2: interaction (same component order as the claimed sums).
+    // Tree 2: interaction (same component order as the claimed sums). The 24 main-interaction columns
+    // come first, then the four small table interactions (always CPU-built + uploaded). Under the GPU
+    // path the main columns are already device-resident; the CPU columns are converted via `to_prover`.
     let t_phase = Instant::now();
-    let mut interaction = main_interaction;
-    interaction.extend(qdecode_interaction);
-    interaction.extend(rc_lo_interaction);
-    interaction.extend(rc_hi_interaction);
-    interaction.extend(program_interaction);
+    let small_interaction = {
+        let mut v = qdecode_interaction;
+        v.extend(rc_lo_interaction);
+        v.extend(rc_hi_interaction);
+        v.extend(program_interaction);
+        v
+    };
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(interaction);
+    {
+        let mut interaction = main_interaction;
+        interaction.extend(small_interaction);
+        tree_builder.extend_evals(to_prover(interaction));
+    }
     tree_builder.commit(prover_channel);
     eprintln!("gate-air: [phase] tree2 commit (NTT+Merkle) {:.3}s", t_phase.elapsed().as_secs_f64());
 
@@ -2246,7 +2291,7 @@ fn main() -> Result<()> {
     // M2a validates it via the native verify below (`extended.proof`). M2d will keep `extended`
     // whole + align the Fiat-Shamir transcript (salt / interaction-PoW / public-claim) to the
     // circuits_stark_verifier replay.
-    let extended = prove_ex::<SimdBackend, Blake2sM31MerkleChannel>(
+    let extended = prove_ex::<ProverBackend, Blake2sM31MerkleChannel>(
         &prover_refs,
         prover_channel,
         commitment_scheme,
@@ -2257,7 +2302,7 @@ fn main() -> Result<()> {
     // ---- In-circuit verification (Design A, Milestone 2), gated by GATE_AIR_INCIRCUIT ----
     if std::env::var("GATE_AIR_INCIRCUIT").is_ok() {
         use circuit_statement::{GateAirStatement, gate_air_components};
-        use circuits::blake::HashValue;
+        use circuits::blake::ReducedHashValue;
         use circuits::context::{Context, TraceContext};
         use circuits::ivalue::NoValue;
         use circuits::ops::Guess;
@@ -2268,7 +2313,7 @@ fn main() -> Result<()> {
         let n_pp = N_PREPROCESSED_COLS;
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
-        let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
+        let pp_root: ReducedHashValue<SecureField> = extended.proof.commitments[0].into();
         let mut boundary = Vec::with_capacity(cases.len());
         for case in cases {
             let x = state_to_limbs(&hex::decode(&case.x_hex)?);
@@ -2317,7 +2362,7 @@ fn main() -> Result<()> {
     // Prove the gate_air verification circuit as a foldable leaf and fold N of them into a root.
     if let Ok(fold_var) = std::env::var("GATE_AIR_FOLD") {
         use circuit_statement::gate_air_components;
-        use circuits::blake::HashValue;
+        use circuits::blake::ReducedHashValue;
         use circuits::ivalue::NoValue;
         use circuits_stark_verifier::proof::ProofConfig;
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
@@ -2332,7 +2377,7 @@ fn main() -> Result<()> {
         let n_pp = N_PREPROCESSED_COLS;
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
-        let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
+        let pp_root: ReducedHashValue<SecureField> = extended.proof.commitments[0].into();
         let mut boundary = Vec::with_capacity(cases.len());
         for case in cases {
             let x = state_to_limbs(&hex::decode(&case.x_hex)?);
