@@ -35,10 +35,16 @@ use stwo::prover::backend::simd::qm31::PackedSecureField;
 // which require a SimdBackend-layout column. The prover backend may differ (see `ProverBackend`);
 // `to_prover` bridges trace-gen columns to the prover backend at the `extend_evals` boundary.
 use stwo::prover::backend::simd::SimdBackend as TraceBackend;
-// Prover backend (commit + prove_ex). The trace-gen and prover backends are kept as distinct
-// aliases so a pluggable (e.g. device-resident) prover backend can be swapped in without touching
-// the trace-gen code; `to_prover` bridges columns at the `extend_evals` boundary.
+// Prover backend (commit + prove_ex): SimdBackend by default; obelyzk GpuBackend under `gpu`
+// (model A: CPU trace-gen, GPU commit+prove_ex); device-resident CudaBackend under `cuda`.
+// SimdBackend/GpuBackend share trace-gen's column layout (rewrap is identity/transmute-compatible);
+// CudaBackend stores device columns, so `to_prover` performs a real host->device upload.
+#[cfg(not(any(feature = "gpu", feature = "cuda")))]
 use stwo::prover::backend::simd::SimdBackend as ProverBackend;
+#[cfg(all(feature = "gpu", not(feature = "cuda")))]
+use stwo::prover::backend::gpu::GpuBackend as ProverBackend;
+#[cfg(feature = "cuda")]
+use stwo::prover::backend::CudaBackend as ProverBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
@@ -53,6 +59,8 @@ use stwo_constraint_framework::{
 
 // In-circuit verifier of the gate_air STARK proof (Design A, Milestone 2).
 mod circuit_statement;
+#[cfg(feature = "gpu")]
+mod gpu_tracegen;
 mod leaf;
 
 // ----------------------------------------------------------------------------
@@ -131,6 +139,19 @@ impl LookupElements {
         }
     }
 
+    /// Fixed challenges for byte-identity tests (mirrors `draw`: one `GateRel` shared
+    /// across all five relations). Used by the K4 GPU interaction validation.
+    #[cfg(feature = "gpu-cuda")]
+    fn dummy() -> Self {
+        let rel = GateRel::dummy();
+        Self {
+            state: rel.clone(),
+            qdecode: rel.clone(),
+            rc_lo: rel.clone(),
+            rc_hi: rel.clone(),
+            program: rel,
+        }
+    }
 }
 
 /// Packed tag constant for prover-side `combine` tuples.
@@ -1402,13 +1423,30 @@ fn col_from_values(values: &[u32]) -> CircleEvaluation<TraceBackend, BaseField, 
 
 /// Converts trace-gen (SimdBackend) columns to the prover backend at the `extend_evals` boundary.
 ///
-/// `ProverBackend == SimdBackend`, whose columns are layout-identical to the trace-gen backend —
-/// a cheap rewrap (`CircleEvaluation::new(domain, values)`).
+/// * default / `gpu`: `ProverBackend == SimdBackend`, or obelyzk `GpuBackend` whose columns are
+///   layout-identical to SimdBackend — a cheap rewrap (`CircleEvaluation::new(domain, values)`).
+/// * `cuda`: `ProverBackend == CudaBackend` with device-resident `BaseFieldVec` columns; copy each
+///   column's host values into a device column via `FromIterator<BaseField> for BaseFieldVec`
+///   (`to_cpu()` is a no-op on SimdBackend host data, then `.collect()` uploads to the device).
+#[cfg(not(feature = "cuda"))]
 fn to_prover(
     cols: Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
 ) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
     cols.into_iter()
         .map(|e| CircleEvaluation::new(e.domain, e.values))
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn to_prover(
+    cols: Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
+) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
+    cols.into_iter()
+        .map(|e| {
+            let domain = e.domain;
+            let values: Col<ProverBackend, BaseField> = e.values.to_cpu().into_iter().collect();
+            CircleEvaluation::new(domain, values)
+        })
         .collect()
 }
 
@@ -1873,6 +1911,33 @@ fn table_public_sum<R: Relation<BaseField, SecureField>>(
 // GPU trace-gen inputs (device path)
 // ----------------------------------------------------------------------------
 
+/// Flatten the host-side inputs the K1/K4 device kernels consume: the gate list
+/// (opcode, target, ctrl_a, ctrl_b per gate), each shot's initial 32-limb state,
+/// and the RcIndex lo/hi offsets. Mirrors the prep in `gpu_tracegen::k1_byte_identity`.
+#[cfg(feature = "cuda")]
+fn gpu_flat_inputs(
+    gates: &[Gate],
+    cases: &[TestCase],
+    rc_lo_index: &RcIndex,
+    rc_hi_index: &RcIndex,
+) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
+    let mut gates_flat = Vec::with_capacity(gates.len() * 4);
+    for g in gates {
+        gates_flat.push(g.opcode as u32);
+        gates_flat.push(g.target as u32);
+        gates_flat.push(g.ctrl_a as u32);
+        gates_flat.push(g.ctrl_b as u32);
+    }
+    let mut x_states = Vec::with_capacity(cases.len() * N_LIMBS);
+    for c in cases {
+        let bytes = hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
+        x_states.extend_from_slice(&state_to_limbs(&bytes));
+    }
+    let off_lo: Vec<u32> = (0..LIMB_BITS).map(|p| rc_lo_index.offset[p] as u32).collect();
+    let off_hi: Vec<u32> = (0..LIMB_BITS).map(|p| rc_hi_index.offset[p] as u32).collect();
+    Ok((gates_flat, x_states, off_lo, off_hi))
+}
+
 // ----------------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------------
@@ -1996,6 +2061,13 @@ fn main() -> Result<()> {
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
 
+    // Under `cuda`, the dominant trees (main + interaction) are generated ON the GPU and handed to
+    // the CudaBackend commit device-to-device (no host upload), UNLESS GATE_AIR_CPU_TRACEGEN=1 forces
+    // the legacy CPU-build + upload path. The small columns (multiplicity / program witness / table
+    // interactions / preprocessed) always stay on the CPU-generate + upload path.
+    #[cfg(feature = "cuda")]
+    let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
+
     // Tree 1: main trace + table multiplicities + program witness (op cols+mult).
     let t_phase = Instant::now();
     let small_main = {
@@ -2006,6 +2078,26 @@ fn main() -> Result<()> {
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
+    #[cfg(feature = "cuda")]
+    if gpu_tracegen {
+        // Device K1: 191 main columns generated on the GPU, fed in as device-resident BaseFieldVecs.
+        let (gates_flat, x_states, off_lo, off_hi) =
+            gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_hi_index)?;
+        let (mut main_dev, _qd, _lo, _hi) = gpu_tracegen::gpu_gen_main_trace_device(
+            &gates_flat, &x_states, &off_lo, &off_hi,
+            k as u32, n_gates as u32, samples as u32, padded_rows, log_n_rows,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        main_dev.extend(to_prover(small_main));
+        eprintln!("gate-air: [phase] main_trace witness gen (GPU K1) {:.3}s", t_phase.elapsed().as_secs_f64());
+        tree_builder.extend_evals(main_dev);
+    } else {
+        let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+        main_trace.extend(small_main);
+        eprintln!("gate-air: [phase] main_trace witness gen (CPU) {:.3}s", t_phase.elapsed().as_secs_f64());
+        tree_builder.extend_evals(to_prover(main_trace));
+    }
+    #[cfg(not(feature = "cuda"))]
     {
         let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
         main_trace.extend(small_main);
@@ -2023,8 +2115,51 @@ fn main() -> Result<()> {
     // Draw relation elements.
     let elements = LookupElements::draw(prover_channel);
 
+    // Install gate_air's drawn LogUp challenges for the GPU constraint kernel (gate_air-specific
+    // hook: the (z, alpha) live inside the opaque GateEval, which the generic ComponentProver can't
+    // reach). No-op unless the kernel gate (CUDA_GPU_CONSTRAINTS=1 + gate_air main) fires.
+    #[cfg(feature = "cuda")]
+    {
+        // Install the downstream gate_air GPU constraint kernel into the generic CudaBackend prover,
+        // then thread the drawn (z, alpha) challenges to it.
+        gate_air_cuda_kernel::register();
+        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.state);
+        gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
+    }
+
     // Interaction traces.
     let t_phase = Instant::now();
+    // Device K4 (under `cuda`, unless GATE_AIR_CPU_TRACEGEN): the 24 main-interaction columns are
+    // generated on the GPU using the REAL drawn `elements` and handed to the commit device-resident
+    // (no upload); `claimed_sum` becomes `main_sum`. `main_interaction` (CPU SimdBackend cols) is
+    // only materialized on the CPU path or when GATE_AIR_ASSERT needs it for `assert_main_constraints`.
+    #[cfg(feature = "cuda")]
+    let main_interaction_device = if gpu_tracegen {
+        let (gates_flat, x_states, off_lo, off_hi) =
+            gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_hi_index)?;
+        let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
+            &gates_flat, &x_states, &off_lo, &off_hi,
+            k as u32, n_gates as u32, samples as u32, padded_rows, log_n_rows, &elements,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        Some((cols, claimed))
+    } else {
+        None
+    };
+    #[cfg(feature = "cuda")]
+    let (main_interaction, main_sum) = if let Some((_, claimed)) = &main_interaction_device {
+        // GPU path: skip CPU interaction gen (the dominant cost); claimed_sum == CPU main_sum.
+        // Only build CPU cols if GATE_AIR_ASSERT needs them for the on-trace constraint check.
+        let cpu_cols = if std::env::var("GATE_AIR_ASSERT").is_ok() {
+            gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements).0
+        } else {
+            Vec::new()
+        };
+        (cpu_cols, *claimed)
+    } else {
+        gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements)
+    };
+    #[cfg(not(feature = "cuda"))]
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (qdecode_interaction, qdecode_sum) = {
@@ -2256,6 +2391,17 @@ fn main() -> Result<()> {
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
+    #[cfg(feature = "cuda")]
+    if let Some((main_dev, _)) = main_interaction_device {
+        let mut interaction = main_dev;
+        interaction.extend(to_prover(small_interaction));
+        tree_builder.extend_evals(interaction);
+    } else {
+        let mut interaction = main_interaction;
+        interaction.extend(small_interaction);
+        tree_builder.extend_evals(to_prover(interaction));
+    }
+    #[cfg(not(feature = "cuda"))]
     {
         let mut interaction = main_interaction;
         interaction.extend(small_interaction);

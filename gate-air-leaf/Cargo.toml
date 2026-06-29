@@ -36,3 +36,35 @@ circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev 
 circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "041ec6101ba782aa00e325433929cda6ef15c1b9" }
 circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "041ec6101ba782aa00e325433929cda6ef15c1b9" }
 circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "041ec6101ba782aa00e325433929cda6ef15c1b9" }
+
+# Device-resident gate_air GPU constraint kernel (registers into the generic CudaBackend prover).
+gate-air-cuda-kernel = { path = "../gate-air-cuda-kernel", optional = true }
+
+[features]
+# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs, via cudarc/NVRTC). `gpu` is the module gate;
+# `gpu-cuda` adds the cudarc runtime (GPU box).
+gpu = []
+gpu-cuda = ["gpu", "dep:cudarc"]
+# Device-resident CUDA prover backend: swaps ProverBackend -> CudaBackend (commit + prove_ex on the
+# device) and installs the gate_air constraint kernel. Pulls gpu-cuda for the K1/K4 trace-gen glue.
+cuda = [
+    "stwo/cuda",
+    "stwo-constraint-framework/cuda",
+    "gpu-cuda",
+    "dep:gate-air-cuda-kernel",
+    "gate-air-cuda-kernel/cuda",
+]
+
+# cudarc for the K1/K4 trace-gen launch glue (gpu_tracegen.rs). MUST match stwo's cudarc (0.11).
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
+
+# Redirect the git stwo (and constraint-framework) to the GENERIC device-resident CUDA backend
+# (same rev 74951f79 + the CudaBackend). circuits@041ec610 + recursive-aggregate share the same
+# stwo, so type identity holds. Without --features cuda this is byte-identical to upstream 74951f79.
+[patch."https://github.com/starkware-libs/stwo"]
+stwo = { path = "../../stwo-cuda-backend/crates/stwo" }
+stwo-constraint-framework = { path = "../../stwo-cuda-backend/crates/constraint-framework" }

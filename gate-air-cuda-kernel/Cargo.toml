@@ -1,0 +1,20 @@
+[package]
+name = "gate-air-cuda-kernel"
+version = "0.1.0"
+edition = "2021"
+# Device-resident gate_air constraint kernel: the per-AIR CUDA kernel + the registration hook that
+# installs it into the generic stwo CudaBackend prover (stwo-cuda-backend). Compiled only under
+# `--features cuda`; the .cu native build needs nvcc (GPU box).
+
+[features]
+default = []
+cuda = ["stwo/cuda", "stwo-constraint-framework/cuda"]
+
+[dependencies]
+# Same git rev as gate-air-leaf so the workspace `[patch]` (-> stwo-cuda-backend) unifies the types.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover", "parallel"] }
+# No build script: the gate_air CUDA kernel (evaluate_gate_air.cu + gate_air_entry.cu) is co-compiled
+# into the generic libstwo_cuda (stwo-cuda-backend cmake), so its device code device-links with
+# fields/evaluate_common. The `evaluate_gate_air_entry` symbol resolves from libstwo_cuda (linked via
+# `stwo`) at the leaf's final link; this crate only declares the FFI + registers the Rust hook.
