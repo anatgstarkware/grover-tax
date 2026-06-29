@@ -18,6 +18,9 @@ num-traits = "0.2"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+# CPU-vs-GPU full-proof byte-identity fingerprint (GATE_AIR_PROOF_HASH): stable SHA-256 over the
+# serde-serialized StarkProof.
+sha2 = "0.10"
 
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover"] }
 stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover", "parallel"] }

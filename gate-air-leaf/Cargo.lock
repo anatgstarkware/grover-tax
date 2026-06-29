@@ -1090,6 +1090,7 @@ dependencies = [
  "recursive-aggregate",
  "serde",
  "serde_json",
+ "sha2",
  "stwo",
  "stwo-constraint-framework",
 ]

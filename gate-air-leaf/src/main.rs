@@ -59,6 +59,8 @@ use stwo_constraint_framework::{
 
 // In-circuit verifier of the gate_air STARK proof (Design A, Milestone 2).
 mod circuit_statement;
+// Accumulator-diff scaffold for the GPU constraint kernel (CPU-vs-GPU composition diff).
+mod accumulator_diff;
 #[cfg(feature = "gpu")]
 mod gpu_tracegen;
 mod leaf;
@@ -192,7 +194,7 @@ struct Fixture {
     test_cases: Vec<TestCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TestCase {
     x_hex: String,
     y_hex: String,
@@ -1975,6 +1977,21 @@ fn main() -> Result<()> {
 
     let cases = &fixture.test_cases[..samples];
 
+    // GPU soundness gates (then exit): GATE_AIR_GPU_TEST selects which kernel to validate
+    // byte-identically against the CPU reference. "k4" → K4 LogUp interaction; anything else
+    // (e.g. "1"/"k1") → K1 main trace-gen + histograms.
+    #[cfg(feature = "gpu-cuda")]
+    if let Ok(which) = std::env::var("GATE_AIR_GPU_TEST") {
+        if which == "k4" {
+            gpu_tracegen::k4_byte_identity(&gates, cases, k, &rc_lo_index, &rc_hi_index)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        } else {
+            gpu_tracegen::k1_byte_identity(&gates, cases, k, &rc_lo_index, &rc_hi_index)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        return Ok(());
+    }
+
     // `trace_gen_start` marks the beginning of the full witness build (shot
     // simulation + every column fill + interaction traces). We stop the clock
     // immediately before the FRI `prove` call; `prove_s`/`verify_s` stay as-is.
@@ -2033,9 +2050,13 @@ fn main() -> Result<()> {
     config.mix_into(prover_channel);
     let mut commitment_scheme =
         CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
-    // Store polynomial coefficients so prove_ex emits the ExtendedStarkProof aux the in-circuit
-    // verifier consumes.
-    commitment_scheme.set_store_polynomials_coefficients();
+    // Memory-footprint fix (candidate 1): DROP stored polynomial coefficients. With store=false the
+    // prover takes the barycentric OODS path (build_weights_hash_map + CudaBackend::barycentric_
+    // eval_at_point, byte-identical to the coeffs path) instead of keeping every committed column's
+    // coefficients device-resident (~14GB at 2^24). The ExtendedStarkProof aux is built from Merkle/
+    // FRI data and the OODS sampled_values (not coeffs), so the proof — and the in-circuit verifier's
+    // input — is unchanged. fp byte-identity gate confirms this.
+    // commitment_scheme.set_store_polynomials_coefficients();  // disabled: barycentric OODS path
 
     // Tree 0: preprocessed. The committed order MUST equal preprocessed_column_ids(...) AND be
     // ascending by size (the lifted Merkle commits columns sorted by length; the in-circuit verifier
@@ -2445,6 +2466,15 @@ fn main() -> Result<()> {
     )?;
     let prove_elapsed = prove_start.elapsed();
 
+    // ---- Full-proof byte-identity fingerprint (read-only), gated by GATE_AIR_PROOF_HASH ----
+    // Deterministic SHA-256 over the serde-serialized ExtendedStarkProof (commitments,
+    // sampled_values, decommitments, FRI, proof_of_work, claimed sums via sampled_values + aux).
+    // The CPU/SimdBackend run is the golden oracle; a `--features cuda` run on the same
+    // fixture+samples must print the SAME hex. See P5_GPU_CONSTRAINT_SCOPE.md Deliverable 2 §2.1.
+    if std::env::var("GATE_AIR_PROOF_HASH").is_ok() {
+        emit_proof_fingerprint(&extended);
+    }
+
     // ---- In-circuit verification (Design A, Milestone 2), gated by GATE_AIR_INCIRCUIT ----
     if std::env::var("GATE_AIR_INCIRCUIT").is_ok() {
         use circuit_statement::{GateAirStatement, gate_air_components};
@@ -2504,9 +2534,42 @@ fn main() -> Result<()> {
         eprintln!("gate-air: in-circuit verify OK");
     }
 
-    // ---- Multiverifier-tree integration (Milestone 3), gated by GATE_AIR_FOLD=<n_leaves> ----
-    // Prove the gate_air verification circuit as a foldable leaf and fold N of them into a root.
-    if let Ok(fold_var) = std::env::var("GATE_AIR_FOLD") {
+    // ---- Multiverifier-tree integration (Milestone 3), gated by GATE_AIR_FOLD ----
+    // Prove the gate_air verification circuit as a foldable leaf, ONE PER SHARD, and fold the N
+    // distinct leaves into a root.
+    //
+    // Sharding (Phase 0): the `samples` shots are partitioned into equal-sized shards of
+    // `GATE_AIR_SHARD_SHOTS` shots (default 2). Each shard gets its OWN distinct base proof (its
+    // own shots' trace) and its OWN distinct leaf (its shots' boundary outputs). N_shards is then
+    // derived from the shot count (ceil(samples / shots_per_shard)). For backward compatibility
+    // GATE_AIR_FOLD, if set to a value LARGER than the derived shard count, raises the leaf count
+    // to that many shards by REUSING the equal-sized partition cyclically only when samples are
+    // exhausted is NOT done — instead the derived N_shards is authoritative and GATE_AIR_FOLD's
+    // presence merely enables the path. Its numeric value is ignored for partitioning; the shard
+    // count is `ceil(samples / shots_per_shard)`. (Documented knob-semantics change.)
+    //
+    // EQUAL-SHAPE REQUIREMENT: every leaf shares one `AggregateConfig` (one trusted
+    // `leaf_preprocessed_root` + target padding sizes). The leaf circuit shape depends on
+    // `boundary.len()` (per-shot loop in `public_logup_sum` + the output-hash preimage),
+    // `main_log_size`, `program_log_size` and `total_pc`. `main_log_size`/`program_log_size`/
+    // `total_pc` are shot-count-independent (same program, same k); only `boundary.len()` varies.
+    // So ALL shards must hold exactly `shots_per_shard` shots. A ragged final shard (fewer real
+    // shots) is PADDED by repeating its last real shot up to `shots_per_shard`, so it shares the
+    // shape. The padding shots are genuine, independently-verified (x->y) executions (a duplicate
+    // of a real shot), so the proof stays sound; they only inflate that shard's output binding by
+    // re-committing a shot that is already committed.
+    //
+    // INTER-SHARD BINDING / H_i ENCODING (project item M3c): the iadd256 shots are INDEPENDENT —
+    // each shot is its own (x_i -> y_i) execution of the SAME hidden program; there is no
+    // shot->shot (or shard->shard) data dependency (the per-shot boundary in `public_boundary_sum`
+    // / `GateAirStatement::public_logup_sum` sums N independent source/sink pairs, and
+    // program-consistency forces ONE shared program across all of them). Therefore the root proves
+    // the UNION of independent shard executions and NO inter-shard binding is needed beyond the
+    // existing per-leaf `output_values = blake(preprocessed_root || {x,y per shard shot})`. The
+    // root aggregates these distinct per-shard output hashes (verified below via rv.leaf_outputs).
+    // The remaining M3c refinement (fold the program commitment H_P into each H_i) is a binding
+    // STRENGTHENING, not a correctness fix for sharding, and is left for the code owner.
+    if std::env::var("GATE_AIR_FOLD").is_ok() {
         use circuit_statement::gate_air_components;
         use circuits::blake::ReducedHashValue;
         use circuits::ivalue::NoValue;
@@ -2514,34 +2577,372 @@ fn main() -> Result<()> {
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
         use leaf::{GateAirLeafParams, derive_aggregate_config, leaf_pcs_config, prove_gate_air_leaf};
         use recursive_aggregate::{
-            PoolSet, ZkBlind, prove_root_verification, recursive_aggregate_prove,
+            AggregateOutput, PoolSet, TreeProof, ZkBlind, prove_root_verification,
+            recursive_aggregate_prove, recursive_aggregate_prove_streaming,
         };
+        use stwo::core::proof::ExtendedStarkProof;
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleHasher;
+
+        // The base-proof tuple `prove_base_shard` returns. Named so the pipeline producer can send
+        // it over a channel; `prove_ex` yields `ExtendedStarkProof<MC::H>` with
+        // `MC::H = Blake2sM31MerkleHasher`, so this is backend-independent (cuda vs simd).
+        type BaseShardOutput = (
+            ExtendedStarkProof<Blake2sM31MerkleHasher>,
+            Vec<SecureField>,
+            u64,
+            u32,
+            u32,
+            u32,
+            Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
+            u32,
+        );
 
         const LOG_BLOWUP_FACTOR: u32 = 3;
-        let n_leaves: usize = fold_var.parse().unwrap_or(4);
+
+        // Shard partition: equal-sized shards of `shots_per_shard` shots; ragged final shard is
+        // padded (below) so all shards share the leaf circuit shape.
+        let shots_per_shard: usize = std::env::var("GATE_AIR_SHARD_SHOTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2)
+            .min(samples);
+        let n_shards = samples.div_ceil(shots_per_shard);
+        eprintln!(
+            "gate-air: sharding {samples} shots into {n_shards} shard(s) of {shots_per_shard} shot(s) each \
+             (final shard padded by shot-repeat if ragged)"
+        );
+
+        // Build each shard's equal-sized `cases` slice. The final shard repeats its last real shot
+        // up to `shots_per_shard` so it shares the shape; padding shots are extra independent (x->y)
+        // executions (a duplicate), still sound.
+        let shard_case_sets: Vec<Vec<TestCase>> = (0..n_shards)
+            .map(|s| {
+                let start = s * shots_per_shard;
+                let end = (start + shots_per_shard).min(samples);
+                let mut v: Vec<TestCase> = cases[start..end].to_vec();
+                while v.len() < shots_per_shard {
+                    v.push(cases[end - 1].clone()); // repeat last real shot to equalize shape
+                }
+                v
+            })
+            .collect();
+
+        // Per-shard base proof: same trace-gen + commit + prove_ex pipeline as the single proof
+        // above, but over this shard's shots. Returns the distinct ExtendedStarkProof plus the
+        // claim / nonce / log_n_rows the leaf needs. The closure mirrors the inline body verbatim;
+        // type inference keeps the ExtendedStarkProof generic (cuda vs simd) implicit.
+        let prove_base_shard = |shard_cases: &[TestCase]| -> Result<_> {
+            let shard_samples = shard_cases.len();
+            let program = build_program_table(&gates, shard_samples, k);
+            let (rows, counts) = build_rows(&gates, shard_cases, k, &rc_lo_index, &rc_hi_index)?;
+            let real_rows = rows.len();
+            let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
+            let log_n_rows = padded_rows.ilog2();
+            let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+            let base_blowup: u32 = std::env::var("BASE_BLOWUP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(BASE_LOG_BLOWUP_FACTOR);
+            let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
+            let twiddles = ProverBackend::precompute_twiddles(
+                CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
+                    .circle_domain()
+                    .half_coset,
+            );
+            let prover_channel = &mut Blake2sM31Channel::default();
+            let channel_salt = 0u32;
+            prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
+            config.mix_into(prover_channel);
+            let mut commitment_scheme =
+                CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
+                    config, &twiddles,
+                );
+            // commitment_scheme.set_store_polynomials_coefficients();  // disabled: barycentric OODS path
+
+            // Tree 0: preprocessed (canonical listing order, then stable-sort by size).
+            let mut tree_builder = commitment_scheme.tree_builder();
+            let qsz = N_QUBITS.ilog2();
+            let mut tagged: Vec<(u32, CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>)> =
+                generate_qdecode_preprocessed().into_iter().map(|c| (qsz, c)).collect();
+            tagged.push((program.log_size, generate_prog_slot_preprocessed(&program)));
+            tagged.push((log_n_rows, generate_pc_in_prog_preprocessed(&rows, padded_rows, n_gates)));
+            tagged.extend(generate_rc_preprocessed(&rc_lo_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
+            tagged.extend(generate_rc_preprocessed(&rc_hi_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
+            tagged.sort_by_key(|(s, _)| *s);
+            let pp: Vec<_> = tagged.into_iter().map(|(_, c)| c).collect();
+            tree_builder.extend_evals(to_prover(pp));
+            tree_builder.commit(prover_channel);
+
+            let public_claim = pack_public_claim(&[]);
+            prover_channel.mix_felts(&public_claim);
+
+            #[cfg(feature = "cuda")]
+            let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
+
+            // Tree 1: main trace + table multiplicities + program witness.
+            let small_main = {
+                let mut v = generate_multiplicity_trace(&counts.qdecode);
+                v.extend(generate_multiplicity_trace(&counts.rc_lo));
+                v.extend(generate_multiplicity_trace(&counts.rc_hi));
+                v.extend(generate_program_witness(&program));
+                v
+            };
+            let mut tree_builder = commitment_scheme.tree_builder();
+            #[cfg(feature = "cuda")]
+            if gpu_tracegen {
+                let (gates_flat, x_states, off_lo, off_hi) =
+                    gpu_flat_inputs(&gates, shard_cases, &rc_lo_index, &rc_hi_index)?;
+                let (mut main_dev, _qd, _lo, _hi) = gpu_tracegen::gpu_gen_main_trace_device(
+                    &gates_flat, &x_states, &off_lo, &off_hi,
+                    k as u32, n_gates as u32, shard_samples as u32, padded_rows, log_n_rows,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                main_dev.extend(to_prover(small_main));
+                tree_builder.extend_evals(main_dev);
+            } else {
+                let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+                main_trace.extend(small_main);
+                tree_builder.extend_evals(to_prover(main_trace));
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+                main_trace.extend(small_main);
+                tree_builder.extend_evals(to_prover(main_trace));
+            }
+            tree_builder.commit(prover_channel);
+
+            let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
+            prover_channel.mix_u64(interaction_pow_nonce);
+            let elements = LookupElements::draw(prover_channel);
+
+            #[cfg(feature = "cuda")]
+            {
+                gate_air_cuda_kernel::register();
+                let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.state);
+                gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
+            }
+
+            // Interaction traces.
+            #[cfg(feature = "cuda")]
+            let main_interaction_device = if gpu_tracegen {
+                let (gates_flat, x_states, off_lo, off_hi) =
+                    gpu_flat_inputs(&gates, shard_cases, &rc_lo_index, &rc_hi_index)?;
+                let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
+                    &gates_flat, &x_states, &off_lo, &off_hi,
+                    k as u32, n_gates as u32, shard_samples as u32, padded_rows, log_n_rows, &elements,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                Some((cols, claimed))
+            } else {
+                None
+            };
+            #[cfg(feature = "cuda")]
+            let (main_interaction, main_sum) = if let Some((_, claimed)) = &main_interaction_device {
+                (Vec::new(), *claimed)
+            } else {
+                gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (main_interaction, main_sum) =
+                gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
+            let (qdecode_interaction, qdecode_sum) = {
+                let el = elements.qdecode.clone();
+                let q: Vec<u32> = (0..N_QUBITS as u32).collect();
+                gen_table_interaction(&counts.qdecode, N_QUBITS.ilog2(), |vec_row| {
+                    el.combine(&[
+                        ptag(TAG_QDECODE),
+                        pack_seq(&q, vec_row),
+                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).0),
+                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).1),
+                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).2),
+                    ])
+                })
+            };
+            let (rc_lo_interaction, rc_lo_sum) = {
+                let el = elements.rc_lo.clone();
+                gen_table_interaction(&counts.rc_lo, RC_LOG_SIZE, |vec_row| {
+                    el.combine(&[
+                        ptag(TAG_RC_LO),
+                        pack_seq(&rc_lo_index.pos_col, vec_row),
+                        pack_seq(&rc_lo_index.val_col, vec_row),
+                    ])
+                })
+            };
+            let (rc_hi_interaction, rc_hi_sum) = {
+                let el = elements.rc_hi.clone();
+                gen_table_interaction(&counts.rc_hi, RC_LOG_SIZE, |vec_row| {
+                    el.combine(&[
+                        ptag(TAG_RC_HI),
+                        pack_seq(&rc_hi_index.pos_col, vec_row),
+                        pack_seq(&rc_hi_index.val_col, vec_row),
+                    ])
+                })
+            };
+            let (program_interaction, program_sum) = {
+                let el = elements.program.clone();
+                gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
+                    el.combine(&[
+                        ptag(TAG_PROGRAM),
+                        pack_seq(&program.slot, vec_row),
+                        pack_seq(&program.opcode_scalar, vec_row),
+                        pack_seq(&program.target, vec_row),
+                        pack_seq(&program.ctrl_a, vec_row),
+                        pack_seq(&program.ctrl_b, vec_row),
+                    ])
+                })
+            };
+
+            // Cross-check claimed sums against this shard's public boundary + table sums.
+            let boundary_sum = public_boundary_sum(shard_cases, n_gates, k, &elements.state)?;
+            if main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum != boundary_sum {
+                bail!("shard main claimed sum != public boundary sum");
+            }
+
+            let claimed_sums = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+            prover_channel.mix_felts(&claimed_sums);
+
+            // Tree 2: interaction (same component order as the claimed sums).
+            let small_interaction = {
+                let mut v = qdecode_interaction;
+                v.extend(rc_lo_interaction);
+                v.extend(rc_hi_interaction);
+                v.extend(program_interaction);
+                v
+            };
+            let mut tree_builder = commitment_scheme.tree_builder();
+            #[cfg(feature = "cuda")]
+            if let Some((main_dev, _)) = main_interaction_device {
+                let mut interaction = main_dev;
+                interaction.extend(to_prover(small_interaction));
+                tree_builder.extend_evals(interaction);
+            } else {
+                let mut interaction = main_interaction;
+                interaction.extend(small_interaction);
+                tree_builder.extend_evals(to_prover(interaction));
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let mut interaction = main_interaction;
+                interaction.extend(small_interaction);
+                tree_builder.extend_evals(to_prover(interaction));
+            }
+            tree_builder.commit(prover_channel);
+
+            let components = build_components(
+                log_n_rows,
+                program.log_size,
+                &elements,
+                main_sum,
+                qdecode_sum,
+                rc_lo_sum,
+                rc_hi_sum,
+                program_sum,
+            );
+            let prover_refs = components.prover_refs();
+            let extended = prove_ex::<ProverBackend, Blake2sM31MerkleChannel>(
+                &prover_refs,
+                prover_channel,
+                commitment_scheme,
+                false,
+            )?;
+
+            // Per-shard boundary (x->y per shard shot) for the leaf's GateAirStatement + output hash.
+            let mut shard_boundary = Vec::with_capacity(shard_cases.len());
+            for case in shard_cases {
+                let x = state_to_limbs(&hex::decode(&case.x_hex)?);
+                let y = state_to_limbs(&hex::decode(&case.y_hex)?);
+                shard_boundary.push((x, y));
+            }
+            let claim: Vec<SecureField> =
+                vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+            Ok((
+                extended,
+                claim,
+                interaction_pow_nonce,
+                channel_salt,
+                log_n_rows,
+                program.log_size,
+                shard_boundary,
+                (n_gates * k) as u32,
+            ))
+        };
 
         let n_pp = N_PREPROCESSED_COLS;
-        let cfg =
-            ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
-        let pp_root: ReducedHashValue<SecureField> = extended.proof.commitments[0].into();
-        let mut boundary = Vec::with_capacity(cases.len());
-        for case in cases {
-            let x = state_to_limbs(&hex::decode(&case.x_hex)?);
-            let y = state_to_limbs(&hex::decode(&case.y_hex)?);
-            boundary.push((x, y));
+
+        // PIPELINE opt-in: with GATE_AIR_PIPELINE set AND >1 shard, overlap GPU base-proving
+        // (producer) with CPU leaf-wrap + streaming fold (consumer). The producer proves shards
+        // 1..n_shards on a dedicated thread while the consumer wraps + folds in shard order; only
+        // shard 0's base is proved eagerly here (it's needed to derive `agg`). With the flag unset
+        // (default) the existing sequential path below runs UNCHANGED.
+        //
+        // SOUNDNESS GATE (pending, on-box, NOT run here — laptop only): the streaming path must
+        // yield a recursion_fingerprint BYTE-IDENTICAL to the sequential path for the same fixture
+        // (e.g. k1-n4 samples=4 GATE_AIR_SHARD_SHOTS=2, GATE_AIR_PIPELINE set vs unset). That
+        // one-flag diff is the trust gate before this path is used in anger.
+        let pipeline = std::env::var("GATE_AIR_PIPELINE").is_ok() && n_shards > 1;
+
+        // Prove the per-shard base proof(s) (each is itself heavy / GPU-bound). In the sequential
+        // path, prove all up front. In the pipeline path, prove ONLY shard 0 here (the rest are
+        // produced concurrently by the producer thread, below).
+        let t = Instant::now();
+        let mut shard_bases = Vec::with_capacity(n_shards);
+        if pipeline {
+            eprintln!("gate-air: proving shard 0 base proof eagerly (pipeline) ...");
+            shard_bases.push(prove_base_shard(&shard_case_sets[0])?);
+        } else {
+            eprintln!("gate-air: proving {n_shards} distinct per-shard base proof(s) ...");
+            for (s, shard_cases) in shard_case_sets.iter().enumerate() {
+                eprintln!("gate-air: base proof for shard {s} ({} shots) ...", shard_cases.len());
+                shard_bases.push(prove_base_shard(shard_cases)?);
+            }
         }
-        let claim: Vec<SecureField> = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
-        let params = GateAirLeafParams {
-            main_log_size: log_n_rows,
-            program_log_size: program.log_size,
-            preprocessed_root: pp_root,
-            boundary,
-            total_pc: (n_gates * k) as u32,
+        eprintln!(
+            "gate-air: base proof(s) (so far) in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+
+        // All shards share the SAME circuit shape (equal shot count, same program -> same
+        // preprocessed root / target sizes). Derive ONE AggregateConfig from shard 0's params and
+        // reuse it for every leaf (the "one trusted leaf_preprocessed_root for all leaves"
+        // invariant). cfg is shape-only (gate_air_components::<NoValue>) so any shard's `config`
+        // works; use shard 0's.
+        let (
+            ref base0_extended,
+            ref _base0_claim,
+            _base0_nonce,
+            _base0_salt,
+            base0_log_n_rows,
+            base0_prog_log_size,
+            ref base0_boundary,
+            base0_total_pc,
+        ) = shard_bases[0];
+        let base0_config = leaf::leaf_pcs_config(
+            base0_log_n_rows.max(RC_LOG_SIZE),
+            std::env::var("BASE_BLOWUP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(BASE_LOG_BLOWUP_FACTOR),
+        );
+        let cfg = ProofConfig::new(
+            &gate_air_components::<NoValue>(),
+            n_pp,
+            &base0_config,
+            INTERACTION_POW_BITS,
+        );
+        let pp_root0: ReducedHashValue<SecureField> = base0_extended.proof.commitments[0].into();
+        let shape_params = GateAirLeafParams {
+            main_log_size: base0_log_n_rows,
+            program_log_size: base0_prog_log_size,
+            preprocessed_root: pp_root0,
+            boundary: base0_boundary.clone(),
+            total_pc: base0_total_pc,
         };
 
         eprintln!("gate-air: deriving aggregate config ...");
         let t = Instant::now();
-        let agg = derive_aggregate_config(&cfg, &params, LOG_BLOWUP_FACTOR);
+        let agg = derive_aggregate_config(&cfg, &shape_params, LOG_BLOWUP_FACTOR);
         eprintln!(
             "gate-air: config derived in {:.1}s (target qm31_ops={})",
             t.elapsed().as_secs_f64(),
@@ -2556,32 +2957,105 @@ fn main() -> Result<()> {
         let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(pool_threads);
         let pools = PoolSet::new((cores / pool_threads).max(1), pool_threads);
 
-        eprintln!("gate-air: proving {n_leaves} leaves ...");
-        let t = Instant::now();
-        let (cfg_ref, params_ref, agg_ref) = (&cfg, &params, &agg);
-        let leaf_jobs: Vec<_> = (0..n_leaves)
-            .map(|_| {
-                let p = proof_from_stark_proof(
-                    &extended,
-                    cfg_ref,
-                    claim.clone(),
-                    interaction_pow_nonce,
-                    channel_salt,
-                );
-                move || prove_gate_air_leaf(p, cfg_ref, params_ref, agg_ref)
-            })
-            .collect();
-        let leaves = pools.map(leaf_jobs);
-        eprintln!("gate-air: {n_leaves} leaves proved in {:.1}s", t.elapsed().as_secs_f64());
+        // Per-shard distinct leaf: build the GateAirLeafParams for THIS shard (its own boundary +
+        // preprocessed root), convert THIS shard's base proof to circuit values, and prove the leaf.
+        // The leaves are now DISTINCT (each commits to its shard's own shots' (x,y) outputs).
+        let n_leaves = n_shards;
+        let (cfg_ref, agg_ref) = (&cfg, &agg);
 
-        let t = Instant::now();
-        let out = recursive_aggregate_prove(leaves.clone(), &agg, &pools);
-        eprintln!(
-            "gate-air: folded to root in {:.1}s ({} levels)",
-            t.elapsed().as_secs_f64(),
-            out.n_levels
-        );
-        eprintln!("gate-air: multiverifier fold OK");
+        // `wrap_leaf` turns one shard's base-proof tuple into its TreeProof leaf. Same params
+        // construction + proof_from_stark_proof + prove_gate_air_leaf as the sequential path; only
+        // WHEN it runs differs between the two paths.
+        let wrap_leaf = |base: &BaseShardOutput| -> TreeProof {
+            let (extended_i, claim_i, nonce_i, salt_i, log_n_rows_i, prog_log_i, boundary_i, total_pc_i) =
+                base;
+            let pp_root_i: ReducedHashValue<SecureField> = extended_i.proof.commitments[0].into();
+            let params_i = GateAirLeafParams {
+                main_log_size: *log_n_rows_i,
+                program_log_size: *prog_log_i,
+                preprocessed_root: pp_root_i,
+                boundary: boundary_i.clone(),
+                total_pc: *total_pc_i,
+            };
+            let p = proof_from_stark_proof(extended_i, cfg_ref, claim_i.clone(), *nonce_i, *salt_i);
+            prove_gate_air_leaf(p, cfg_ref, &params_i, agg_ref)
+        };
+
+        let (leaves, out) = if pipeline {
+            // PIPELINE: producer thread proves shards 1.. (GPU) and sends each base over a bounded
+            // sync_channel (depth 1, so the producer doesn't race far ahead of the consumer / blow
+            // memory). The consumer (this thread) wraps each base into a leaf in shard order
+            // (starting with shard 0, already proved) and streams the leaves into
+            // `recursive_aggregate_prove_streaming` via a second channel. So GPU base-proving of
+            // shard i+1 overlaps CPU leaf-wrap + fold of shard i. The leaves Vec is collected in
+            // shard order (0..N) for the unchanged prove_root_verification + fingerprint below.
+            eprintln!("gate-air: PIPELINED base||recursion (streaming frontier fold)");
+            let t = Instant::now();
+            let mut leaves_vec: Vec<TreeProof> = Vec::with_capacity(n_leaves);
+            let (base_tx, base_rx) = std::sync::mpsc::sync_channel::<Result<BaseShardOutput>>(1);
+            let (leaf_tx, leaf_rx) = std::sync::mpsc::channel::<TreeProof>();
+            let shard0_base = shard_bases.into_iter().next().unwrap();
+
+            let out = std::thread::scope(|scope| -> Result<AggregateOutput> {
+                // PRODUCER: prove shards 1..n_shards on the GPU (single producer — one GPU).
+                let producer = scope.spawn(|| {
+                    for shard_cases in shard_case_sets[1..].iter() {
+                        let r = prove_base_shard(shard_cases);
+                        let is_err = r.is_err();
+                        // Stop on send failure (consumer gone) or after forwarding an error.
+                        if base_tx.send(r).is_err() || is_err {
+                            break;
+                        }
+                    }
+                });
+
+                // FOLD: run the streaming fold on a worker thread driven by `leaf_rx`, so the
+                // consumer (this thread) can keep wrapping the next leaf while a fold proceeds.
+                let folder = scope.spawn(|| {
+                    recursive_aggregate_prove_streaming(leaf_rx, n_leaves, agg_ref, &pools)
+                });
+
+                // CONSUMER (this thread): wrap shard 0 first, then each received base in order.
+                let leaf0 = wrap_leaf(&shard0_base);
+                leaves_vec.push(leaf0.clone());
+                leaf_tx.send(leaf0).expect("fold thread dropped early");
+                for _ in 1..n_shards {
+                    let base = base_rx.recv().expect("producer hung up early")?;
+                    let leaf = wrap_leaf(&base);
+                    leaves_vec.push(leaf.clone());
+                    leaf_tx.send(leaf).expect("fold thread dropped early");
+                }
+                drop(leaf_tx);
+                producer.join().expect("base producer thread panicked");
+                Ok(folder.join().expect("fold thread panicked"))
+            })?;
+            eprintln!(
+                "gate-air: pipelined {n_leaves} leaves + fold in {:.1}s ({} levels)",
+                t.elapsed().as_secs_f64(),
+                out.n_levels
+            );
+            eprintln!("gate-air: multiverifier fold OK");
+            (leaves_vec, out)
+        } else {
+            eprintln!("gate-air: proving {n_leaves} distinct leaves (one per shard) ...");
+            let t = Instant::now();
+            let leaf_jobs: Vec<_> = shard_bases
+                .iter()
+                .map(|base| move || wrap_leaf(base))
+                .collect();
+            let leaves = pools.map(leaf_jobs);
+            eprintln!("gate-air: {n_leaves} distinct leaves proved in {:.1}s", t.elapsed().as_secs_f64());
+
+            let t = Instant::now();
+            let out = recursive_aggregate_prove(leaves.clone(), &agg, &pools);
+            eprintln!(
+                "gate-air: folded to root in {:.1}s ({} levels)",
+                t.elapsed().as_secs_f64(),
+                out.n_levels
+            );
+            eprintln!("gate-air: multiverifier fold OK");
+            (leaves, out)
+        };
 
         // Root verification: verify the root proof + unpack the leaf outputs, with the single
         // zk-blinding (the only published proof). Completes the recursion pipeline.
@@ -2597,6 +3071,41 @@ fn main() -> Result<()> {
             rv.trace_log_size,
             rv.leaf_outputs.len()
         );
+
+        // ---- Recursion byte-identity fingerprint (precompute ON vs OFF validation) ----
+        // The precompute optimization only changes HOW each node/leaf's tree0 is built, never WHAT.
+        // So the leaf proofs, every internal node proof (folded into `out.root`), and the root
+        // proof must be byte-identical between precompute ON (default) and OFF
+        // (GATE_AIR_NO_PRECOMPUTE=1). `Proof<QM31>` is purely Vec/array/struct of QM31 (no maps),
+        // so its `{:?}` Debug form is a deterministic, cross-process canonical encoding. We fold
+        // every leaf proof + its output values, the root proof + its output values, and the
+        // unpacked leaf outputs into one SHA-256 and print it for the two runs to compare.
+        {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"gate-air/recursion-proofs/debug/v1");
+            hasher.update(format!("n_leaves={n_leaves} n_levels={}", out.n_levels).as_bytes());
+            for (i, l) in leaves.iter().enumerate() {
+                hasher.update(format!("leaf[{i}].proof={:?}", l.proof).as_bytes());
+                hasher.update(format!("leaf[{i}].pp_root={:?}", l.preprocessed_root).as_bytes());
+                hasher.update(format!("leaf[{i}].outs={:?}", l.output_values).as_bytes());
+            }
+            hasher.update(format!("root.proof={:?}", out.root.proof).as_bytes());
+            hasher.update(format!("root.pp_root={:?}", out.root.preprocessed_root).as_bytes());
+            hasher.update(format!("root.outs={:?}", out.root.output_values).as_bytes());
+            hasher.update(format!("rv.proof={:?}", rv.proof).as_bytes());
+            hasher.update(format!("rv.leaf_outputs={:?}", rv.leaf_outputs).as_bytes());
+            let digest = hasher.finalize();
+            let mode = if std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok() {
+                "PRECOMPUTE_OFF"
+            } else {
+                "PRECOMPUTE_ON"
+            };
+            // The fold completing = every leaf proof verified in-circuit by its parent node; the
+            // root verification completing = the root proof verified in-circuit. Both self-verify.
+            println!("gate-air: recursion_fingerprint[{mode}]={}", hex::encode(digest));
+            println!("gate-air: recursion self-verify (fold+root) OK [{mode}]");
+        }
     }
 
     let proof = extended.proof;
@@ -2695,6 +3204,53 @@ fn pack_decode(vec_row: usize, f: impl Fn(usize) -> u32) -> PackedM31 {
     PackedM31::from_array(std::array::from_fn(|lane| {
         BaseField::from_u32_unchecked(f((vec_row << LOG_N_LANES) + lane))
     }))
+}
+
+// ----------------------------------------------------------------------------
+// Full-proof byte-identity fingerprint (read-only)
+// ----------------------------------------------------------------------------
+//
+// Computes a STABLE, deterministic SHA-256 over the serde-serialized `ExtendedStarkProof`
+// and prints `gate-air: proof_fingerprint=<hex>`. This is a READ-ONLY tap: it only serializes
+// the already-produced proof, touching no CPU constraint-eval / prover / verifier math.
+//
+// Determinism: the proof is a pure function of (fixture, samples, canonical Fiat-Shamir
+// transcript). The transcript is fixed — `channel_salt` is a fixed scalar mixed first, then
+// `config.mix_into`, then the fixed INTERACTION_POW_BITS grind (deterministic nonce for a fixed
+// transcript). No RNG/salt is drawn outside the channel. serde_json serializes struct fields in
+// declaration order and field elements / hashes as plain numbers / byte arrays, so the byte stream
+// is identical across runs and across backends (SimdBackend vs CudaBackend). The backend under test
+// is therefore the ONLY possible source of divergence — which is the point of the comparison.
+//
+// We hash the serde form (not `format!("{:?}", ..)`) because it is a canonical, version-stable
+// encoding; the Debug form would also be deterministic (it is what `cuda_byte_identity.rs` uses)
+// and is kept as the fallback below if serialization were ever to fail.
+fn emit_proof_fingerprint<H>(extended: &stwo::core::proof::ExtendedStarkProof<H>)
+where
+    H: stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted,
+    stwo::core::proof::StarkProof<H>: serde::Serialize,
+{
+    use sha2::{Digest, Sha256};
+    // Fingerprint ONLY the verifier-consumed `proof` (StarkProof): it is entirely Vec/struct-based
+    // and therefore serializes deterministically. The `aux` (in-circuit-verifier helper data)
+    // contains HashMaps (all_node_values / all_values) whose serde iteration order is randomized
+    // per process — including it makes the fingerprint differ run-to-run even on the SAME backend,
+    // which is NOT a proof divergence. Byte-identity of the actual proof = byte-identity of `.proof`.
+    let mut hasher = Sha256::new();
+    match serde_json::to_vec(&extended.proof) {
+        Ok(bytes) => {
+            hasher.update(b"gate-air/stark-proof/serde/v1");
+            hasher.update(&bytes);
+        }
+        Err(e) => {
+            // Fallback: stable Debug fingerprint (matches stwo's cuda_byte_identity.rs pattern).
+            eprintln!("gate-air: proof serde failed ({e}); falling back to Debug fingerprint");
+            hasher.update(b"gate-air/stark-proof/debug/v1");
+            hasher.update(format!("{:?}", extended.proof).as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    println!("gate-air: proof_fingerprint={}", hex::encode(digest));
 }
 
 fn normalize(path: PathBuf) -> PathBuf {

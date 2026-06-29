@@ -2,18 +2,46 @@
 //!
 //! Generates the 191 main-trace columns + the 3 lookup histograms (qdecode / rc_lo / rc_hi)
 //! ENTIRELY on the GPU, so the trace never leaves device memory (avoiding the model-A transfer
-//! wall). Thread-per-shot: each of the `n_shots` threads runs its shot's full `k * n_gates`
-//! sequential gate chain, threading the 32-limb state, and writes its rows directly into
-//! device-resident column-major M31 columns.
+//! wall).
 //!
-//! SOUNDNESS: this kernel must produce a trace BYTE-IDENTICAL to the CPU `build_rows` +
-//! `generate_main_trace`. It is a line-for-line translation of `simulate_shot` (per-gate compute),
-//! `ReadCols::live`/`inactive`, `qubit_decode`, `count_read` (histogram indices), `delta_to_m31`,
-//! and the `cell_at` 191-column layout. Validated by a column-by-column M31 equality test vs CPU
-//! before it is trusted. No security parameters change — this only moves WHERE the witness is built.
+//! THREAD-PER-EXECUTION (occupancy redesign, 2026-06-29).
+//! ------------------------------------------------------
+//! The original kernel was thread-per-SHOT: each of `n_shots` threads ran its shot's full
+//! `k * n_gates` chain. Parallelism was therefore fixed at `n_shots` regardless of total work,
+//! so at the real 9024-shot Tanuj benchmark only ~36 of an A100's 108 SMs were ever touched, and
+//! sharding across 8 GPUs (~1128 shots/GPU) lit only ~5 SMs/GPU (~95% idle) — worst at high k.
 //!
-//! Status: kernel source complete (this file). Launch glue (cudarc, sharing stwo's CUDA executor +
-//! producing GpuBackend-resident columns) + the byte-identity test are the next steps (see TODOs).
+//! The fix maps ONE THREAD PER EXECUTION = per (shot, rep) pair, so parallelism rises from
+//! `n_shots` to `n_shots * k` (~9M at k=1000) and saturates the device. The catch is that the
+//! `k` reps are a SEQUENTIAL state chain: rep r+1 of a shot starts from the state rep r ended on
+//! (Grover-style; the CPU `simulate_shot` never resets `limbs` between reps). So per-rep threads
+//! are NOT independent unless each knows its starting state.
+//!
+//! We resolve this with a TWO-KERNEL split that keeps total work LINEAR in k (a per-rep
+//! fast-forward would be O(k^2) — fatal at k=2000) and is NOT the forbidden per-gate-instance
+//! two-pass:
+//!   K0 `gate_sim_states` — thread-per-SHOT, but does ONLY the cheap limb update (no column
+//!       stores, no histogram atomics). It walks the full `k * n_gates` chain and records the
+//!       rep-BOUNDARY state of each shot: `rep_states[shot*k*N_LIMBS + rep*N_LIMBS + i]` = the
+//!       32-limb state at the START of (shot, rep) (rep 0 == x_states[shot]). This is k small
+//!       state snapshots per shot — not k*n_gates rows.
+//!   K1 `gate_sim` — thread-per-EXECUTION. Thread `exec = shot*k + rep` loads its start state
+//!       from `rep_states`, sets `pc = rep*n_gates` and `row = exec*n_gates`, then walks its own
+//!       `n_gates` gates writing the 191 columns + the 3 histograms exactly as before.
+//! The expensive phase (191 stores + 3 atomics per row) now runs with `n_shots*k` threads; the
+//! cheap sequential chain stays in K0 with `n_shots` threads (a small fraction of the old cost,
+//! since K0 omits all the per-row I/O that dominated the old kernel).
+//!
+//! SOUNDNESS / BYTE-IDENTITY: the output is unchanged. K1's per-gate body is the SAME line-for-line
+//! translation of `simulate_shot` / `ReadCols::live`/`inactive` / `qubit_decode` / `count_read` /
+//! `delta_to_m31` / the `cell_at` 191-column layout. The only change is the thread→(shot,rep,row,pc)
+//! mapping: row(shot,rep,g) = shot*k*n_gates + rep*n_gates + g is EXACTLY the row the old kernel
+//! wrote (old: row started at shot*k*n_gates and incremented through rep,g in order); pc = rep*n_gates
+//! + g matches the old monotonic `pc` (which also ran 0..k*n_gates per shot); and each thread's start
+//! state equals what the old kernel held entering rep r, because K0 reproduces the same chain. The
+//! histogram atomicAdds are the same set of increments, just issued by more threads — integer add is
+//! commutative/associative so the totals are identical. Validated by the GATE_AIR_GPU_TEST=k1 / k4
+//! column-by-column + histogram equality harness vs CPU before it is trusted.
 
 use std::sync::{Arc, OnceLock};
 
@@ -38,12 +66,15 @@ fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
 /// Buffers (all device):
 /// - `gates`:   n_gates * 4  (opcode, target_q, ctrl_a_q, ctrl_b_q), u32
 /// - `x_states`: n_shots * N_LIMBS  (initial state limbs per shot), u32
+/// - `rep_states`: n_shots * k * N_LIMBS — rep-boundary states K0 produces and K1 consumes:
+///   rep_states[(shot*k + rep)*N_LIMBS + i] = limb i of the state at the START of (shot, rep).
 /// - `off_lo`/`off_hi`: 16 each — RcIndex offsets: off_lo[p]=2^p-1, off_hi[p]=2^16-2^(16-p)
 /// - `cols`:    TRACE_COLUMNS * padded_rows, column-major (col c at cols[c*padded_rows + row]), u32
 /// - `qdecode`(512), `rc_lo`(65536), `rc_hi`(65536): histograms, u32, zero-initialized
 /// Scalars: k, n_gates, n_shots, padded_rows (shot_rows = k*n_gates computed in-kernel).
 /// NOTE: caller must zero `cols` + histograms first, and write padding rows (enabler=0, the 3
 /// read-block `mask` columns = 1, rest 0) for rows in [n_shots*shot_rows, padded_rows).
+/// Launch order: K0 `gate_sim_states` (fills rep_states), then K1 `gate_sim` (consumes it).
 pub const GATE_SIM_KERNEL: &str = r#"
 #define N_LIMBS 32u
 #define LIMB_BITS 16u
@@ -54,9 +85,64 @@ pub const GATE_SIM_KERNEL: &str = r#"
 #define OP_CNOT 2u
 #define OP_TOFFOLI 3u
 
-extern "C" __global__ void gate_sim(
+// Apply one gate's target-bit flip to `limbs` in place. Pure state update (no column/histogram
+// I/O) — the part the K1 per-gate body and K0 share. Mirrors simulate_shot's limb math exactly.
+__device__ __forceinline__ void apply_gate(
+    unsigned* limbs, const unsigned* __restrict__ gates, unsigned g)
+{
+    unsigned opcode = gates[g * 4u + 0u];
+    unsigned tq     = gates[g * 4u + 1u];
+    unsigned aq     = gates[g * 4u + 2u];
+    unsigned bq     = gates[g * 4u + 3u];
+    unsigned is_not = (opcode == OP_NOT) ? 1u : 0u;
+    unsigned is_cnot = (opcode == OP_CNOT) ? 1u : 0u;
+    unsigned is_tof = (opcode == OP_TOFFOLI) ? 1u : 0u;
+    unsigned a_active = is_cnot + is_tof;
+    unsigned b_active = is_tof;
+    unsigned tl = tq / LIMB_BITS, tbp = tq % LIMB_BITS;
+    unsigned t_bit = (limbs[tl] >> tbp) & 1u;
+    unsigned a_bit = a_active ? ((limbs[aq / LIMB_BITS] >> (aq % LIMB_BITS)) & 1u) : 0u;
+    unsigned b_bit = b_active ? ((limbs[bq / LIMB_BITS] >> (bq % LIMB_BITS)) & 1u) : 0u;
+    unsigned fire = is_not + is_cnot * a_bit + is_tof * (a_bit * b_bit);  // in {0,1}
+    unsigned new_t = t_bit ^ fire;
+    int delta_signed = (int)new_t - (int)t_bit;                          // {-1,0,1}
+    unsigned mask = 1u << tbp;
+    if (delta_signed > 0) limbs[tl] += mask;
+    else if (delta_signed < 0) limbs[tl] -= mask;
+}
+
+// K0: thread-per-SHOT, state-only. Walk the full k*n_gates chain (cheap limb updates, NO column
+// stores, NO histogram atomics) and snapshot the state at the START of every (shot, rep) into
+// rep_states. rep 0's snapshot is exactly x_states[shot]; rep r's is the state after r full passes.
+// This keeps total chain work LINEAR in k while letting K1 start each (shot,rep) independently.
+extern "C" __global__ void gate_sim_states(
     const unsigned* __restrict__ gates,
     const unsigned* __restrict__ x_states,
+    unsigned* __restrict__ rep_states,
+    unsigned k,
+    unsigned n_gates,
+    unsigned n_shots)
+{
+    unsigned shot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (shot >= n_shots) return;
+
+    unsigned limbs[N_LIMBS];
+    #pragma unroll
+    for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = x_states[shot * N_LIMBS + i];
+
+    for (unsigned rep = 0; rep < k; rep++) {
+        // Snapshot the state entering this rep.
+        unsigned long base = ((unsigned long)shot * (unsigned long)k + (unsigned long)rep) * N_LIMBS;
+        #pragma unroll
+        for (unsigned i = 0; i < N_LIMBS; i++) rep_states[base + i] = limbs[i];
+        // Advance through one full pass of the program.
+        for (unsigned g = 0; g < n_gates; g++) apply_gate(limbs, gates, g);
+    }
+}
+
+extern "C" __global__ void gate_sim(
+    const unsigned* __restrict__ gates,
+    const unsigned* __restrict__ rep_states,
     const unsigned* __restrict__ off_lo,
     const unsigned* __restrict__ off_hi,
     unsigned* __restrict__ cols,
@@ -68,23 +154,28 @@ extern "C" __global__ void gate_sim(
     unsigned n_shots,
     unsigned long padded_rows)
 {
-    unsigned shot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (shot >= n_shots) return;
-    unsigned long shot_rows = (unsigned long)k * (unsigned long)n_gates;
+    // THREAD-PER-EXECUTION: one thread per (shot, rep). exec = shot*k + rep.
+    unsigned long exec = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long n_exec = (unsigned long)n_shots * (unsigned long)k;
+    if (exec >= n_exec) return;
+    unsigned shot = (unsigned)(exec / (unsigned long)k);
+    unsigned rep  = (unsigned)(exec % (unsigned long)k);
 
-    // Per-thread state: the 32-limb register file, threaded across the whole shot.
+    // Per-thread state: the 32-limb register file, seeded from K0's rep-boundary snapshot so this
+    // (shot, rep) starts exactly where the old thread-per-shot kernel was when it entered rep.
     unsigned limbs[N_LIMBS];
     #pragma unroll
-    for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = x_states[shot * N_LIMBS + i];
+    for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = rep_states[exec * N_LIMBS + i];
 
-    unsigned long row = (unsigned long)shot * shot_rows;
-    unsigned pc = 0u;
+    // Row range + pc this execution owns. row(shot,rep,g) = (shot*k + rep)*n_gates + g = exec*n_gates+g.
+    // pc is the monotonic per-shot counter the old kernel emitted: pc(rep,g) = rep*n_gates + g.
+    unsigned long row = exec * (unsigned long)n_gates;
+    unsigned pc = rep * n_gates;
 
     // Per-read decoded fields (mirror ReadCols).
     unsigned r_active[3], r_q[3], r_limb[3], r_bitpos[3], r_mask[3], r_lo[3], r_hi[3], r_bit[3];
 
-    for (unsigned rep = 0; rep < k; rep++) {
-        for (unsigned g = 0; g < n_gates; g++) {
+    for (unsigned g = 0; g < n_gates; g++) {
             unsigned opcode   = gates[g * 4u + 0u];
             unsigned tq       = gates[g * 4u + 1u];
             unsigned aq       = gates[g * 4u + 2u];
@@ -171,7 +262,6 @@ extern "C" __global__ void gate_sim(
             for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = out_limb[i];
             pc += 1u;
             row += 1u;
-        }
     }
 }
 
@@ -222,7 +312,7 @@ pub fn gpu_gen_main_trace(
     let dev = cuda_device()?;
 
     let ptx = compile_ptx(GATE_SIM_KERNEL).map_err(|e| format!("nvrtc compile: {e}"))?;
-    dev.load_ptx(ptx, "gate_sim_mod", &["gate_sim", "fill_padding"])
+    dev.load_ptx(ptx, "gate_sim_mod", &["gate_sim_states", "gate_sim", "fill_padding"])
         .map_err(|e| format!("load_ptx: {e}"))?;
     let func = dev
         .get_func("gate_sim_mod", "gate_sim")
@@ -238,9 +328,27 @@ pub fn gpu_gen_main_trace(
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
     let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
     let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
+    // K0 boundary-state buffer: n_shots * k * N_LIMBS (rep-start state per execution).
+    let n_exec = (n_shots as u64) * (k as u64);
+    let mut d_rep = dev
+        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
+        .map_err(|e| format!("alloc rep_states: {e}"))?;
 
     let block = 256u32;
-    let grid = n_shots.div_ceil(block);
+    // K0: thread-per-shot — fill rep-boundary states.
+    let k0_cfg = LaunchConfig {
+        grid_dim: (n_shots.div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        dev.get_func("gate_sim_mod", "gate_sim_states")
+            .ok_or_else(|| "get_func gate_sim_states".to_string())?
+            .launch(k0_cfg, (&d_gates, &d_x, &mut d_rep, k, n_gates, n_shots))
+            .map_err(|e| format!("launch gate_sim_states: {e}"))?;
+    }
+    // K1: thread-per-execution — one thread per (shot, rep) = n_shots*k threads.
+    let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (block, 1, 1),
@@ -251,7 +359,7 @@ pub fn gpu_gen_main_trace(
         func.launch(
             cfg,
             (
-                &d_gates, &d_x, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
+                &d_gates, &d_rep, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
                 k, n_gates, n_shots, padded_rows as u64,
             ),
         )
@@ -419,6 +527,16 @@ pub fn k1_byte_identity(
 //
 // SOUNDNESS: validated by `k4_byte_identity` (24 cols + claimed_sum) vs the CPU reference
 // using a FIXED `GateRel::dummy()` (z,alpha) before it is trusted.
+//
+// OCCUPANCY: K4 is ALREADY thread-per-EXECUTION-instance — every per-row kernel here
+// (logup_col_gen / logup_finalize_col / logup_cumsum_shift / the prefix-sum stages) maps one
+// thread per ROW with `row = blockIdx*blockDim + threadIdx; if (row >= padded_rows) return;`, and
+// the launch grid is `padded_rows.div_ceil(block)`. Since padded_rows ≈ n_shots*k*n_gates rounded
+// to a power of two, parallelism is already millions of threads at the Tanuj benchmark and scales
+// with total work — it never had K1's thread-per-shot pathology, so K4's mapping is unchanged here.
+// (logup_cumsum_reduce is a grid-stride block reduction capped at 1024 blocks, which is correct and
+// fully occupied.) The K4 column writes are coordinate-major (4 coords × padded_rows); each thread
+// writes its row's 4 coords at stride padded_rows, the same layout K1 uses.
 
 /// Number of LogUp columns (pairs) gate_air emits. Each is a SecureColumnByCoords (4 M31).
 pub const N_LOGUP_COLS: usize = 6;
@@ -1211,7 +1329,7 @@ pub fn gpu_gen_main_trace_device(
     let dev = cuda_device()?;
 
     let ptx = compile_ptx(GATE_SIM_KERNEL).map_err(|e| format!("nvrtc compile: {e}"))?;
-    dev.load_ptx(ptx, "gate_sim_mod", &["gate_sim", "fill_padding"])
+    dev.load_ptx(ptx, "gate_sim_mod", &["gate_sim_states", "gate_sim", "fill_padding"])
         .map_err(|e| format!("load_ptx: {e}"))?;
     let func = dev
         .get_func("gate_sim_mod", "gate_sim")
@@ -1227,9 +1345,26 @@ pub fn gpu_gen_main_trace_device(
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
     let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
     let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
+    let n_exec = (n_shots as u64) * (k as u64);
+    let mut d_rep = dev
+        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
+        .map_err(|e| format!("alloc rep_states: {e}"))?;
 
     let block = 256u32;
-    let grid = n_shots.div_ceil(block);
+    // K0: thread-per-shot — fill rep-boundary states (cheap, state-only chain).
+    let k0_cfg = LaunchConfig {
+        grid_dim: (n_shots.div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        dev.get_func("gate_sim_mod", "gate_sim_states")
+            .ok_or_else(|| "get_func gate_sim_states".to_string())?
+            .launch(k0_cfg, (&d_gates, &d_x, &mut d_rep, k, n_gates, n_shots))
+            .map_err(|e| format!("launch gate_sim_states: {e}"))?;
+    }
+    // K1: thread-per-execution — n_shots*k threads.
+    let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (block, 1, 1),
@@ -1239,7 +1374,7 @@ pub fn gpu_gen_main_trace_device(
         func.launch(
             cfg,
             (
-                &d_gates, &d_x, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
+                &d_gates, &d_rep, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
                 k, n_gates, n_shots, padded_rows as u64,
             ),
         )
@@ -1340,7 +1475,7 @@ pub fn gpu_gen_interaction_device(
     // kept entirely on-device for K4 to consume. (Same buffer the device main path
     // uses; reproduced here so K4 owns a cudarc buffer it can read with `COL`.)
     let mtx = compile_ptx(GATE_SIM_KERNEL).map_err(|e| format!("nvrtc compile (K1 for K4): {e}"))?;
-    dev.load_ptx(mtx, "gate_sim_mod", &["gate_sim", "fill_padding"])
+    dev.load_ptx(mtx, "gate_sim_mod", &["gate_sim_states", "gate_sim", "fill_padding"])
         .map_err(|e| format!("load_ptx (K1 for K4): {e}"))?;
     let gate_sim = dev
         .get_func("gate_sim_mod", "gate_sim")
@@ -1355,8 +1490,25 @@ pub fn gpu_gen_interaction_device(
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
     let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
     let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
+    let n_exec = (n_shots as u64) * (k as u64);
+    let mut d_rep = dev
+        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
+        .map_err(|e| format!("alloc rep_states: {e}"))?;
     let block = 256u32;
-    let grid = n_shots.div_ceil(block);
+    // K0: thread-per-shot — fill rep-boundary states.
+    let k0_cfg = LaunchConfig {
+        grid_dim: (n_shots.div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        dev.get_func("gate_sim_mod", "gate_sim_states")
+            .ok_or_else(|| "get_func gate_sim_states".to_string())?
+            .launch(k0_cfg, (&d_gates, &d_x, &mut d_rep, k, n_gates, n_shots))
+            .map_err(|e| format!("launch gate_sim_states (for K4): {e}"))?;
+    }
+    // K1: thread-per-execution — n_shots*k threads.
+    let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg_shots = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (block, 1, 1),
@@ -1367,7 +1519,7 @@ pub fn gpu_gen_interaction_device(
             .launch(
                 cfg_shots,
                 (
-                    &d_gates, &d_x, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo,
+                    &d_gates, &d_rep, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo,
                     &mut d_hi, k, n_gates, n_shots, padded_rows as u64,
                 ),
             )

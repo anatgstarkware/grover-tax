@@ -6,7 +6,7 @@
 #
 #   bin/verify_stwo.sh <proof_path>
 #
-# Symmetric with `bin/verify_sp1.sh`. Reads `fixtures/v0.1.json` from a
+# Symmetric with `bin/verify_sp1.sh`. Reads `fixtures/v0.2.json` from a
 # fixed relative path (the cwd) for the sanity check. v0.1 spec target:
 # verifies the apples-to-apples Cairo 1 → bootloader → stwo-cairo Circle
 # STARK proof produced by `bin/run_stwo.sh` / `bin/apples-prove`.
@@ -18,13 +18,13 @@
 
 set -euo pipefail
 
-FIXTURE_RELATIVE_PATH="fixtures/v0.1.json"
+FIXTURE_RELATIVE_PATH="fixtures/v0.2.json"
 
 usage() {
   cat >&2 <<'EOF'
 Usage: bin/verify_stwo.sh <proof_path>
 
-Reads `fixtures/v0.1.json` from the current working directory.
+Reads `fixtures/v0.2.json` from the current working directory.
 
 Exit codes:
   0  proof valid; stdout empty

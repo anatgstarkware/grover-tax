@@ -19,14 +19,21 @@ use circuits_stark_verifier::verify::verify;
 use circuit_common::N_RESERVED;
 use circuit_common::finalize::{ComponentSizes, compute_padded_sizes, pad_to_targets};
 use circuit_common::preprocessed::PreprocessedCircuit;
-use circuit_prover::prover::{prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment};
+use circuit_prover::prover::{
+    prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment,
+    prove_circuit_with_precompute,
+};
+use std::sync::Arc;
+
 use recursive_aggregate::{
-    AggregateConfig, TreeProof, multiverifier_node_preprocessed, preprocessed_root,
-    shared_config_for_leaf,
+    AggregateConfig, CircuitPrecompute, TreeProof, multiverifier_node_preprocessed,
+    preprocessed_root, shared_config_for_leaf,
 };
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
+use stwo::core::utils::MaybeOwned;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
 
@@ -137,12 +144,40 @@ pub fn derive_aggregate_config(
     let (node_pp, _) = multiverifier_node_preprocessed(&leaf_pp, pcs, Some(target.clone()));
     let node_preprocessed_root = preprocessed_root(&node_pp, log_blowup_factor);
 
+    // Build the shared config before the precompute moves `leaf_pp`.
+    let shared_config = shared_config_for_leaf(&leaf_pp, pcs);
+
+    // Build the witness-independent proving precompute (committed tree0 + twiddles) once for the leaf
+    // and node shapes; every leaf/node prove reuses it instead of rebuilding tree0. `new` asserts the
+    // cached tree's root equals the already-trusted root before any proof is produced.
+    // GATE_AIR_NO_PRECOMPUTE=1 leaves both caches `None` so the same build runs the fallback
+    // (rebuild-tree0-per-prove) path, for byte-identity validation.
+    let no_precompute = std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok();
+    let (leaf_precompute, node_precompute) = if no_precompute {
+        (None, None)
+    } else {
+        (
+            Some(Arc::new(CircuitPrecompute::new(
+                leaf_pp,
+                pcs,
+                leaf_preprocessed_root,
+            ))),
+            Some(Arc::new(CircuitPrecompute::new(
+                node_pp,
+                pcs,
+                node_preprocessed_root,
+            ))),
+        )
+    };
+
     AggregateConfig {
-        shared_config: shared_config_for_leaf(&leaf_pp, pcs),
+        shared_config,
         node_preprocessed_root,
         leaf_preprocessed_root,
         target_padding_sizes: target,
         pcs_config: pcs,
+        node_precompute,
+        leaf_precompute,
     }
 }
 
@@ -156,13 +191,27 @@ pub fn prove_gate_air_leaf(
 ) -> TreeProof {
     let mut context = build_gate_air_leaf_circuit::<QM31>(real_proof, cfg, params);
     pad_to_targets(&mut context, config.target_padding_sizes.clone());
-    let preprocessed = PreprocessedCircuit::preprocess_circuit(&mut context);
-    let circuit_proof = prove_circuit_assignment(
-        context.values(),
-        &preprocessed,
-        &BaseColumnPool::<SimdBackend>::new(),
-        config.pcs_config,
-    )
+    // Reuse the witness-independent precompute (committed tree0 + twiddles) when present, otherwise
+    // fall back to the self-contained path that rebuilds tree0 per call.
+    let circuit_proof = match &config.leaf_precompute {
+        Some(pc) => prove_circuit_with_precompute::<Blake2sM31MerkleChannel>(
+            &pc.base_column_pool,
+            &pc.twiddles,
+            &pc.preprocessed,
+            MaybeOwned::Borrowed(&pc.tree),
+            context.values(),
+            pc.pcs_config,
+        ),
+        None => {
+            let preprocessed = PreprocessedCircuit::preprocess_circuit(&mut context);
+            prove_circuit_assignment(
+                context.values(),
+                &preprocessed,
+                &BaseColumnPool::<SimdBackend>::new(),
+                config.pcs_config,
+            )
+        }
+    }
     .expect("gate_air leaf prove failed");
     let (proof, public_data) = prepare_circuit_proof_for_circuit_verifier(circuit_proof);
     let output_values = public_data

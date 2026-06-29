@@ -20,6 +20,7 @@ pub mod serialise;
 pub mod commit;
 pub mod c_tests;
 pub mod io;
+pub mod qsim;
 
 use core::array::ArrayTrait;
 use grover_tax_circuit::commit::commit_blake2s;
@@ -60,7 +61,7 @@ fn secp256k1_p() -> u256 {
 /// Convert 8 little-endian u32 words (= Blake2s output) to a big-endian
 /// `u256`. The 32-byte digest is interpreted exactly as SP1's side does
 /// with `U256::from_be_bytes` of the raw digest bytes.
-fn digest_to_u256_be(d: [u32; 8]) -> u256 {
+pub fn digest_to_u256_be(d: [u32; 8]) -> u256 {
     let [d0, d1, d2, d3, d4, d5, d6, d7] = d;
     // d0..d7 are little-endian u32 words of the digest bytes b0..b31.
     // The big-endian u256 reads bytes b0 (MSB) through b31 (LSB).
