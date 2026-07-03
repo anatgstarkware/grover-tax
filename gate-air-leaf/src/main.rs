@@ -2280,33 +2280,47 @@ fn main() -> Result<()> {
     // immediately before the FRI `prove` call; `prove_s`/`verify_s` stay as-is.
     let trace_gen_start = Instant::now();
 
-    let build_start = Instant::now();
-    let (rows, counts) = build_rows(&gates, cases, k, &rc_lo_index, &rc_hi_index)?;
-    let build_elapsed = build_start.elapsed();
-
-    let real_rows = rows.len();
+    // Shape scalars. `build_rows` returns exactly `cases.len() * k * n_gates` rows
+    // (`cases.len() == samples`), so `real_rows` and the derived padding are computed here CHEAPLY —
+    // without materializing the O(samples) `Vec<Row>`. The FOLD path (which returns before the
+    // single-proof path below) only ever needs these scalars; each shard rebuilds its OWN rows in
+    // `prove_base_shard` and derives shape from `shard_bases[0]`. Only the non-fold single-proof
+    // path (and the no-prove report) consumes the full witness, so `rows`/`counts` are built there.
+    let real_rows = samples * k * n_gates;
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
 
-    if (samples * k * n_gates) >= M31_MODULUS_U32 as usize {
+    if real_rows >= M31_MODULUS_U32 as usize {
         bail!("pc timeline does not fit in M31");
     }
 
-    eprintln!(
-        "gate-air: samples={} K={} n_gates={} real_rows={} padded_rows={} log_rows={} columns={}",
-        samples, k, n_gates, real_rows, padded_rows, log_n_rows, TRACE_COLUMNS
-    );
-    eprintln!(
-        "gate-air: shots simulated and self-checked (final state == y) in {:.3}s",
-        build_elapsed.as_secs_f64()
-    );
+    // In FOLD mode this top-level buffer is DEAD (each shard rebuilds its own), so skip it — at
+    // large N it is the single O(N)-scaling host allocation (`Row` is 776 bytes) and OOMs the box.
+    let fold_active = std::env::var("GATE_AIR_FOLD").is_ok();
+    let (rows, counts) = if fold_active {
+        (Vec::<Row>::new(), LookupCounts::new())
+    } else {
+        let build_start = Instant::now();
+        let (rows, counts) = build_rows(&gates, cases, k, &rc_lo_index, &rc_hi_index)?;
+        let build_elapsed = build_start.elapsed();
 
-    if args.no_prove {
-        println!(
-            "{{\"schema\":\"gate-air-report/v1\",\"samples\":{samples},\"repetitions\":{k},\"n_gates\":{n_gates},\"real_rows\":{real_rows},\"padded_rows\":{padded_rows},\"log_rows\":{log_n_rows},\"trace_columns\":{TRACE_COLUMNS},\"proved\":false,\"self_check\":\"final_state_matches_y\"}}"
+        eprintln!(
+            "gate-air: samples={} K={} n_gates={} real_rows={} padded_rows={} log_rows={} columns={}",
+            samples, k, n_gates, real_rows, padded_rows, log_n_rows, TRACE_COLUMNS
         );
-        return Ok(());
-    }
+        eprintln!(
+            "gate-air: shots simulated and self-checked (final state == y) in {:.3}s",
+            build_elapsed.as_secs_f64()
+        );
+
+        if args.no_prove {
+            println!(
+                "{{\"schema\":\"gate-air-report/v1\",\"samples\":{samples},\"repetitions\":{k},\"n_gates\":{n_gates},\"real_rows\":{real_rows},\"padded_rows\":{padded_rows},\"log_rows\":{log_n_rows},\"trace_columns\":{TRACE_COLUMNS},\"proved\":false,\"self_check\":\"final_state_matches_y\"}}"
+            );
+            return Ok(());
+        }
+        (rows, counts)
+    };
 
     // ---- Multiverifier-tree integration (Milestone 3), gated by GATE_AIR_FOLD ----
     // Prove the gate_air verification circuit as a foldable leaf, ONE PER SHARD, and fold the N
@@ -2343,7 +2357,7 @@ fn main() -> Result<()> {
     // root aggregates these distinct per-shard output hashes (verified below via rv.leaf_outputs).
     // The remaining M3c refinement (fold the program commitment H_P into each H_i) is a binding
     // STRENGTHENING, not a correctness fix for sharding, and is left for the code owner.
-    if std::env::var("GATE_AIR_FOLD").is_ok() {
+    if fold_active {
         use circuit_statement::gate_air_components;
         use circuits::blake::ReducedHashValue;
         use circuits::ivalue::NoValue;
@@ -2915,12 +2929,29 @@ fn main() -> Result<()> {
         );
 
         // Partition the machine so independent leaf proves run concurrently (POOL_THREADS sweet spot).
+        // MEMORY/THROUGHPUT TRADEOFF: each concurrent pool holds one large in-flight `TreeProof`
+        // (FRI layers + Merkle decommits, multi-GB) while it proves a leaf/fold node, so the number
+        // of pools == the number of proofs in flight == the multiplier on peak host RAM. On a big box
+        // (96 vCPU) we want K = cores/48 pools for real leaf/fold concurrency; on a memory-limited box
+        // (12 vCPU, ~40-85GB) K collapses to 1 (12/48 -> 0 -> max(1)), which is what we want: a single
+        // in-flight fold proof, no RAM multiplier. That already prevents the N>=4 concurrency OOM.
+        //
+        // The remaining waste: `PoolSet::new(1, 48)` would still spawn 48 rayon OS threads (each with
+        // a large default stack, and 48 > 12 cores oversubscribes) for a pool that only ever runs one
+        // proof at a time. When a single pool is used we therefore clamp its worker count to the
+        // actual core count, so we don't reserve ~48 big thread stacks on a 12-core box. This is a
+        // pure thread-count change (rayon fan-out over NTT/Merkle/FRI is order-independent) and does
+        // not touch any proof value -> byte-identical output.
         let pool_threads: usize = std::env::var("POOL_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(48);
         let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(pool_threads);
-        let pools = PoolSet::new((cores / pool_threads).max(1), pool_threads);
+        let n_pools = (cores / pool_threads).max(1);
+        // With a single pool there is no sibling proof to run alongside it, so let that one pool use
+        // all cores rather than reserving `pool_threads` (48) large thread stacks it can't schedule.
+        let threads_per_pool = if n_pools == 1 { pool_threads.min(cores) } else { pool_threads };
+        let pools = PoolSet::new(n_pools, threads_per_pool);
 
         // Per-shard distinct leaf: build the GateAirLeafParams for THIS shard (its own boundary +
         // preprocessed root), convert THIS shard's base proof to circuit values, and prove the leaf.
