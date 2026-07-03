@@ -302,16 +302,22 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
     ) {
         let cols = component_data.trace_columns();
         assert_eq!(cols.len(), TRACE_COLUMNS, "main: unexpected trace column count");
-        let enabler = cols[0];
-        let is_nop = cols[1];
-        let is_not = cols[2];
-        let is_cnot = cols[3];
-        let is_toffoli = cols[4];
-        let shot_id = cols[5];
-        let pc = cols[6];
-        let in_limb: Vec<Var> = cols[7..7 + N_LIMBS].to_vec();
-        let out_limb: Vec<Var> = cols[7 + N_LIMBS..7 + 2 * N_LIMBS].to_vec();
-        let base = 7 + 2 * N_LIMBS;
+        // enabler, shot_id, pc were moved OUT of the main witness trace into the preprocessed tree
+        // (tree0). They are read via `get_preprocessed_column` (same value-type as a trace mask, so
+        // usable identically in constraints and as the LogUp numerator). The remaining main-trace
+        // header is just the 4 opcode one-hots, so every subsequent column index dropped by 3.
+        let enabler = acc.get_preprocessed_column(&pp_id("gate_enabler"));
+        let shot_id = acc.get_preprocessed_column(&pp_id("gate_shot_id"));
+        let pc = acc.get_preprocessed_column(&pp_id("gate_pc"));
+        let pc_in_prog = acc.get_preprocessed_column(&pp_id("gate_pc_in_prog"));
+
+        let is_nop = cols[0];
+        let is_not = cols[1];
+        let is_cnot = cols[2];
+        let is_toffoli = cols[3];
+        let in_limb: Vec<Var> = cols[4..4 + N_LIMBS].to_vec();
+        let out_limb: Vec<Var> = cols[4 + N_LIMBS..4 + 2 * N_LIMBS].to_vec();
+        let base = 4 + 2 * N_LIMBS;
         let read_w = 4 + N_LIMBS + 3;
         let target = parse_read(cols, base);
         let ctrl_a = parse_read(cols, base + read_w);
@@ -319,8 +325,6 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         let ab = cols[base + 3 * read_w];
         let fire = cols[base + 3 * read_w + 1];
         let delta = cols[base + 3 * read_w + 2];
-
-        let pc_in_prog = acc.get_preprocessed_column(&pp_id("gate_pc_in_prog"));
         let one = context.one();
         let two = konst(context, 2);
         let three = konst(context, 3);
@@ -411,10 +415,17 @@ pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn Ci
 pub struct GateAirStatement<Value: IValue> {
     components: IndexMap<&'static str, Box<dyn CircuitEval<Value>>>,
     component_log_sizes: Simd,
-    /// Preprocessed-trace Merkle root (from the proof's commitments[0], via `.into()`).
-    preprocessed_root: ReducedHashValue<QM31>,
-    /// (x_limbs, y_limbs) per shot (shot_id = index) for the public state boundary.
-    boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
+    /// Base-proof preprocessed-trace Merkle root, GUESSED as a witness Var pair (not baked as a
+    /// circuit constant) so it stays out of the leaf's preprocessed trace and all leaves share ONE
+    /// `leaf_preprocessed_root`. Stays BOUND because `get_preprocessed_root` returns exactly these
+    /// Vars, and `verify` uses that return value as the Merkle root for the base proof's
+    /// preprocessed-trace decommitment — a wrong guess fails decommitment.
+    preprocessed_root: ReducedHashValue<Var>,
+    /// (x_limbs, y_limbs) per shot (shot_id = index) for the public state boundary, GUESSED as
+    /// witness Vars (not baked as circuit constants). Stay BOUND because `public_logup_sum` feeds
+    /// them into the LogUp boundary term that `validate_logup_sum` checks against the verified
+    /// proof's claimed sums — a wrong guess makes `public_logup_sum + Σ claimed_sums == 0` fail.
+    boundary: Vec<([Var; N_LIMBS], [Var; N_LIMBS])>,
     total_pc: u32,
     /// Main-trace + program-table log sizes — needed to reproduce the DYNAMIC preprocessed column
     /// order (pc_in_prog is sized with the main trace, so the size-sorted order depends on it).
@@ -439,6 +450,22 @@ impl<Value: IValue> GateAirStatement<Value> {
             .map(|qm31| Value::from_qm31(qm31).guess(context))
             .collect::<Vec<_>>();
         let component_log_sizes = Simd::from_packed(packed, n_components);
+
+        // Per-shard data → GUESSED witness Vars (not `context.constant`), so the leaf circuit SHAPE
+        // (and hence `leaf_preprocessed_root`) is identical for every shard; only the witness
+        // differs. Bindings are re-established by `get_preprocessed_root` / `public_logup_sum`.
+        let preprocessed_root = ReducedHashValue(
+            Value::from_qm31(preprocessed_root.0).guess(context),
+            Value::from_qm31(preprocessed_root.1).guess(context),
+        );
+        let boundary = boundary
+            .iter()
+            .map(|(x_limbs, y_limbs)| {
+                let x = x_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
+                let y = y_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
+                (x, y)
+            })
+            .collect::<Vec<_>>();
         Self {
             components: gate_air_components(),
             component_log_sizes,
@@ -448,6 +475,19 @@ impl<Value: IValue> GateAirStatement<Value> {
             main_log_size,
             program_log_size,
         }
+    }
+
+    /// The guessed base-proof preprocessed root Vars (for building the leaf's output-hash preimage).
+    /// These are the same Vars `get_preprocessed_root` returns into `verify`, so the output commits
+    /// to the bound root, not a parallel free copy.
+    pub fn preprocessed_root_vars(&self) -> &ReducedHashValue<Var> {
+        &self.preprocessed_root
+    }
+
+    /// The guessed boundary (x, y) limb Vars per shot (for the leaf's output-hash preimage). These
+    /// are the same Vars `public_logup_sum` constrains to the base proof's x/y.
+    pub fn boundary_vars(&self) -> &[([Var; N_LIMBS], [Var; N_LIMBS])] {
+        &self.boundary
     }
 }
 
@@ -466,11 +506,11 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
         preprocessed_column_ids(self.main_log_size, self.program_log_size)
     }
-    fn get_preprocessed_root(&self, context: &mut Context<Value>) -> ReducedHashValue<Var> {
-        ReducedHashValue(
-            context.constant(self.preprocessed_root.0),
-            context.constant(self.preprocessed_root.1),
-        )
+    fn get_preprocessed_root(&self, _context: &mut Context<Value>) -> ReducedHashValue<Var> {
+        // Return the GUESSED root Vars. `verify` mixes this into the channel and uses it as the
+        // Merkle root for the base proof's preprocessed-trace decommitment, so a wrong guess fails
+        // verification (the guess stays bound, not a free parallel copy).
+        ReducedHashValue(self.preprocessed_root.0, self.preprocessed_root.1)
     }
     fn public_logup_sum(&self, context: &mut Context<Value>, interaction_elements: [Var; 2]) -> Var {
         // verify checks `public_logup_sum + Σ claimed_sums == 0`, and gate_air's Σ claimed_sums =
@@ -482,10 +522,13 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         let mut sum = context.zero();
         for (shot_id, (x_limbs, y_limbs)) in self.boundary.iter().enumerate() {
             let shot = konst(context, shot_id as u32);
+            // x/y are GUESSED Vars; feeding them into the boundary LogUp term that
+            // `validate_logup_sum` checks against the verified proof's claimed sums binds them to
+            // the base proof's actual x/y (a wrong guess breaks the sum-to-zero check).
             let mut e_in = vec![tag, shot, zero_pc];
-            e_in.extend(x_limbs.iter().map(|&v| konst(context, v)));
+            e_in.extend_from_slice(x_limbs);
             let mut e_out = vec![tag, shot, total];
-            e_out.extend(y_limbs.iter().map(|&v| konst(context, v)));
+            e_out.extend_from_slice(y_limbs);
             let ci = combine_term(context, &e_in, interaction_elements);
             let cf = combine_term(context, &e_out, interaction_elements);
             let ci_inv = inv(context, ci);
@@ -534,11 +577,19 @@ mod constraint_tests {
                 qm31_from_u32s(0, 0, 0, 0),
                 1 << 14,
             );
-            let pc = cell_at(row, 6);
-            let pp = HashMap::from([(
-                pp_id("gate_pc_in_prog"),
-                ctx.constant(qm31_from_u32s(pc % n_gates, 0, 0, 0)),
-            )]);
+            // enabler / shot_id / pc are now PREPROCESSED (not in the trace), so feed them via the
+            // preprocessed map exactly as the prover's tree0 would. (Valid rows here are all real,
+            // so enabler = 1.)
+            let pc = row.pc;
+            let pp = HashMap::from([
+                (pp_id("gate_enabler"), ctx.constant(qm31_from_u32s(row.enabler, 0, 0, 0))),
+                (pp_id("gate_shot_id"), ctx.constant(qm31_from_u32s(row.shot_id, 0, 0, 0))),
+                (pp_id("gate_pc"), ctx.constant(qm31_from_u32s(pc, 0, 0, 0))),
+                (
+                    pp_id("gate_pc_in_prog"),
+                    ctx.constant(qm31_from_u32s(pc % n_gates, 0, 0, 0)),
+                ),
+            ]);
             let coeff = ctx.constant(qm31_from_u32s(7, 11, 13, 17));
             let ie = [
                 ctx.constant(qm31_from_u32s(2, 3, 5, 7)),

@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
+use stwo::prover::backend::cuda::fused_commit;
 use stwo::stwo_cuda::base_field_vec::BaseFieldVec;
 use stwo::stwo_cuda::bindings::CudaSecureField;
 
@@ -43,6 +44,16 @@ extern "C" {
         trace1_evaluations_len: u32,
         trace2_evaluations: *const *const u32,
         trace2_evaluations_len: u32,
+        // COMPOSITION_TILING_SCOPE (route c) + FULL (A): PER-COLUMN host-tile-source tables for
+        // tree0/tree1. A non-null table has one entry per column: the column's committed host bytes
+        // if that column is STAGED (row-tiled, H2D per block), or NULL if that column is RESIDENT
+        // (the kernel then uses its live device pointer whole — the resident sentinel). A wholly-
+        // null TABLE means the whole tree is resident. The kernel row-tiles iff EITHER table is
+        // non-null and dispatches each column independently (mixed supply). Both tables null =>
+        // legacy resident path (BYTE-FOR-BYTE). MUST match the CUDA `evaluate_gate_air_entry` arg
+        // list in stwo-cuda-backend gate_air_entry.cu — a mismatch is UB.
+        host_trace0: *const *const u32,
+        host_trace1: *const *const u32,
         random_coeff_powers: *const u32,
         denominator_inverses: *const u32,
         domain_log_size: u32,
@@ -57,9 +68,9 @@ extern "C" {
 }
 
 /// gate_air structural constants (must equal the Rust constants in gate-air-leaf src/main.rs).
-const GATE_AIR_TRACE_COLUMNS: usize = 191; // main columns (trace1)
+const GATE_AIR_TRACE_COLUMNS: usize = 188; // main columns (trace1); witness-shrink moved enabler/shot_id/pc to tree0
 const GATE_AIR_INTERACTION_COLUMNS: usize = 24; // 6 LogUp cols * 4 QM31 coords (trace2)
-const GATE_AIR_PREPROCESSED_COLUMNS: usize = 1; // gate_pc_in_prog (trace0)
+const GATE_AIR_PREPROCESSED_COLUMNS: usize = 4; // enabler, shot_id, pc, pc_in_prog (trace0), in get_preprocessed_column call order
 const GATE_AIR_N_CONSTRAINTS: usize = 151 + 6; // 151 algebraic + 6 LogUp pair-batch constraints
 const GATE_AIR_LOGUP_COUNTS: u32 = 12; // 12 relation entries -> 6 pairs
 
@@ -130,7 +141,11 @@ static GATE_AIR_RELATION: Mutex<Option<([u32; 4], [[u32; 4]; 35])>> = Mutex::new
 /// must contain 35 entries (alpha^0..alpha^34), each as M31x4 coords. No effect unless the kernel
 /// gate (`CUDA_GPU_CONSTRAINTS=1` + gate_air main) fires.
 pub fn set_gate_air_relation(z: [u32; 4], alpha_powers: Vec<[u32; 4]>) {
-    assert_eq!(alpha_powers.len(), 35, "gate_air relation needs 35 alpha powers");
+    assert_eq!(
+        alpha_powers.len(),
+        35,
+        "gate_air relation needs 35 alpha powers"
+    );
     let mut ap = [[0u32; 4]; 35];
     ap.copy_from_slice(&alpha_powers[..35]);
     *GATE_AIR_RELATION.lock().unwrap() = Some((z, ap));
@@ -155,9 +170,51 @@ struct GateAirKernelInputs<'a> {
 /// Call the gate_air GPU constraint kernel, writing into the 4 device accumulator coordinate
 /// columns. Returns `false` (host-delegate fallback) if the drawn relation was not installed.
 fn run_gate_air_kernel(inputs: GateAirKernelInputs<'_>, accum_cols: [&BaseFieldVec; 4]) -> bool {
-    let trace0_ptrs: Vec<*const u32> = inputs.trace0.iter().map(|c| c.device_ptr).collect();
-    let trace1_ptrs: Vec<*const u32> = inputs.trace1.iter().map(|c| c.device_ptr).collect();
+    // DIAGNOSTIC (GATE_AIR_DIAG_FULL_REHYDRATE=1): bisect the A-side (composition) staged read.
+    // When set, every STAGED tree0/tree1 column is `rehydrate_owned` into a fresh OWNED device
+    // buffer here and fed to the kernel as RESIDENT (its fresh device ptr in traceX_ptrs; host
+    // table entry NULL), so the kernel reads it WHOLE/live and NEVER takes the per-block
+    // H2D-from-host-table (tile-buffer) path. Interpretation of a both-flags @2^22 run:
+    //   * now PASSES  => the bug is in the composition kernel's per-block staged read mechanics
+    //     (host-table / tile-buffer / bias), NOT the stashed bytes.
+    //   * still FAILS => `rehydrate_owned` reads the SAME wrong bytes the per-block path would,
+    //     so the bug is in the STASHED BYTES themselves (dehydrate captured wrong/stale data).
+    // Scoped strictly to this composition dispatch; the keepalive Vec below owns the rehydrated
+    // buffers for the FFI-call lifetime and frees them on return. Diagnostic only (not a perf path;
+    // full rehydrate is cheap at 2^22).
+    let diag_full_rehydrate = std::env::var("GATE_AIR_DIAG_FULL_REHYDRATE").is_ok();
+
+    // Rehydrated owned buffers (diagnostic only). Held for the whole FFI-call lifetime; on
+    // `diag_full_rehydrate` the traceX_ptrs entry for a staged column points into one of these.
+    let mut diag_rehydrated0: Vec<BaseFieldVec> = Vec::new();
+    let mut diag_rehydrated1: Vec<BaseFieldVec> = Vec::new();
+
+    let mut trace0_ptrs: Vec<*const u32> = inputs.trace0.iter().map(|c| c.device_ptr).collect();
+    let mut trace1_ptrs: Vec<*const u32> = inputs.trace1.iter().map(|c| c.device_ptr).collect();
     let trace2_ptrs: Vec<*const u32> = inputs.trace2.iter().map(|c| c.device_ptr).collect();
+
+    if diag_full_rehydrate {
+        for (c, col) in inputs.trace0.iter().enumerate() {
+            if fused_commit::is_staged(col) {
+                let owned = fused_commit::rehydrate_owned(col);
+                trace0_ptrs[c] = owned.device_ptr;
+                diag_rehydrated0.push(owned);
+            }
+        }
+        for (c, col) in inputs.trace1.iter().enumerate() {
+            if fused_commit::is_staged(col) {
+                let owned = fused_commit::rehydrate_owned(col);
+                trace1_ptrs[c] = owned.device_ptr;
+                diag_rehydrated1.push(owned);
+            }
+        }
+        eprintln!(
+            "[GATE_AIR_DIAG] full-rehydrate ON: rehydrated {} tree0 + {} tree1 staged cols to \
+             resident for the composition kernel",
+            diag_rehydrated0.len(),
+            diag_rehydrated1.len()
+        );
+    }
 
     // Upload denom_inv to device (small: 2^log_expand entries).
     let denom_inv_dev = BaseFieldVec::from_vec(inputs.denom_inv.to_vec());
@@ -178,6 +235,90 @@ fn run_gate_air_kernel(inputs: GateAirKernelInputs<'_>, accum_cols: [&BaseFieldV
         (inputs.trace0.len() + inputs.trace1.len() + inputs.trace2.len()) as u32;
     let random_coeff_powers_ptr = inputs.random_coeff_powers.as_ptr() as *const u32;
 
+    // COMPOSITION_TILING_SCOPE (route c) + FULL (A) per-column mixed supply: under
+    // GATE_AIR_STREAM_COMMIT only the 188 LARGE tree1 eval columns are host-staged (their device
+    // buffers freed, bytes in the fused_commit stash); the 4 tree0 preprocessed columns and the
+    // small tree1 (multiplicity/witness/program) columns stay RESIDENT on device.
+    // `build_scoped_device_trace` leaves a staged column as a NON-OWNING passthrough carrying the
+    // stash-key device pointer (so `staged_host_ptr` resolves here) and keeps a resident column as
+    // its live device buffer. So tree1 is a MIX and tree0 is fully resident.
+    //
+    // Build PER-COLUMN host tables: entry c = the staged host stash base pointer if column c is
+    // staged, else NULL (the kernel's resident sentinel — it then uses the column's live device
+    // pointer, whole, exactly as the resident path). Pass a table pointer iff AT LEAST ONE column
+    // of that tree is staged; a wholly-resident tree (tree0 here) passes a NULL table. The kernel's
+    // `tiled_input` is true iff EITHER table is non-null, and it dispatches each column
+    // independently — so a resident tree0 does NOT force the whole eval-set resident (which would
+    // dereference the freed stash-key pointers of the staged tree1 cols — the 2^24 illegal address).
+    // When NOTHING is staged (legacy/resident shard) both tables are null and the kernel takes the
+    // byte-for-byte resident path. tree2 is always resident (scope §1.3) — no host supply.
+    // Under the diagnostic, force EVERY host-table entry NULL: the staged columns were rehydrated
+    // to resident above (their fresh device ptr is in traceX_ptrs), so the kernel must read them
+    // whole/live, not via the per-block host table. `null_table` on both trees makes `tiled_input`
+    // false in the kernel => byte-for-byte the resident path over the rehydrated buffers.
+    let null_table = |c: &&BaseFieldVec| -> *const u32 {
+        let _ = c;
+        std::ptr::null()
+    };
+    let host0: Vec<*const u32> = inputs
+        .trace0
+        .iter()
+        .map(|c| {
+            if diag_full_rehydrate {
+                null_table(&c)
+            } else {
+                fused_commit::staged_host_ptr(c).map_or(std::ptr::null(), |(p, _)| p)
+            }
+        })
+        .collect();
+    let host1: Vec<*const u32> = inputs
+        .trace1
+        .iter()
+        .map(|c| {
+            if diag_full_rehydrate {
+                null_table(&c)
+            } else {
+                fused_commit::staged_host_ptr(c).map_or(std::ptr::null(), |(p, _)| p)
+            }
+        })
+        .collect();
+
+    // DIAGNOSTIC INSTRUMENTATION (printed regardless of the flag): how many tree0/tree1 columns
+    // resolve STAGED vs RESIDENT at composition-kernel dispatch time. `is_staged` reflects the
+    // owns_memory-guarded truth; under the diagnostic flag the host tables are nulled AFTER this
+    // count, so this count is the pre-diagnostic (real) staged/resident split.
+    {
+        let staged0 = inputs.trace0.iter().filter(|c| fused_commit::is_staged(c)).count();
+        let staged1 = inputs.trace1.iter().filter(|c| fused_commit::is_staged(c)).count();
+        eprintln!(
+            "[GATE_AIR_DIAG] composition dispatch: tree0 {}/{} staged, tree1 {}/{} staged \
+             (diag_full_rehydrate={})",
+            staged0,
+            inputs.trace0.len(),
+            staged1,
+            inputs.trace1.len(),
+            diag_full_rehydrate,
+        );
+        // Print + reset the dehydrate counters accumulated during the tree1 commit (which ran
+        // before this composition dispatch). Shows how many large-col dehydrations early-returned
+        // on a reused stash key.
+        fused_commit::diag_report_dehydrate("tree1-commit -> composition");
+    }
+    // A tree with NO staged column passes a null table (fully resident); otherwise pass the
+    // per-column table (staged entries carry the host ptr, resident entries are null).
+    let any0_staged = host0.iter().any(|p| !p.is_null());
+    let any1_staged = host1.iter().any(|p| !p.is_null());
+    // Keepalives own the tables for the FFI-call lifetime; take pointers AFTER binding so they
+    // reference the surviving allocation (never a moved/dropped Vec).
+    let host0_keepalive = any0_staged.then_some(host0);
+    let host1_keepalive = any1_staged.then_some(host1);
+    let host_trace0_ptr = host0_keepalive
+        .as_ref()
+        .map_or(std::ptr::null(), |h| h.as_ptr());
+    let host_trace1_ptr = host1_keepalive
+        .as_ref()
+        .map_or(std::ptr::null(), |h| h.as_ptr());
+
     unsafe {
         evaluate_gate_air_entry(
             q0,
@@ -190,6 +331,8 @@ fn run_gate_air_kernel(inputs: GateAirKernelInputs<'_>, accum_cols: [&BaseFieldV
             trace1_ptrs.len() as u32,
             trace2_ptrs.as_ptr(),
             trace2_ptrs.len() as u32,
+            host_trace0_ptr,
+            host_trace1_ptr,
             random_coeff_powers_ptr,
             denom_inv_dev.device_ptr,
             inputs.domain_log_size,

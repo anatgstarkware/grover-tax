@@ -44,10 +44,13 @@ circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits
 gate-air-cuda-kernel = { path = "../gate-air-cuda-kernel", optional = true }
 
 [features]
-# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs, via cudarc/NVRTC). `gpu` is the module gate;
-# `gpu-cuda` adds the cudarc runtime (GPU box).
-gpu = []
-gpu-cuda = ["gpu", "dep:cudarc"]
+# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs, via cudarc/NVRTC). `gpu-cuda` gates the
+# module and pulls in the cudarc runtime (GPU box).
+gpu-cuda = ["dep:cudarc"]
+# Byte-identity / diagnostic hooks (GATE_AIR_GPU_TEST, GATE_AIR_PROOF_HASH, k1/k4 byte-identity
+# harnesses). Validation-only — production `cuda` builds deliberately do NOT pull this, so the
+# shipped prover stays clean. Use `--features cuda,diag` for the byte-identity validation runs.
+diag = []
 # Device-resident CUDA prover backend: swaps ProverBackend -> CudaBackend (commit + prove_ex on the
 # device) and installs the gate_air constraint kernel. Pulls gpu-cuda for the K1/K4 trace-gen glue.
 cuda = [

@@ -10,10 +10,9 @@
 
 use circuits::blake::{ReducedHashValue, blake2s_m31};
 use circuits::context::{Context, FinalizedContext};
-use circuits::ivalue::{IValue, NoValue, qm31_from_u32s};
+use circuits::ivalue::{IValue, NoValue};
 use circuits::ops::Guess;
 use circuits_stark_verifier::proof::{Proof, ProofConfig, empty_proof};
-use circuits_stark_verifier::statement::Statement;
 use circuits_stark_verifier::verify::verify;
 
 use circuit_common::N_RESERVED;
@@ -101,14 +100,16 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     let proof_vars = proof.guess(&mut context);
     verify(&mut context, &proof_vars, cfg, &statement);
 
-    // Leaf output: hash the (constant) preprocessed root and the verified state boundary, so the
-    // 2 reserved outputs commit to (x, y) for every shot. Preimage = [ppR.0, ppR.1, x.., y..].
-    let pp_root = statement.get_preprocessed_root(&mut context);
+    // Leaf output: hash the (now GUESSED, witness) preprocessed root and verified state boundary, so
+    // the 2 reserved outputs commit to (x, y) for every shot. Preimage = [ppR.0, ppR.1, x.., y..].
+    // These are the SAME guessed Vars that `verify` bound: the root via the preprocessed-trace
+    // Merkle decommitment, and the x/y via the boundary LogUp sum. So the commitment is over the
+    // bound values, and keeping them witness (not `context.constant`) keeps the leaf's preprocessed
+    // trace — and `leaf_preprocessed_root` — identical across shards.
+    let pp_root = statement.preprocessed_root_vars();
     let mut preimage = vec![pp_root.0, pp_root.1];
-    for (x, y) in &params.boundary {
-        for &limb in x.iter().chain(y.iter()) {
-            preimage.push(context.constant(qm31_from_u32s(limb, 0, 0, 0)));
-        }
+    for (x, y) in statement.boundary_vars() {
+        preimage.extend(x.iter().chain(y.iter()).copied());
     }
     let output_hash = blake2s_m31(&mut context, &preimage, 16 * preimage.len());
     context.set_outputs(&[output_hash.0, output_hash.1]);
