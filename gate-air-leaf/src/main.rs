@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+#[allow(unused_imports)]
 use itertools::Itertools;
 use num_traits::{One, Zero};
 use serde::Deserialize;
@@ -72,14 +73,12 @@ const LIMB_BITS: usize = 16;
 const N_LIMBS: usize = N_QUBITS / LIMB_BITS; // 32
 const STATE_BYTES: usize = N_QUBITS / 8; // 64
 
-// State-relation width: shot_id, pc, then 32 limbs.
-const STATE_WIDTH: usize = 2 + N_LIMBS;
-
-// Dynamic range-check tables span pos in 0..LIMB_BITS, value in 0..2^16.
-// Pad both T_lo and T_hi to 2^17 rows so (pos, value) fits one preprocessed
-// pair of columns (pos in 0..16 -> 4 bits, value 16 bits => up to 2^16 entries
-// per table; we lay them out as a flat table of valid (pos,value) pairs).
-const RC_LOG_SIZE: u32 = 16; // 2^16 padded rows for each dynamic-RC table.
+// Log-size of the ts-ordering range-check (rc) supply table (2^16 rows). The table holds the two
+// value ranges [0,2^RC_LO_BITS) and [0,2^RC_HI_BITS) keyed by a `pos` selector (pos=0 => lo range,
+// pos=1 => hi range); its membership count is 2^RC_LO_BITS + 2^RC_HI_BITS = 33792 <= 2^16, so it
+// fits one 2^16 table. Also doubles as the twiddle/FRI domain floor (the committed domain must
+// cover the largest committed column) and as the GPU histogram size.
+const RC_LOG_SIZE: u32 = 16;
 
 // Interaction-trace proof-of-work bits (canonical transcript; matches the in-circuit verifier's
 // ProofConfig). Tiny grind (~2^8), present so the in-circuit verifier can replay the transcript.
@@ -92,6 +91,41 @@ const BASE_LOG_BLOWUP_FACTOR: u32 = 1;
 
 const NO_CTRL: u16 = 0xFFFF;
 
+// Program-order timestamp encoding. `ts = pc + 1`, where `pc` is the PREPROCESSED per-shot program
+// counter (`gate_pc`, strictly increasing in program order, verifier-pinned). Because `pc` is
+// preprocessed the prover CANNOT reorder an address's accesses relative to program order: ts is a
+// fixed affine function of the verifier-pinned pc. `ts` is therefore NOT a witness column — it is
+// inlined as `pc + 1` everywhere (Yield tuple, range-check reconstruction), and the old PIN
+// constraint (`ts == pc*STRIDE + slot`) is removed as vacuous. No per-gate slot is needed: within a
+// gate step the (up to 3) accesses hit DISTINCT qubit addresses (a reversible gate cannot use its
+// target as a control), so sharing ts = pc+1 across the step never collides two accesses on the same
+// per-address chain; two accesses to the SAME address are necessarily in different gate steps
+// (distinct pc), so they still get strictly increasing ts. The `+1` keeps the smallest real ts = 1
+// (at pc=0) > 0 = the init boundary node's ts, so init's ts=0 tuple stays distinct from every real
+// access (do NOT use plain `pc`: that collides pc=0's accesses with the init node). Max real ts per
+// shot = (k*n_gates-1) + 1 = k*n_gates; at k=2000, n_gates=2547 this is ~5.1e6 < 2^23, far below
+// TS_FINAL = 2^30 and p = 2^31-1 (no aliasing, no wraparound).
+
+// Range-check width for the ts-ordering diff `d = ts - prev_ts - 1`. We prove `d ∈ [0, 2^TS_RC_BITS)`
+// by a LogUp rc-table lookup (below): `d` is split into two limbs `d = rc_lo + 2^RC_LO_BITS * rc_hi`
+// (RC_LO_BITS + RC_HI_BITS == TS_RC_BITS) and each limb is looked up into the rc supply table's
+// matching exact range block — `rc_lo` into [0,2^RC_LO_BITS), `rc_hi` into [0,2^RC_HI_BITS). Because
+// the table blocks are the EXACT ranges (not a padded power-of-two bound), the two lookups pin
+// rc_lo < 2^RC_LO_BITS and rc_hi < 2^RC_HI_BITS with NO slack, so the reconstructed d ranges over
+// exactly [0, 2^TS_RC_BITS) = [0, 2^25) and nothing larger. Honest `d = pc - prev_ts <= pc <= ts_max
+// - 1 < 2^23 (k<=2000), so 25 bits is complete with margin; the absolute bound 2^25 - 1 < p = 2^31-1
+// guarantees the field subtraction cannot wrap, so a cyclic (stale-read) chain — which would need
+// Σ(ts_i - prev_ts_i) ≡ 0 mod p with each term >= 1 — is impossible. See the soundness argument:
+// pc-pinned ts gives program order, the range-check `prev_ts < ts` on EVERY access forces the chain
+// to be a forward DAG, and both together defeat the reorder.
+const TS_RC_BITS: usize = 25;
+// Limb split of `d` for the rc-table lookup. RC_LO_BITS + RC_HI_BITS == TS_RC_BITS. The split is
+// chosen so the two exact-range blocks fit ONE 2^RC_LOG_SIZE table: 2^15 + 2^10 = 33792 <= 2^16.
+const RC_LO_BITS: usize = 15;
+const RC_HI_BITS: usize = 10;
+const _: () = assert!(RC_LO_BITS + RC_HI_BITS == TS_RC_BITS);
+const _: () = assert!((1usize << RC_LO_BITS) + (1usize << RC_HI_BITS) <= (1usize << RC_LOG_SIZE));
+
 const M31_MODULUS_U32: u32 = (1 << 31) - 1;
 const LANE_COUNT: usize = 1 << LOG_N_LANES;
 
@@ -99,31 +133,39 @@ const LANE_COUNT: usize = 1 << LOG_N_LANES;
 // Relations
 // ----------------------------------------------------------------------------
 
-// ONE shared LogUp relation (single drawn (z,α)). The 5 logical relations are
+// ONE shared LogUp relation (single drawn (z,α)). The logical relations are
 // distinguished by a distinct id TAG prepended as the first tuple element — this
 // matches the in-circuit verifier's single-relation model (circuits_stark_verifier:
 // one acc.interaction_elements, relation id as a constant in the tuple). Width =
-// widest payload (state = STATE_WIDTH = 34) + 1 tag.
-const GATE_REL_WIDTH: usize = 1 + STATE_WIDTH;
-stwo_constraint_framework::relation!(GateRel, 35);
-const _: () = assert!(GATE_REL_WIDTH <= 35);
+// widest payload (program = slot,opcode,target,ctrl_a,ctrl_b = 5) + 1 tag = 6.
+#[allow(dead_code)]
+const GATE_REL_WIDTH: usize = 6;
+stwo_constraint_framework::relation!(GateRel, 6);
 
 // Relation id tags (distinct constants; the prover and the in-circuit verifier must agree).
-const TAG_STATE: u32 = 1;
-const TAG_QDECODE: u32 = 2;
-const TAG_RC_LO: u32 = 3;
-const TAG_RC_HI: u32 = 4;
+// Qubit-memory encoding: TAG_QUBITMEM is the per-qubit chain-lookup relation (replaces the
+// old whole-state TAG_STATE). TAG_RC is the ts-ordering range-check relation: the main component
+// looks up each limb of `d = ts - prev_ts - 1` as (TAG_RC, pos, limb) and the rc supply table
+// supplies (TAG_RC, pos, value) for every value in the pos-block's exact range.
+const TAG_QUBITMEM: u32 = 1;
+const TAG_RC: u32 = 2;
 const TAG_PROGRAM: u32 = 5;
 
-/// All five logical relations share the SAME drawn `(z,α)`; the fields are clones of
-/// the single `GateRel`, kept under named handles for readable call sites. The tag
+// Phase-3 x/y binding: the boundary's final value `y` is re-keyed to a FIXED public timestamp
+// `TS_FINAL` so it surfaces as an UNCONSUMED public LogUp term (see `BoundaryTableEval`). The leaf's
+// `public_logup_sum` supplies the matching term over its GUESSED x/y, forcing guessed == committed
+// (the recursion's public-output binding). `TS_FINAL` must exceed every real per-address ts
+// (real ts in 0..=k*n_gates, tiny) and stay a valid M31, so the public tuples never alias an interior
+// chain node or the ts=0 init node. 2^30 < p = 2^31-1 and >> any real ts.
+const TS_FINAL: u32 = 1 << 30;
+
+/// The logical relations share the SAME drawn `(z,α)`; the fields are clones of the
+/// single `GateRel`, kept under named handles for readable call sites. The tag
 /// prepended at each combine is what keeps the relations separate.
 #[derive(Clone)]
 struct LookupElements {
-    state: GateRel,
-    qdecode: GateRel,
-    rc_lo: GateRel,
-    rc_hi: GateRel,
+    qubitmem: GateRel,
+    rc: GateRel,
     program: GateRel,
 }
 
@@ -131,24 +173,19 @@ impl LookupElements {
     fn draw(channel: &mut impl Channel) -> Self {
         let rel = GateRel::draw(channel);
         Self {
-            state: rel.clone(),
-            qdecode: rel.clone(),
-            rc_lo: rel.clone(),
-            rc_hi: rel.clone(),
+            qubitmem: rel.clone(),
+            rc: rel.clone(),
             program: rel,
         }
     }
 
-    /// Fixed challenges for byte-identity tests (mirrors `draw`: one `GateRel` shared
-    /// across all five relations). Used by the K4 GPU interaction validation.
+    /// Fixed challenges for byte-identity tests. Used by the K4 GPU interaction validation.
     #[cfg(feature = "gpu-cuda")]
     fn dummy() -> Self {
         let rel = GateRel::dummy();
         Self {
-            state: rel.clone(),
-            qdecode: rel.clone(),
-            rc_lo: rel.clone(),
-            rc_hi: rel.clone(),
+            qubitmem: rel.clone(),
+            rc: rel.clone(),
             program: rel,
         }
     }
@@ -263,6 +300,7 @@ fn state_to_limbs(bytes: &[u8]) -> [u32; N_LIMBS] {
     limbs
 }
 
+#[allow(dead_code)] // used by the cuda/gpu-cuda trace-gen + byte-identity paths
 fn limbs_to_state(limbs: &[u32; N_LIMBS]) -> [u8; STATE_BYTES] {
     let mut out = [0u8; STATE_BYTES];
     for (j, &limb) in limbs.iter().enumerate() {
@@ -273,6 +311,7 @@ fn limbs_to_state(limbs: &[u32; N_LIMBS]) -> [u8; STATE_BYTES] {
 }
 
 #[inline]
+#[allow(dead_code)] // used by the cuda/gpu-cuda trace-gen + byte-identity paths
 fn qubit_decode(q: u16) -> (u32, u32, u32) {
     let limb_idx = (q as u32) / LIMB_BITS as u32;
     let bit_pos = (q as u32) % LIMB_BITS as u32;
@@ -284,53 +323,31 @@ fn qubit_decode(q: u16) -> (u32, u32, u32) {
 // Witness row
 // ----------------------------------------------------------------------------
 
-/// Decoded read of a single qubit (target / ctrl_a / ctrl_b).
+/// One qubit-memory access (chain lookup) for target / ctrl_a / ctrl_b.
+/// The access timestamp is NOT a witness column: it is the affine function `ts = pc + 1` of the
+/// verifier-pinned preprocessed `pc`, inlined at every use site. `prev_ts` is the ts of the previous
+/// access to this addr (0 = the init boundary node). `rc_lo`/`rc_hi` are the two limbs of the
+/// ordering diff `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts = rc_lo + 2^RC_LO_BITS *
+/// rc_hi`, each range-checked by a LogUp lookup into the rc supply table (rc_lo into [0,2^RC_LO_BITS),
+/// rc_hi into [0,2^RC_HI_BITS)), proving `prev_ts < ts` (forward-DAG / no-stale-read). `active` gates
+/// the terms.
 #[derive(Clone, Copy)]
-struct ReadCols {
-    active: u32,       // enabler*active flag (0 if this control isn't live)
-    q: u32,            // qubit index (0 when inactive)
-    limb_idx: u32,     // decoded limb index
-    bit_pos: u32,      // decoded bit position
-    mask: u32,         // 2^bit_pos
-    lsel: [u32; N_LIMBS], // limb-select one-hot (all zero if inactive)
-    lo: u32,
-    hi: u32,
-    bit: u32,
+struct AccessCols {
+    addr: u32,    // qubit index 0..511 (0 when inactive, matches program canon)
+    prev_ts: u32, // predecessor's ts at this addr (0 if this is the first access)
+    v: u32,       // v_before (the value read); for a control this is also v_after
+    rc_lo: u32,   // low limb of d = ts - prev_ts - 1 = pc - prev_ts  (d & (2^RC_LO_BITS - 1))
+    rc_hi: u32,   // high limb of d                                   (d >> RC_LO_BITS)
 }
 
-impl ReadCols {
+impl AccessCols {
     fn inactive() -> Self {
         Self {
-            active: 0,
-            q: 0,
-            limb_idx: 0,
-            bit_pos: 0,
-            mask: 1, // 2^0; harmless since lsel is all zero so L=0.
-            lsel: [0; N_LIMBS],
-            lo: 0,
-            hi: 0,
-            bit: 0,
-        }
-    }
-
-    fn live(limbs: &[u32; N_LIMBS], q: u16) -> Self {
-        let (limb_idx, bit_pos, mask) = qubit_decode(q);
-        let l = limbs[limb_idx as usize];
-        let lo = l & ((1u32 << bit_pos) - 1);
-        let bit = (l >> bit_pos) & 1;
-        let hi = l >> (bit_pos + 1);
-        let mut lsel = [0u32; N_LIMBS];
-        lsel[limb_idx as usize] = 1;
-        Self {
-            active: 1,
-            q: q as u32,
-            limb_idx,
-            bit_pos,
-            mask,
-            lsel,
-            lo,
-            hi,
-            bit,
+            addr: 0,
+            prev_ts: 0,
+            v: 0,
+            rc_lo: 0,
+            rc_hi: 0,
         }
     }
 }
@@ -344,14 +361,14 @@ struct Row {
     is_toffoli: u32,
     shot_id: u32,
     pc: u32,
-    in_limb: [u32; N_LIMBS],
-    out_limb: [u32; N_LIMBS],
-    target: ReadCols,
-    ctrl_a: ReadCols,
-    ctrl_b: ReadCols,
+    target: AccessCols,
+    // NOTE: the target's post-gate value `v_after` is NOT a witness column — it equals
+    // `v_before + delta` (a pinned equality), inlined at every use site.
+    ctrl_a: AccessCols,
+    ctrl_b: AccessCols,
     ab: u32,
     fire: u32,
-    delta: u32, // new_t - t_bit, signed in {-1,0,1}; stored as M31.
+    delta: u32, // v_after - v_before, signed in {-1,0,1}; stored as M31.
 }
 
 impl Row {
@@ -364,11 +381,9 @@ impl Row {
             is_toffoli: 0,
             shot_id: 0,
             pc: 0,
-            in_limb: [0; N_LIMBS],
-            out_limb: [0; N_LIMBS],
-            target: ReadCols::inactive(),
-            ctrl_a: ReadCols::inactive(),
-            ctrl_b: ReadCols::inactive(),
+            target: AccessCols::inactive(),
+            ctrl_a: AccessCols::inactive(),
+            ctrl_b: AccessCols::inactive(),
             ab: 0,
             fire: 0,
             delta: 0,
@@ -380,25 +395,34 @@ impl Row {
 // Column layout
 // ----------------------------------------------------------------------------
 //
-// Per row:
-//   is_nop,is_not,is_cnot,is_toffoli(4)
-//   in_limb[0..32]                  (32)
-//   out_limb[0..32]                 (32)
-//   target read block               (READ_COLS)
-//   ctrl_a read block               (READ_COLS)
-//   ctrl_b read block               (READ_COLS)
-//   ab, fire, delta                 (3)
+// Per row (qubit-memory encoding), one access block = ACCESS_COLS core + RC_N_LIMBS rc limbs:
+//   is_nop,is_not,is_cnot,is_toffoli                                 (4)
+//   target access: addr,prev_ts,v_before, rc_lo,rc_hi                (ACCESS_BLOCK)
+//   ctrl_a access: addr,prev_ts,v, rc_lo,rc_hi                       (ACCESS_BLOCK)
+//   ctrl_b access: addr,prev_ts,v, rc_lo,rc_hi                       (ACCESS_BLOCK)
+//   ab, fire, delta                                                  (3)
 //
 // `enabler`, `shot_id`, `pc` are SHARD-INVARIANT POSITIONAL values (enabler = real/padding
-// indicator, shot_id = row / (k*n_gates), pc = row % (k*n_gates)). They were moved OUT of the
-// main (witness) trace into the PREPROCESSED tree (tree0) — see `preprocessed_columns_sorted`
-// (gate_enabler / gate_shot_id / gate_pc). The prover cannot lie about them (they are fixed,
-// public, and verifier-pinned), and tree0 stays shard-invariant (their values depend only on the
-// trace SHAPE, never on secret x/y/gate content).
+// indicator, shot_id = row / (k*n_gates), pc = row % (k*n_gates)). They live in the PREPROCESSED
+// tree (tree0) — see `preprocessed_columns_sorted` (gate_enabler / gate_shot_id / gate_pc). The
+// prover cannot lie about them (fixed, public, verifier-pinned), and tree0 stays shard-invariant.
 //
-// READ_COLS = q(1)+limb_idx(1)+bit_pos(1)+mask(1)+lsel(32)+lo(1)+hi(1)+bit(1)
-const READ_COLS: usize = 4 + N_LIMBS + 3; // 39
-const TRACE_COLUMNS: usize = 4 + N_LIMBS + N_LIMBS + 3 * READ_COLS + 3;
+// The access timestamp `ts` is NOT a witness column: it is the affine `ts = pc + 1` of the
+// preprocessed `pc`, inlined at every use site (Yield tuple + range-check reconstruction). The old
+// PIN constraint is gone (vacuous). Timestamp ordering is now ONE algebraic constraint + a LogUp
+// lookup per active access (soundness-critical):
+//   RANGE: active*((pc+1) - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 reconstructs
+//          d = ts-prev_ts-1 = pc-prev_ts from its two limbs, and each limb is range-checked by a
+//          LogUp lookup into the rc supply table (rc_lo ∈ [0,2^RC_LO_BITS), rc_hi ∈ [0,2^RC_HI_BITS)).
+//          The exact-range table blocks pin d ∈ [0, 2^TS_RC_BITS) with NO slack, so prev_ts < ts,
+//          forcing the chain to be a forward DAG (no stale-read cycle).
+// The target's `v_after` is likewise NOT a witness column: it equals `v_before + delta`, inlined at
+// its Yield tuple and booleanity constraint. The two controls' written value equals `v` (reads
+// propagate the value).
+const ACCESS_COLS: usize = 3; // addr, prev_ts, v (the core access cols read by AccessMasks; ts inlined = pc+1)
+const RC_N_LIMBS: usize = 2; // rc_lo, rc_hi
+const ACCESS_BLOCK: usize = ACCESS_COLS + RC_N_LIMBS; // core cols + range-check limbs
+const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS_BLOCK + 3;
 
 fn delta_to_m31(delta: i64) -> u32 {
     // new_t - t_bit in {-1,0,1}; represent in M31.
@@ -413,45 +437,16 @@ fn delta_to_m31(delta: i64) -> u32 {
 // Witness generation + self-check
 // ----------------------------------------------------------------------------
 
-struct LookupCounts {
-    qdecode: Vec<u32>,
-    rc_lo: Vec<u32>,
-    rc_hi: Vec<u32>,
-}
-
-impl LookupCounts {
-    fn new() -> Self {
-        Self {
-            qdecode: vec![0; N_QUBITS],
-            rc_lo: vec![0; 1 << RC_LOG_SIZE],
-            rc_hi: vec![0; 1 << RC_LOG_SIZE],
-        }
-    }
-
-    /// Reduce: add another shot's local counts into this one (component-wise).
-    fn add_assign(&mut self, other: &LookupCounts) {
-        for (a, b) in self.qdecode.iter_mut().zip(&other.qdecode) {
-            *a += *b;
-        }
-        for (a, b) in self.rc_lo.iter_mut().zip(&other.rc_lo) {
-            *a += *b;
-        }
-        for (a, b) in self.rc_hi.iter_mut().zip(&other.rc_hi) {
-            *a += *b;
-        }
-    }
-}
-
 /// Build all witness rows for the selected shots and assert each shot's final
-/// state matches y_hex. Returns rows plus lookup multiplicity counts.
+/// state matches y_hex.
 ///
 /// PARALLELISM (two-phase, trace bit-identical to the serial version):
 ///   Phase 1 here parallelizes over SHOTS. Shots are fully independent: shot s
 ///   owns the contiguous scalar row block `[s*K*n_gates, (s+1)*K*n_gates)`, has
 ///   its own initial state x_s and its own sequential chain to y_s (gates and K
 ///   reps are threaded strictly in order *within* a shot). Each shot writes a
-///   disjoint `&mut [Row]` slice (`par_chunks_mut`) and accumulates its own LOCAL
-///   `LookupCounts`; we then REDUCE (sum) the per-shot counts at the end.
+///   disjoint `&mut [Row]` slice (`par_chunks_mut`). Returns Err on the first shot
+///   whose simulation fails or whose final state mismatches y_hex.
 ///   Phase 2 — packing the scalar `Vec<Row>` into `PackedM31` words — happens
 ///   later in `generate_main_trace` / `gen_main_interaction` over PACKED rows,
 ///   so a shot block being non-16-aligned (2547*K rows) can never cause a
@@ -462,68 +457,110 @@ fn build_rows(
     gates: &[Gate],
     cases: &[TestCase],
     k: usize,
-    rc_lo_index: &RcIndex,
-    rc_hi_index: &RcIndex,
-) -> Result<(Vec<Row>, LookupCounts)> {
+) -> Result<(Vec<Row>, BoundaryTable)> {
     use rayon::prelude::*;
 
     let n_gates = gates.len();
     let shot_rows = k * n_gates;
     let total_rows = cases.len() * shot_rows;
 
+    // LOUD completeness guard (release-mode, not debug_assert): the ts-ordering diff
+    // `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts` is bounded by the max per-shot pc.
+    // The largest pc is k*n_gates - 1, and the largest honest d occurs when prev_ts = 0, i.e.
+    // d_max = k*n_gates - 1. If that could reach 2^TS_RC_BITS the rc-table range-check would REJECT an
+    // honest proof (silent completeness failure at large k), so fail here loudly instead.
+    // (No-silent-fallback rule.)
+    let d_max: u64 = (k as u64) * (n_gates as u64) - 1;
+    if d_max >= (1u64 << TS_RC_BITS) {
+        bail!(
+            "ts-ordering range-check budget exceeded: k*n_gates = {}*{} makes the max ts diff d_max = {} >= 2^{} \
+             (the rc-table bound); honest proofs would silently fail the range-check. Widen TS_RC_BITS / the rc-limb split.",
+            k, n_gates, d_max, TS_RC_BITS
+        );
+    }
+
     // Pre-allocate the full scalar row buffer; each shot fills a disjoint block.
     let mut rows = vec![Row::padding(); total_rows];
+    // Per-shot boundary rows: 512 entries per shot, holding init/final (x, y, ts_last).
+    let mut boundary = BoundaryTable::new(cases.len());
 
-    // Phase 1: simulate every shot in parallel into its own disjoint row block,
-    // each producing its own local LookupCounts. Returns Err on the first shot
-    // whose simulation fails or whose final state mismatches y_hex.
-    let per_shot: Vec<Result<LookupCounts>> = rows
+    // Phase 1: simulate every shot in parallel into its own disjoint row block +
+    // boundary block. Returns Err on the first shot whose simulation fails or whose
+    // final state mismatches y_hex.
+    let per_shot: Vec<Result<()>> = rows
         .par_chunks_mut(shot_rows)
+        .zip(boundary.per_shot_mut().par_iter_mut())
         .zip(cases.par_iter())
         .enumerate()
-        .map(|(shot_id, (block, case))| {
-            simulate_shot(gates, k, shot_id, case, block, rc_lo_index, rc_hi_index)
+        .map(|(shot_id, ((block, bnd), case))| {
+            simulate_shot(gates, k, shot_id, case, block, bnd)
         })
         .collect();
 
-    // Phase 1 reduce: sum the per-shot local counts into one global LookupCounts.
-    // Arrays are small (512, 2^16, 2^16); a serial reduce is cheap.
-    let mut counts = LookupCounts::new();
     for result in per_shot {
-        let local = result?;
-        counts.add_assign(&local);
+        result?;
     }
 
-    Ok((rows, counts))
+    Ok((rows, boundary))
 }
 
-/// Simulate a single shot sequentially, filling its row block and returning its
-/// LOCAL lookup multiplicity counts. The chain (K reps * n_gates gates) is run
-/// strictly in order, threading the 512-bit state from x_s to y_s, and the final
-/// state is checked against y_hex.
+/// Simulate a single shot sequentially, filling its row block. The chain
+/// (K reps * n_gates gates) is run strictly in order, threading the 512-bit state
+/// from x_s to y_s, and the final state is checked against y_hex.
 fn simulate_shot(
     gates: &[Gate],
     k: usize,
     shot_id: usize,
     case: &TestCase,
     block: &mut [Row],
-    rc_lo_index: &RcIndex,
-    rc_hi_index: &RcIndex,
-) -> Result<LookupCounts> {
+    bnd: &mut [BoundaryRow],
+) -> Result<()> {
     let n_gates = gates.len();
     let x = hex::decode(&case.x_hex).context("decoding x_hex")?;
     let y = hex::decode(&case.y_hex).context("decoding y_hex")?;
     if x.len() != STATE_BYTES || y.len() != STATE_BYTES {
         bail!("state must be {STATE_BYTES} bytes");
     }
-    let mut counts = LookupCounts::new();
-    let mut limbs = state_to_limbs(&x);
+    debug_assert_eq!(bnd.len(), N_QUBITS);
+
+    // Per-shot qubit-memory state: last[addr] = (ts, value). Reset each shot.
+    // `ts` is the PROGRAM-ORDER timestamp `pc + 1`: an affine function of the preprocessed pc, so an
+    // address's accesses are timestamped in program order and cannot be reordered by the prover.
+    let x_bit = |addr: usize| -> u32 { qubit_bit(&x, addr) };
+    let mut last_ts = vec![0u32; N_QUBITS];
+    let mut last_val: Vec<u32> = (0..N_QUBITS).map(x_bit).collect();
     let mut pc: u32 = 0;
     let mut row_idx = 0usize;
 
+    // One access: read predecessor (prev_ts, v_before) from last[addr]; the access ts is `pc + 1`
+    // (program-order timestamp, inlined — not stored). Splits d = ts - prev_ts - 1 = pc - prev_ts
+    // (>= 0 since prev_ts is an earlier program-order ts or the init 0) into the two limbs (rc_lo,
+    // rc_hi) the rc-table lookup range-checks (proving prev_ts < ts). Returns the filled AccessCols
+    // with v = v_before. The caller sets last[addr] to the post-access ts (= pc+1) / value (v_before
+    // for reads, v_after for the target write).
+    let do_access = |addr: u32, pc: u32, last_ts: &[u32], last_val: &[u32]| -> AccessCols {
+        let a = addr as usize;
+        let prev_ts = last_ts[a];
+        let v_before = last_val[a];
+        let ts = pc + 1;
+        debug_assert!(ts > prev_ts, "ts {ts} must exceed prev_ts {prev_ts} (program order)");
+        let d = ts - prev_ts - 1; // = pc - prev_ts
+        // Completeness guard (checked once at build_rows before any access; see build_rows). Here d is
+        // guaranteed < 2^TS_RC_BITS, so the limb split is exact.
+        debug_assert!((d as u64) < (1u64 << TS_RC_BITS), "diff {d} exceeds range-check bound");
+        let rc_lo = d & ((1u32 << RC_LO_BITS) - 1);
+        let rc_hi = d >> RC_LO_BITS;
+        AccessCols {
+            addr,
+            prev_ts,
+            v: v_before,
+            rc_lo,
+            rc_hi,
+        }
+    };
+
     for _rep in 0..k {
         for gate in gates {
-            let in_limb = limbs;
             let (is_nop, is_not, is_cnot, is_toffoli) = match gate.opcode {
                 OP_NOP => (1, 0, 0, 0),
                 OP_NOT => (0, 1, 0, 0),
@@ -534,44 +571,45 @@ fn simulate_shot(
             let a_active = is_cnot + is_toffoli;
             let b_active = is_toffoli;
 
-            // Reads.
-            let target = ReadCols::live(&in_limb, gate.target);
+            // Control reads first (they feed the gate-apply), then target read+write. ts is the
+            // program-order timestamp `pc + 1`, shared by all accesses of this gate step (no slot).
+            // The three accesses of a gate touch DISTINCT addrs (a reversible gate can't use its
+            // target as a control), so sharing ts within the step never collides two accesses on the
+            // same per-address chain; two accesses to the same addr are in different steps (distinct
+            // pc), so they still get strictly increasing ts. In iadd the three accesses touch distinct
+            // addrs.
+            let ts = pc + 1;
             let ctrl_a = if a_active == 1 {
                 debug_assert_ne!(gate.ctrl_a, NO_CTRL);
-                ReadCols::live(&in_limb, gate.ctrl_a)
+                let ac = do_access(gate.ctrl_a as u32, pc, &last_ts, &last_val);
+                last_ts[gate.ctrl_a as usize] = ts;
+                // read: value propagates unchanged.
+                ac
             } else {
-                ReadCols::inactive()
+                AccessCols::inactive()
             };
             let ctrl_b = if b_active == 1 {
                 debug_assert_ne!(gate.ctrl_b, NO_CTRL);
-                ReadCols::live(&in_limb, gate.ctrl_b)
+                let ac = do_access(gate.ctrl_b as u32, pc, &last_ts, &last_val);
+                last_ts[gate.ctrl_b as usize] = ts;
+                ac
             } else {
-                ReadCols::inactive()
+                AccessCols::inactive()
             };
+            let target = do_access(gate.target as u32, pc, &last_ts, &last_val);
 
-            let a_bit = ctrl_a.bit;
-            let b_bit = ctrl_b.bit;
-            let t_bit = target.bit;
+            let a_bit = ctrl_a.v;
+            let b_bit = ctrl_b.v;
+            let t_bit = target.v;
             let ab = a_bit * b_bit;
             let fire = is_not + is_cnot * a_bit + is_toffoli * ab;
             debug_assert!(fire <= 1);
-            let new_t = t_bit ^ fire;
-            let delta_signed = new_t as i64 - t_bit as i64;
+            let v_after = t_bit ^ fire;
+            let delta_signed = v_after as i64 - t_bit as i64;
 
-            // Apply write.
-            let mut out_limb = in_limb;
-            let tl = target.limb_idx as usize;
-            if delta_signed > 0 {
-                out_limb[tl] += target.mask;
-            } else if delta_signed < 0 {
-                out_limb[tl] -= target.mask;
-            }
-            limbs = out_limb;
-
-            // Lookup multiplicities (local to this shot).
-            count_read(&mut counts, &target, rc_lo_index, rc_hi_index);
-            count_read(&mut counts, &ctrl_a, rc_lo_index, rc_hi_index);
-            count_read(&mut counts, &ctrl_b, rc_lo_index, rc_hi_index);
+            // Commit the target write to memory (ts = pc+1, inlined).
+            last_ts[gate.target as usize] = ts;
+            last_val[gate.target as usize] = v_after;
 
             block[row_idx] = Row {
                 enabler: 1,
@@ -581,8 +619,6 @@ fn simulate_shot(
                 is_toffoli,
                 shot_id: shot_id as u32,
                 pc,
-                in_limb,
-                out_limb,
                 target,
                 ctrl_a,
                 ctrl_b,
@@ -597,26 +633,130 @@ fn simulate_shot(
     }
     debug_assert_eq!(row_idx, k * n_gates);
 
-    // Self-check: final state equals y.
-    let final_bytes = limbs_to_state(&limbs);
-    if final_bytes.as_slice() != y.as_slice() {
-        bail!(
-            "shot {shot_id}: simulated final state does not match y_hex\n  got {}\n  exp {}",
-            hex::encode(final_bytes),
-            case.y_hex
-        );
+    // Boundary rows: init x, final y (== last_val), ts_last (0 if untouched).
+    for addr in 0..N_QUBITS {
+        let y_bit = qubit_bit(&y, addr);
+        // Self-check: simulated final value equals y's bit at this addr.
+        if last_val[addr] != y_bit {
+            bail!(
+                "shot {shot_id}: simulated final qubit {addr} = {} != y bit {}",
+                last_val[addr],
+                y_bit
+            );
+        }
+        bnd[addr] = BoundaryRow {
+            shot_id: shot_id as u32,
+            addr: addr as u32,
+            x: x_bit(addr),
+            y: y_bit,
+            ts_last: last_ts[addr],
+        };
     }
 
-    Ok(counts)
+    Ok(())
 }
 
-fn count_read(counts: &mut LookupCounts, read: &ReadCols, lo_idx: &RcIndex, hi_idx: &RcIndex) {
-    if read.active == 0 {
-        return;
+/// Bit `addr` of a little-endian byte state (bit `addr` = byte `addr/8`, bit `addr%8`).
+#[inline]
+fn qubit_bit(bytes: &[u8], addr: usize) -> u32 {
+    ((bytes[addr / 8] >> (addr % 8)) & 1) as u32
+}
+
+// ----------------------------------------------------------------------------
+// ts-ordering range-check (rc) supply table
+// ----------------------------------------------------------------------------
+//
+// The rc table is a single 2^RC_LOG_SIZE-row `[0, range)` supply table keyed by a `pos` selector:
+//   pos = RC_POS_LO (0): value block  {0, 1, ..., 2^RC_LO_BITS - 1}   (the low-limb range)
+//   pos = RC_POS_HI (1): value block  {0, 1, ..., 2^RC_HI_BITS - 1}   (the high-limb range)
+// Membership count = 2^RC_LO_BITS + 2^RC_HI_BITS = 33792 <= 2^RC_LOG_SIZE = 65536; the remaining
+// rows are padding reusing the (pos=RC_POS_LO, value=0) tuple (a genuine member: multiplicity-counting
+// only counts real limb lookups, so extra supply of an existing tuple is inert). The main component
+// looks up (TAG_RC, pos, limb) for each of the two limbs of every active access; the table supplies
+// -multiplicity / (TAG_RC, pos, value). Because each pos-block enumerates its EXACT range (not a
+// padded power-of-two bound), the lookups pin rc_lo < 2^RC_LO_BITS and rc_hi < 2^RC_HI_BITS with NO
+// slack — reconstruction d = rc_lo + 2^RC_LO_BITS*rc_hi then ranges over exactly [0, 2^TS_RC_BITS).
+const RC_POS_LO: u32 = 0;
+const RC_POS_HI: u32 = 1;
+
+/// Supply table for the ts-ordering range-check. `pos`/`val` are PREPROCESSED (the table membership,
+/// shard-invariant); `multiplicity` is WITNESS (count of real limb lookups landing on that row).
+struct RcTable {
+    log_size: u32,
+    pos: Vec<u32>,         // preprocessed
+    val: Vec<u32>,         // preprocessed
+    multiplicity: Vec<u32>, // witness
+    lo_len: usize,         // # rows in the RC_POS_LO block (= 2^RC_LO_BITS)
+}
+
+impl RcTable {
+    fn new() -> Self {
+        let size = 1usize << RC_LOG_SIZE;
+        let lo_len = 1usize << RC_LO_BITS;
+        let hi_len = 1usize << RC_HI_BITS;
+        let mut pos = vec![RC_POS_LO; size];
+        let mut val = vec![0u32; size];
+        let mut row = 0usize;
+        for v in 0..lo_len {
+            pos[row] = RC_POS_LO;
+            val[row] = v as u32;
+            row += 1;
+        }
+        for v in 0..hi_len {
+            pos[row] = RC_POS_HI;
+            val[row] = v as u32;
+            row += 1;
+        }
+        debug_assert!(row <= size);
+        // Remaining rows stay (pos=RC_POS_LO, val=0): a valid member, inert padding.
+        Self {
+            log_size: RC_LOG_SIZE,
+            pos,
+            val,
+            multiplicity: vec![0u32; size],
+            lo_len,
+        }
     }
-    counts.qdecode[read.q as usize] += 1;
-    counts.rc_lo[lo_idx.row(read.bit_pos, read.lo)] += 1;
-    counts.rc_hi[hi_idx.row(read.bit_pos, read.hi)] += 1;
+
+    /// Row index of the (pos, value) tuple in the flattened table. lo block first, then hi block.
+    #[inline]
+    fn row_of(&self, pos: u32, value: u32) -> usize {
+        match pos {
+            RC_POS_HI => self.lo_len + value as usize,
+            _ => value as usize,
+        }
+    }
+
+    /// Count the two limb lookups of one active access into the multiplicity column.
+    #[inline]
+    fn count_access(&mut self, a: &AccessCols) {
+        let lo = self.row_of(RC_POS_LO, a.rc_lo);
+        let hi = self.row_of(RC_POS_HI, a.rc_hi);
+        self.multiplicity[lo] += 1;
+        self.multiplicity[hi] += 1;
+    }
+}
+
+/// Build the rc supply table and its multiplicity column by counting every ACTIVE access's two
+/// limb lookups. An access is active iff its owning gate fires it: the target on every real row, a
+/// control iff the opcode uses it. Padding rows (enabler = 0) emit no lookup, so they are skipped.
+fn build_rc_table(rows: &[Row]) -> RcTable {
+    let mut table = RcTable::new();
+    for r in rows {
+        if r.enabler == 0 {
+            continue;
+        }
+        // target is active on every real row.
+        table.count_access(&r.target);
+        // controls active per opcode (a_active = is_cnot + is_toffoli, b_active = is_toffoli).
+        if r.is_cnot + r.is_toffoli == 1 {
+            table.count_access(&r.ctrl_a);
+        }
+        if r.is_toffoli == 1 {
+            table.count_access(&r.ctrl_b);
+        }
+    }
+    table
 }
 
 // ----------------------------------------------------------------------------
@@ -630,8 +770,11 @@ fn count_read(counts: &mut LookupCounts, read: &ReadCols, lo_idx: &RcIndex, hi_i
 // LogUp membership math stays sound: extra supply of an existing tuple is fine
 // as long as the multiplicity-trace counts only real reads (which it does).
 
-/// Maps (pos, value) -> a row index in the flattened preprocessed table, and
-/// holds the (pos, value) contents of each row for trace generation.
+/// Maps (pos, value) -> a row index in the flattened range-check table. The per-address +1 counter
+/// fix removed the range-check LOOKUP; this now survives ONLY so the CUDA trace-gen glue
+/// (`gpu_flat_inputs` -> `off_lo`/`off_hi`) can keep its device-buffer layout unchanged. The
+/// pos/val columns and `row()` accessor are unused by the CPU path (hence `dead_code`).
+#[allow(dead_code)]
 struct RcIndex {
     pos_col: Vec<u32>,
     val_col: Vec<u32>,
@@ -665,19 +808,64 @@ impl RcIndex {
             offset,
         }
     }
-
-    #[inline]
-    fn row(&self, pos: u32, value: u32) -> usize {
-        self.offset[pos as usize] + value as usize
-    }
 }
 
 fn build_rc_lo() -> RcIndex {
     RcIndex::build(|pos| 1u32 << pos)
 }
 
-fn build_rc_hi() -> RcIndex {
-    RcIndex::build(|pos| 1u32 << (LIMB_BITS - 1 - pos))
+// ----------------------------------------------------------------------------
+// Qubit-memory boundary table (init/final anchoring, per shot)
+// ----------------------------------------------------------------------------
+//
+// PHASE-3 re-keyed boundary. Per (shot, addr) emits on TAG_QUBITMEM two terms:
+//   (B) INTERNAL final Use [+1](shot, addr, ts_last, y)  -> cancels main's last chain Yield.
+//   (D) PUBLIC   final Yield[-1](shot, addr, TS_FINAL, y) -> re-keys y to a fixed public ts.
+// `shot`/`addr` are PREPROCESSED (positional); `x`/`y`/`ts_last` are WITNESS (`x` is now booleanity-
+// checked only — main's dangling init Use +1(shot,addr,0,x) at ts=0 carries x publicly). The base
+// therefore nets to the PUBLIC term B = Σ(+[0,x] − [TS_FINAL,y]); the leaf's public_logup_sum equals
+// −B over guessed x/y, forcing guessed == committed. Untouched addr => ts_last = 0 and (prover data)
+// x == y, so B's ts=0 term matches the actual dangling +[0,y]. `shot`/`addr` in the tuple isolate shots.
+
+#[derive(Clone, Copy, Default)]
+struct BoundaryRow {
+    shot_id: u32, // preprocessed
+    addr: u32,    // preprocessed (Seq 0..511, repeating per shot)
+    x: u32,       // witness (init value, 1 bit)
+    y: u32,       // witness (final value, 1 bit)
+    ts_last: u32, // witness (last ts at this addr this shot; 0 if untouched)
+}
+
+/// Flat list of `n_shots * N_QUBITS` boundary rows, plus the padded power-of-two size.
+struct BoundaryTable {
+    rows: Vec<BoundaryRow>,
+    log_size: u32,
+    n_shots: usize,
+}
+
+impl BoundaryTable {
+    fn new(n_shots: usize) -> Self {
+        let real = n_shots * N_QUBITS;
+        let padded = real.next_power_of_two().max(LANE_COUNT);
+        let mut rows = vec![BoundaryRow::default(); padded];
+        // Pre-fill positional (shot, addr) for real rows so untouched-simulation shots still
+        // carry a valid tuple; simulate_shot overwrites the witness fields (x, y, ts_last).
+        for (i, r) in rows.iter_mut().enumerate().take(real) {
+            r.shot_id = (i / N_QUBITS) as u32;
+            r.addr = (i % N_QUBITS) as u32;
+        }
+        Self {
+            rows,
+            log_size: padded.ilog2(),
+            n_shots,
+        }
+    }
+
+    /// Mutable per-shot chunks of exactly `N_QUBITS` rows (for parallel simulation fill).
+    fn per_shot_mut(&mut self) -> Vec<&mut [BoundaryRow]> {
+        let real = self.n_shots * N_QUBITS;
+        self.rows[..real].chunks_mut(N_QUBITS).collect()
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -764,16 +952,14 @@ impl FrameworkEval for GateEval {
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let one = E::F::one();
+        let two = BaseField::from_u32_unchecked(2);
 
-        // Preprocessed (tree0) columns. These are SHARD-INVARIANT POSITIONAL values that used to
-        // live in the main witness trace; moving them to the preprocessed tree makes them fixed and
-        // verifier-pinned. The framework treats `get_preprocessed_column` results as `E::F` — the
-        // SAME type as `next_trace_mask` — so they are usable identically in constraints and as
-        // LogUp numerators (`enabler`/`-enabler`). Order here must match the producer order in
-        // `assert_main_constraints` and the committed `tagged` listing order.
+        // Preprocessed (tree0) columns: SHARD-INVARIANT POSITIONAL values (verifier-pinned).
         //   enabler   = real-row indicator (1 on real rows, 0 on padding)
-        //   shot_id   = row / (k*n_gates)
-        //   pc        = row % (k*n_gates)   (monotonic per-shot program counter)
+        //   shot_id   = row / (k*n_gates)   (partitions the per-qubit chains per shot)
+        //   pc        = row % (k*n_gates)   (per-shot PROGRAM COUNTER, program order) — the access
+        //               timestamp is the inlined affine `ts = pc + 1` (verifier-pinned program order
+        //               is what forbids reordering an address's accesses).
         //   pc_in_prog= pc mod n_gates      (the program slot each execution row addresses)
         let enabler = eval.get_preprocessed_column(pp_id("gate_enabler"));
         let shot_id = eval.get_preprocessed_column(pp_id("gate_shot_id"));
@@ -785,12 +971,10 @@ impl FrameworkEval for GateEval {
         let is_cnot = eval.next_trace_mask();
         let is_toffoli = eval.next_trace_mask();
 
-        let in_limb = (0..N_LIMBS).map(|_| eval.next_trace_mask()).collect_vec();
-        let out_limb = (0..N_LIMBS).map(|_| eval.next_trace_mask()).collect_vec();
-
-        let target = read_masks(&mut eval);
-        let ctrl_a = read_masks(&mut eval);
-        let ctrl_b = read_masks(&mut eval);
+        // target access: addr, prev_ts, v_before (ts inlined = pc+1; v_after inlined = v_before+delta).
+        let target = access_masks(&mut eval);
+        let ctrl_a = access_masks(&mut eval);
+        let ctrl_b = access_masks(&mut eval);
 
         let ab = eval.next_trace_mask();
         let fire = eval.next_trace_mask();
@@ -811,94 +995,102 @@ impl FrameworkEval for GateEval {
         let a_active = is_cnot.clone() + is_toffoli.clone();
         let b_active = is_toffoli.clone();
 
-        // --- Per-read structural constraints. ---
-        // target is always active iff enabler.
-        read_constraints(&mut eval, &target, enabler.clone(), &in_limb);
-        read_constraints(&mut eval, &ctrl_a, a_active.clone(), &in_limb);
-        read_constraints(&mut eval, &ctrl_b, b_active.clone(), &in_limb);
+        // The target's post-gate value `v_after` is NOT a witness column: it equals
+        // `v_before + delta` (the pinned gate-apply equality, now inlined). `delta = fire*(1-2*v_before)`
+        // is enforced below, so `v_after = v_before + delta` remains a bit and carries the write forward.
+        let t_bit = target.v.clone(); // v_before
+        let v_after = t_bit.clone() + delta.clone();
 
-        // --- Fire / delta logic. ---
-        let a_bit = ctrl_a.bit.clone();
-        let b_bit = ctrl_b.bit.clone();
-        let t_bit = target.bit.clone();
-        // ab = a_bit*b_bit.
+        // --- Value booleanity (memory values are 1 bit). The target's written value is the derived
+        // `v_after = v_before + delta`; booleanity on it keeps the memory value a bit. ---
+        for v in [&target.v, &v_after, &ctrl_a.v, &ctrl_b.v] {
+            eval.add_constraint(v.clone() * (v.clone() - one.clone()));
+        }
+
+        // --- Gate-apply on the memory values. ---
+        let a_bit = ctrl_a.v.clone();
+        let b_bit = ctrl_b.v.clone();
+        // ab = v_a * v_b.
         eval.add_constraint(ab.clone() - a_bit.clone() * b_bit.clone());
-        // fire = is_not + is_cnot*a_bit + is_toffoli*ab.
+        // fire = is_not + is_cnot*v_a + is_toffoli*ab.
         eval.add_constraint(
             fire.clone()
                 - is_not.clone()
                 - is_cnot.clone() * a_bit.clone()
                 - is_toffoli.clone() * ab.clone(),
         );
-        // new_t = t_bit + fire - 2*t_bit*fire (XOR); delta = new_t - t_bit.
-        // delta = fire - 2*t_bit*fire = fire*(1 - 2*t_bit).
-        eval.add_constraint(
-            delta.clone() - fire.clone() + t_bit.clone() * fire.clone() * BaseField::from_u32_unchecked(2),
+        // v_after = v_before XOR fire; delta = v_after - v_before = fire*(1 - 2*v_before). (The
+        // `v_after - v_before - delta = 0` equality is now vacuous — v_after is defined as v_before+delta.)
+        eval.add_constraint(delta.clone() - fire.clone() + t_bit.clone() * fire.clone() * two);
+
+        // The access timestamp is the affine `ts = pc + 1` of the preprocessed pc, shared by all three
+        // accesses of the step (no witness column, no per-access slot). Computed once, inlined below.
+        let ts = pc.clone() + one.clone();
+
+        // --- Qubit-memory chain: per active access Use(predecessor) + Yield(successor). ---
+        // Target (always active iff enabler): Use(prev_ts, v_before), Yield(ts=pc+1, v_after=v_before+delta).
+        add_qubitmem_pair(
+            &mut eval,
+            &self.elements.qubitmem,
+            &shot_id,
+            &target,
+            &ts,
+            &v_after,
+            enabler.clone(),
+        );
+        // Control C1 (active iff is_cnot+is_toffoli): read propagates value (v_after = v).
+        add_qubitmem_pair(
+            &mut eval,
+            &self.elements.qubitmem,
+            &shot_id,
+            &ctrl_a,
+            &ts,
+            &ctrl_a.v,
+            a_active.clone(),
+        );
+        // Control C2 (active iff is_toffoli).
+        add_qubitmem_pair(
+            &mut eval,
+            &self.elements.qubitmem,
+            &shot_id,
+            &ctrl_b,
+            &ts,
+            &ctrl_b.v,
+            b_active.clone(),
         );
 
-        // --- Write: out_limb[j] = in_limb[j] + lsel_t[j]*delta*mask_t. ---
-        for j in 0..N_LIMBS {
-            eval.add_constraint(
-                out_limb[j].clone()
-                    - in_limb[j].clone()
-                    - target.lsel[j].clone() * delta.clone() * target.mask.clone(),
-            );
-        }
+        // --- ts-ordering RANGE-CHECK LOOKUPs (emitted here so their relation-batch order is
+        // qubitmem-pairs, then rc-pairs (target lo/hi, ctrl_a lo/hi, ctrl_b lo/hi), then program;
+        // mirrored exactly by `gen_main_interaction` and the in-circuit MainGate). ---
+        add_rc_lookup(&mut eval, &self.elements.rc, &target, enabler.clone());
+        add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_a, a_active.clone());
+        add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_b, b_active.clone());
 
-        // --- State threading (telescoping). ---
-        let state_tag = one.clone() * BaseField::from_u32_unchecked(TAG_STATE);
-        let mut input_state = Vec::with_capacity(GATE_REL_WIDTH);
-        input_state.push(state_tag.clone());
-        input_state.push(shot_id.clone());
-        input_state.push(pc.clone());
-        input_state.extend(in_limb.iter().cloned());
-        let mut output_state = Vec::with_capacity(GATE_REL_WIDTH);
-        output_state.push(state_tag);
-        output_state.push(shot_id.clone());
-        output_state.push(pc.clone() + one.clone());
-        output_state.extend(out_limb.iter().cloned());
-
-        let mult = E::EF::from(enabler.clone());
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements.state,
-            mult.clone(),
-            &input_state,
-        ));
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements.state,
-            -mult,
-            &output_state,
-        ));
-
-        // --- q-decode membership for each active read. ---
-        add_qdecode_lookup(&mut eval, &self.elements.qdecode, &target, enabler.clone());
-        add_qdecode_lookup(&mut eval, &self.elements.qdecode, &ctrl_a, a_active.clone());
-        add_qdecode_lookup(&mut eval, &self.elements.qdecode, &ctrl_b, b_active.clone());
-
-        // --- Dynamic range checks (lo/hi) for each active read. ---
-        add_rc_lookup(&mut eval, &self.elements.rc_lo, &self.elements.rc_hi, &target, enabler.clone());
-        add_rc_lookup(&mut eval, &self.elements.rc_lo, &self.elements.rc_hi, &ctrl_a, a_active);
-        add_rc_lookup(&mut eval, &self.elements.rc_lo, &self.elements.rc_hi, &ctrl_b, b_active);
+        // --- ts-ordering: RANGE-CHECK prev_ts < ts (soundness-critical). ---
+        // The old PIN constraint `active*(ts - (pc*TS_STRIDE + slot)) = 0` is GONE: ts is now
+        // structurally `pc + 1` (inlined), so the pin is vacuous. Only the RANGE reconstruction
+        // remains: active*((pc+1) - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 reconstructs
+        // d = pc - prev_ts from its two limbs, each range-checked by the rc-table lookup above =>
+        // d ∈ [0, 2^TS_RC_BITS), i.e. prev_ts < ts. Together with the structurally program-ordered ts
+        // and the LogUp chain balance this forces a FORWARD DAG (no stale-read cycle): each read
+        // observes the program-order-last write. Inactive accesses (active=0) unconstrained.
+        add_ts_range(&mut eval, &ts, &target, enabler.clone());
+        add_ts_range(&mut eval, &ts, &ctrl_a, a_active);
+        add_ts_range(&mut eval, &ts, &ctrl_b, b_active);
 
         // --- Program-consistency (use side, +enabler). ---
-        // opcode_scalar = is_not*1 + is_cnot*2 + is_toffoli*3 (NOP -> 0).
-        // The op fields are the execution row's existing q columns (ctrl_a.q /
-        // ctrl_b.q are 0 when the control is inactive, matching the program
-        // table's canonical zero for absent controls). pc_in_prog (preprocessed)
-        // = pc mod n_gates indexes the single hidden program. Balances against
-        // the program table's -multiplicity supply iff every execution row's
-        // (opcode, target, ctrl_a, ctrl_b) equals program[pc_in_prog], i.e. all
-        // K*N executions run the SAME program in the right cyclic order.
+        // opcode_scalar = is_not + 2*is_cnot + 3*is_toffoli (NOP -> 0). Addresses are the access
+        // addr columns (0 for inactive controls, matching the program table's canonical zero).
         let opcode_scalar = is_not.clone()
-            + is_cnot.clone() * BaseField::from_u32_unchecked(2)
+            + is_cnot.clone() * two
             + is_toffoli.clone() * BaseField::from_u32_unchecked(3);
         let prog_entry = [
             one.clone() * BaseField::from_u32_unchecked(TAG_PROGRAM),
             pc_in_prog.clone(),
             opcode_scalar,
-            target.q.clone(),
-            ctrl_a.q.clone(),
-            ctrl_b.q.clone(),
+            target.addr.clone(),
+            ctrl_a.addr.clone(),
+            ctrl_b.addr.clone(),
         ];
         eval.add_to_relation(RelationEntry::new(
             &self.elements.program,
@@ -911,125 +1103,104 @@ impl FrameworkEval for GateEval {
     }
 }
 
-struct ReadMasks<F> {
-    q: F,
-    limb_idx: F,
-    bit_pos: F,
-    mask: F,
-    lsel: Vec<F>,
-    lo: F,
-    hi: F,
-    bit: F,
+struct AccessMasks<F> {
+    addr: F,
+    prev_ts: F,
+    v: F,
+    rc_lo: F, // low limb of d = ts - prev_ts - 1 = pc - prev_ts (range-checked into [0,2^RC_LO_BITS))
+    rc_hi: F, // high limb of d                                   (range-checked into [0,2^RC_HI_BITS))
 }
 
-/// Structural constraints for a single qubit read.
-fn read_constraints<E: EvalAtRow>(
-    eval: &mut E,
-    r: &ReadMasks<E::F>,
-    active: E::F,
-    in_limb: &[E::F],
-) {
-    let one = E::F::one();
-    // lsel booleanity.
-    for s in &r.lsel {
-        eval.add_constraint(s.clone() * (s.clone() - one.clone()));
-    }
-    // sum lsel = active; sum j*lsel_j = limb_idx.
-    let mut sum = E::F::zero();
-    let mut weighted = E::F::zero();
-    for (j, s) in r.lsel.iter().enumerate() {
-        sum += s.clone();
-        weighted += s.clone() * BaseField::from_u32_unchecked(j as u32);
-    }
-    eval.add_constraint(sum - active.clone());
-    eval.add_constraint(weighted - r.limb_idx.clone());
-    // selected limb L = sum lsel_j * in_limb_j.
-    let mut l = E::F::zero();
-    for (j, s) in r.lsel.iter().enumerate() {
-        l += s.clone() * in_limb[j].clone();
-    }
-    // variable split: L = hi*2^(pos+1) + bit*2^pos + lo = hi*2*mask + bit*mask + lo.
-    let two = BaseField::from_u32_unchecked(2);
-    eval.add_constraint(
-        l - r.hi.clone() * r.mask.clone() * two
-            - r.bit.clone() * r.mask.clone()
-            - r.lo.clone(),
-    );
-    // bit booleanity.
-    eval.add_constraint(r.bit.clone() * (r.bit.clone() - one.clone()));
-    // inactive => bit forced 0.
-    eval.add_constraint((one.clone() - active.clone()) * r.bit.clone());
-}
-
-fn read_masks<E: EvalAtRow>(eval: &mut E) -> ReadMasks<E::F> {
-    let q = eval.next_trace_mask();
-    let limb_idx = eval.next_trace_mask();
-    let bit_pos = eval.next_trace_mask();
-    let mask = eval.next_trace_mask();
-    let lsel = (0..N_LIMBS).map(|_| eval.next_trace_mask()).collect_vec();
-    let lo = eval.next_trace_mask();
-    let hi = eval.next_trace_mask();
-    let bit = eval.next_trace_mask();
-    ReadMasks {
-        q,
-        limb_idx,
-        bit_pos,
-        mask,
-        lsel,
-        lo,
-        hi,
-        bit,
+fn access_masks<E: EvalAtRow>(eval: &mut E) -> AccessMasks<E::F> {
+    // ts is NOT a column — it is the inlined `pc + 1`. Per-access columns: addr, prev_ts, v, rc_lo, rc_hi.
+    let addr = eval.next_trace_mask();
+    let prev_ts = eval.next_trace_mask();
+    let v = eval.next_trace_mask();
+    // rc_lo, rc_hi follow v (matches `cell_at`'s per-access column order).
+    let rc_lo = eval.next_trace_mask();
+    let rc_hi = eval.next_trace_mask();
+    AccessMasks {
+        addr,
+        prev_ts,
+        v,
+        rc_lo,
+        rc_hi,
     }
 }
 
-fn add_qdecode_lookup<E: EvalAtRow>(
+/// Emit the chain Use(predecessor) + Yield(successor) pair for one access, gated by `active`.
+/// `ts` is the access's inlined timestamp expression (`pc + 1`, shared across the step); `v_out` is
+/// the value written forward (v_after = v_before+delta for the target, v for a control read).
+fn add_qubitmem_pair<E: EvalAtRow>(
     eval: &mut E,
     elements: &GateRel,
-    r: &ReadMasks<E::F>,
+    shot_id: &E::F,
+    a: &AccessMasks<E::F>,
+    ts: &E::F,
+    v_out: &E::F,
     active: E::F,
 ) {
-    // Membership of (q, limb_idx, bit_pos, mask) in the 512-row table, with
-    // multiplicity = active (0 for inactive reads => inert). Tagged TAG_QDECODE.
-    let entry = [
-        E::F::one() * BaseField::from_u32_unchecked(TAG_QDECODE),
-        r.q.clone(),
-        r.limb_idx.clone(),
-        r.bit_pos.clone(),
-        r.mask.clone(),
+    let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_QUBITMEM);
+    // Use predecessor: +active / (shot, addr, prev_ts, v_before).
+    let use_entry = [
+        tag.clone(),
+        shot_id.clone(),
+        a.addr.clone(),
+        a.prev_ts.clone(),
+        a.v.clone(),
     ];
     eval.add_to_relation(RelationEntry::new(
         elements,
-        E::EF::from(active),
-        &entry,
+        E::EF::from(active.clone()),
+        &use_entry,
+    ));
+    // Yield successor: -active / (shot, addr, ts=pc+1, v_after).
+    let yield_entry = [tag, shot_id.clone(), a.addr.clone(), ts.clone(), v_out.clone()];
+    eval.add_to_relation(RelationEntry::new(
+        elements,
+        -E::EF::from(active),
+        &yield_entry,
     ));
 }
 
-fn add_rc_lookup<E: EvalAtRow>(
+/// Emit the range-check reconstruction for one access, gated by `active`:
+///   RANGE: active*(ts - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 — reconstructs the diff
+///          d = ts - prev_ts - 1 = pc - prev_ts from its two limbs. The limbs themselves are
+///          range-checked by the rc-table LOOKUP (`add_rc_lookup`), not here, so d ∈ [0, 2^TS_RC_BITS)
+///          (prev_ts < ts). `ts` is the inlined `pc + 1` expression.
+/// The old PIN constraint is removed (ts is structurally pc+1, so the pin is vacuous). The
+/// reconstruction is gated by `active`; the two limb LOOKUPs are also gated by `active` (an inactive
+/// access emits no rc term). Inactive accesses (active = 0) leave prev_ts/rc_lo/rc_hi free.
+fn add_ts_range<E: EvalAtRow>(
     eval: &mut E,
-    lo_elements: &GateRel,
-    hi_elements: &GateRel,
-    r: &ReadMasks<E::F>,
+    ts: &E::F,
+    a: &AccessMasks<E::F>,
     active: E::F,
 ) {
-    let lo_entry = [
-        E::F::one() * BaseField::from_u32_unchecked(TAG_RC_LO),
-        r.bit_pos.clone(),
-        r.lo.clone(),
-    ];
-    let hi_entry = [
-        E::F::one() * BaseField::from_u32_unchecked(TAG_RC_HI),
-        r.bit_pos.clone(),
-        r.hi.clone(),
-    ];
+    let one = E::F::one();
+    // RANGE reconstruction: d = rc_lo + 2^RC_LO_BITS * rc_hi.
+    let recon = a.rc_lo.clone() + a.rc_hi.clone() * BaseField::from_u32_unchecked(1u32 << RC_LO_BITS);
+    let d = ts.clone() - a.prev_ts.clone() - one;
+    eval.add_constraint(active * (d - recon));
+}
+
+/// Emit the two rc-table range-check LOOKUPs for one access, gated by `active`. Each limb is looked
+/// up as (TAG_RC, pos, limb); the rc supply table supplies each in-range (pos, value). Emitting the
+/// two terms consecutively (lo then hi) makes them a single finalize-in-pairs batch (mirrored by
+/// `gen_main_interaction` and the in-circuit MainGate).
+fn add_rc_lookup<E: EvalAtRow>(eval: &mut E, rc: &GateRel, a: &AccessMasks<E::F>, active: E::F) {
+    let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
+    let pos_lo = E::F::one() * BaseField::from_u32_unchecked(RC_POS_LO);
+    let pos_hi = E::F::one() * BaseField::from_u32_unchecked(RC_POS_HI);
     eval.add_to_relation(RelationEntry::new(
-        lo_elements,
+        rc,
         E::EF::from(active.clone()),
-        &lo_entry,
+        &[tag.clone(), pos_lo, a.rc_lo.clone()],
     ));
     eval.add_to_relation(RelationEntry::new(
-        hi_elements,
+        rc,
         E::EF::from(active),
-        &hi_entry,
+        &[tag, pos_hi, a.rc_hi.clone()],
     ));
 }
 
@@ -1037,85 +1208,61 @@ fn add_rc_lookup<E: EvalAtRow>(
 // Table FrameworkEvals (supply side of each lookup table)
 // ----------------------------------------------------------------------------
 
+/// Qubit-memory boundary table (supply side). Per (shot, addr) — `shot`/`addr` preprocessed,
+/// `x`/`y`/`ts_last` witness — emits on TAG_QUBITMEM the chain head + tail:
+///   init  Yield[-1](shot, addr, 0, x)
+///   final Use [+1](shot, addr, ts_last, y)
+/// Two terms/row => 1 batch. Booleanity on x, y (1-bit values).
 #[derive(Clone)]
-struct QDecodeTableEval {
+struct BoundaryTableEval {
+    log_size: u32,
     elements: GateRel,
 }
 
-impl FrameworkEval for QDecodeTableEval {
+impl FrameworkEval for BoundaryTableEval {
     fn log_size(&self) -> u32 {
-        N_QUBITS.ilog2()
+        self.log_size
     }
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size() + 1
+        self.log_size + 1
     }
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let q = eval.get_preprocessed_column(pp_id("gate_qdecode_q"));
-        let limb_idx = eval.get_preprocessed_column(pp_id("gate_qdecode_limb"));
-        let bit_pos = eval.get_preprocessed_column(pp_id("gate_qdecode_pos"));
-        let mask = eval.get_preprocessed_column(pp_id("gate_qdecode_mask"));
-        let multiplicity = eval.next_trace_mask();
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_QDECODE);
+        let one = E::F::one();
+        let shot = eval.get_preprocessed_column(pp_id("gate_bnd_shot"));
+        let addr = eval.get_preprocessed_column(pp_id("gate_bnd_addr"));
+        // Real-row enabler (1 on real (shot,addr), 0 on padding). Gates the boundary emission so
+        // padding rows (non-power-of-two n_shots*N_QUBITS) inject no unmatched LogUp terms.
+        let bnd_enabler = eval.get_preprocessed_column(pp_id("gate_bnd_enabler"));
+        let x = eval.next_trace_mask();
+        let y = eval.next_trace_mask();
+        let ts_last = eval.next_trace_mask();
+        // Booleanity of the boundary values.
+        eval.add_constraint(x.clone() * (x.clone() - one.clone()));
+        eval.add_constraint(y.clone() * (y.clone() - one.clone()));
+
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_QUBITMEM);
+        let ts_final = E::F::one() * BaseField::from_u32_unchecked(TS_FINAL);
+        // Phase-3 x/y binding (re-keyed boundary). The init anchor is NO LONGER consumed here:
+        // main's first Use +1/(shot,addr,0,x) is left DANGLING as a PUBLIC term. The boundary now
+        //   (B) INTERNAL final Use  +1 / (shot, addr, ts_last, y)  -> cancels main's last Yield.
+        //   (D) PUBLIC  final Yield -1 / (shot, addr, TS_FINAL, y)  -> re-keys y to a fixed public ts.
+        // Net base claimed_sum (per shot,addr) = +[0,x] − [TS_FINAL,y]; the leaf's public_logup_sum
+        // supplies −that over its guessed x/y, so the verifier balance forces guessed == committed.
+        // (`x` is retained as a witness column with its booleanity constraint above; it is no longer
+        // emitted by the boundary — it lives only on main's dangling init term.)
+        // (B) internal final Use[+bnd_enabler]: +bnd_enabler / (shot, addr, ts_last, y).
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
-            -E::EF::from(multiplicity),
-            &[tag, q, limb_idx, bit_pos, mask],
+            E::EF::from(bnd_enabler.clone()),
+            &[tag.clone(), shot.clone(), addr.clone(), ts_last, y.clone()],
         ));
-        eval.finalize_logup();
-        eval
-    }
-}
-
-#[derive(Clone)]
-struct RcLoTableEval {
-    elements: GateRel,
-}
-
-impl FrameworkEval for RcLoTableEval {
-    fn log_size(&self) -> u32 {
-        RC_LOG_SIZE
-    }
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size() + 1
-    }
-    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let pos = eval.get_preprocessed_column(pp_id("gate_rc_lo_pos"));
-        let val = eval.get_preprocessed_column(pp_id("gate_rc_lo_val"));
-        let multiplicity = eval.next_trace_mask();
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC_LO);
+        // (D) public final Yield[-bnd_enabler]: -bnd_enabler / (shot, addr, TS_FINAL, y).
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
-            -E::EF::from(multiplicity),
-            &[tag, pos, val],
+            -E::EF::from(bnd_enabler),
+            &[tag, shot, addr, ts_final, y],
         ));
-        eval.finalize_logup();
-        eval
-    }
-}
-
-#[derive(Clone)]
-struct RcHiTableEval {
-    elements: GateRel,
-}
-
-impl FrameworkEval for RcHiTableEval {
-    fn log_size(&self) -> u32 {
-        RC_LOG_SIZE
-    }
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size() + 1
-    }
-    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let pos = eval.get_preprocessed_column(pp_id("gate_rc_hi_pos"));
-        let val = eval.get_preprocessed_column(pp_id("gate_rc_hi_val"));
-        let multiplicity = eval.next_trace_mask();
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC_HI);
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            -E::EF::from(multiplicity),
-            &[tag, pos, val],
-        ));
-        eval.finalize_logup();
+        eval.finalize_logup_in_pairs();
         eval
     }
 }
@@ -1155,49 +1302,80 @@ impl FrameworkEval for ProgramTableEval {
     }
 }
 
+/// ts-ordering range-check table (supply side). `pos`/`val` are preprocessed (the table membership);
+/// `multiplicity` is witness (count of real limb lookups landing on this row). Emits
+/// -multiplicity / combine(TAG_RC, pos, val) — one term/row => 1 batch => 4 interaction columns.
+#[derive(Clone)]
+struct RcTableEval {
+    elements: GateRel,
+}
+
+impl FrameworkEval for RcTableEval {
+    fn log_size(&self) -> u32 {
+        RC_LOG_SIZE
+    }
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.log_size() + 1
+    }
+    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let pos = eval.get_preprocessed_column(pp_id("gate_rc_pos"));
+        let val = eval.get_preprocessed_column(pp_id("gate_rc_val"));
+        let multiplicity = eval.next_trace_mask();
+        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
+        eval.add_to_relation(RelationEntry::new(
+            &self.elements,
+            -E::EF::from(multiplicity),
+            &[tag, pos, val],
+        ));
+        eval.finalize_logup();
+        eval
+    }
+}
+
 fn pp_id(id: &str) -> PreProcessedColumnId {
     PreProcessedColumnId { id: id.to_owned() }
 }
 
 /// Number of preprocessed columns (count-only uses; the order is `preprocessed_column_ids`).
-/// 10 base + 3 (gate_enabler / gate_shot_id / gate_pc) moved out of the main witness trace.
-const N_PREPROCESSED_COLS: usize = 13;
+/// prog_slot + (enabler/shot_id/pc/pc_in_prog) + (bnd_shot/bnd_addr/bnd_enabler) + (rc_pos/rc_val) = 10.
+const N_PREPROCESSED_COLS: usize = 10;
 
 /// Each preprocessed column paired with its log_size, in a fixed canonical listing order, then
 /// STABLE-sorted ascending by size. The committed preprocessed tree MUST be size-sorted (stwo's
 /// lifted Merkle sorts each tree's columns by length, and the in-circuit verifier does NOT re-sort
-/// the preprocessed tree). The sizes are DYNAMIC: `gate_pc_in_prog` is sized with the main trace
-/// (`main_log_size = log_n_rows`) and `gate_prog_slot` with the program table — so when the main
-/// trace grows past the range-check tables (RC_LOG_SIZE = 16) the sort order changes (pc_in_prog
-/// moves after rc). A static order is only correct while main_log_size <= 16.
+/// the preprocessed tree). The sizes are DYNAMIC: `gate_pc_in_prog` is sized with the main trace,
+/// `gate_prog_slot` with the program table, `gate_bnd_*` with the boundary table, and the rc table
+/// columns are fixed at RC_LOG_SIZE.
 fn preprocessed_columns_sorted(
     main_log_size: u32,
     program_log_size: u32,
+    boundary_log_size: u32,
 ) -> Vec<(PreProcessedColumnId, u32)> {
-    let q = N_QUBITS.ilog2();
     let mut cols = vec![
-        (pp_id("gate_qdecode_q"), q),
-        (pp_id("gate_qdecode_limb"), q),
-        (pp_id("gate_qdecode_pos"), q),
-        (pp_id("gate_qdecode_mask"), q),
         (pp_id("gate_prog_slot"), program_log_size),
-        // Shard-invariant positional main-trace columns, moved out of the witness trace (tree1)
-        // into the preprocessed tree (tree0). All sized with the main trace (`main_log_size`).
+        // Shard-invariant positional main-trace columns (tree0). Sized with the main trace.
         (pp_id("gate_enabler"), main_log_size),
         (pp_id("gate_shot_id"), main_log_size),
         (pp_id("gate_pc"), main_log_size),
         (pp_id("gate_pc_in_prog"), main_log_size),
-        (pp_id("gate_rc_lo_pos"), RC_LOG_SIZE),
-        (pp_id("gate_rc_lo_val"), RC_LOG_SIZE),
-        (pp_id("gate_rc_hi_pos"), RC_LOG_SIZE),
-        (pp_id("gate_rc_hi_val"), RC_LOG_SIZE),
+        // Qubit-memory boundary positional columns. Sized with the boundary table.
+        (pp_id("gate_bnd_shot"), boundary_log_size),
+        (pp_id("gate_bnd_addr"), boundary_log_size),
+        (pp_id("gate_bnd_enabler"), boundary_log_size),
+        // ts-ordering range-check table membership (pos, val). Fixed at RC_LOG_SIZE.
+        (pp_id("gate_rc_pos"), RC_LOG_SIZE),
+        (pp_id("gate_rc_val"), RC_LOG_SIZE),
     ];
     cols.sort_by_key(|&(_, s)| s); // stable: ties keep the listing order above
     cols
 }
 
-fn preprocessed_column_ids(main_log_size: u32, program_log_size: u32) -> Vec<PreProcessedColumnId> {
-    preprocessed_columns_sorted(main_log_size, program_log_size)
+fn preprocessed_column_ids(
+    main_log_size: u32,
+    program_log_size: u32,
+    boundary_log_size: u32,
+) -> Vec<PreProcessedColumnId> {
+    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -1208,37 +1386,33 @@ fn preprocessed_column_ids(main_log_size: u32, program_log_size: u32) -> Vec<Pre
 // ----------------------------------------------------------------------------
 
 type GateComponent = FrameworkComponent<GateEval>;
-type QDecodeComponent = FrameworkComponent<QDecodeTableEval>;
-type RcLoComponent = FrameworkComponent<RcLoTableEval>;
-type RcHiComponent = FrameworkComponent<RcHiTableEval>;
 type ProgramComponent = FrameworkComponent<ProgramTableEval>;
+type BoundaryComponent = FrameworkComponent<BoundaryTableEval>;
+type RcComponent = FrameworkComponent<RcTableEval>;
 
 struct Components {
     main: GateComponent,
-    qdecode: QDecodeComponent,
-    rc_lo: RcLoComponent,
-    rc_hi: RcHiComponent,
     program: ProgramComponent,
+    boundary: BoundaryComponent,
+    rc: RcComponent,
 }
 
 impl Components {
     fn component_refs(&self) -> Vec<&dyn Component> {
         vec![
             &self.main as &dyn Component,
-            &self.qdecode as &dyn Component,
-            &self.rc_lo as &dyn Component,
-            &self.rc_hi as &dyn Component,
             &self.program as &dyn Component,
+            &self.boundary as &dyn Component,
+            &self.rc as &dyn Component,
         ]
     }
 
     fn prover_refs(&self) -> Vec<&dyn stwo::prover::ComponentProver<ProverBackend>> {
         vec![
             &self.main as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.qdecode as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.rc_lo as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.rc_hi as &dyn stwo::prover::ComponentProver<ProverBackend>,
             &self.program as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.boundary as &dyn stwo::prover::ComponentProver<ProverBackend>,
+            &self.rc as &dyn stwo::prover::ComponentProver<ProverBackend>,
         ]
     }
 
@@ -1261,15 +1435,15 @@ impl Components {
 fn build_components(
     log_n_rows: u32,
     program_log_size: u32,
+    boundary_log_size: u32,
     elements: &LookupElements,
     main_sum: SecureField,
-    qdecode_sum: SecureField,
-    rc_lo_sum: SecureField,
-    rc_hi_sum: SecureField,
     program_sum: SecureField,
+    boundary_sum: SecureField,
+    rc_sum: SecureField,
 ) -> Components {
     let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(
-        &preprocessed_column_ids(log_n_rows, program_log_size),
+        &preprocessed_column_ids(log_n_rows, program_log_size, boundary_log_size),
     );
     let main = GateComponent::new(
         &mut allocator,
@@ -1279,27 +1453,6 @@ fn build_components(
         },
         main_sum,
     );
-    let qdecode = QDecodeComponent::new(
-        &mut allocator,
-        QDecodeTableEval {
-            elements: elements.qdecode.clone(),
-        },
-        qdecode_sum,
-    );
-    let rc_lo = RcLoComponent::new(
-        &mut allocator,
-        RcLoTableEval {
-            elements: elements.rc_lo.clone(),
-        },
-        rc_lo_sum,
-    );
-    let rc_hi = RcHiComponent::new(
-        &mut allocator,
-        RcHiTableEval {
-            elements: elements.rc_hi.clone(),
-        },
-        rc_hi_sum,
-    );
     let program = ProgramComponent::new(
         &mut allocator,
         ProgramTableEval {
@@ -1308,12 +1461,26 @@ fn build_components(
         },
         program_sum,
     );
+    let boundary = BoundaryComponent::new(
+        &mut allocator,
+        BoundaryTableEval {
+            log_size: boundary_log_size,
+            elements: elements.qubitmem.clone(),
+        },
+        boundary_sum,
+    );
+    let rc = RcComponent::new(
+        &mut allocator,
+        RcTableEval {
+            elements: elements.rc.clone(),
+        },
+        rc_sum,
+    );
     Components {
         main,
-        qdecode,
-        rc_lo,
-        rc_hi,
         program,
+        boundary,
+        rc,
     }
 }
 
@@ -1322,14 +1489,27 @@ fn build_components(
 // ----------------------------------------------------------------------------
 
 /// Single scalar cell of `row` at canonical column index `col`. The column order
-/// is exactly the serial `put(...)` sequence the old fill used (and the order
-/// `evaluate` reads masks): is_{nop,not,cnot,toffoli},
-/// in_limb[32], out_limb[32], then target/ctrl_a/ctrl_b read blocks
-/// (q,limb_idx,bit_pos,mask,lsel[32],lo,hi,bit) each, then ab,fire,delta.
-/// NOTE: enabler, shot_id, pc are NOT here — they are preprocessed (tree0) now.
+/// matches the order `evaluate` reads masks (each access block = ACCESS_COLS core + RC_N_LIMBS limbs):
+///   is_{nop,not,cnot,toffoli}(4),
+///   target(addr,prev_ts,v, rc_lo,rc_hi),
+///   ctrl_a(addr,prev_ts,v, rc_lo,rc_hi), ctrl_b(addr,prev_ts,v, rc_lo,rc_hi),
+///   ab, fire, delta (3).
+/// NOTE: enabler, shot_id, pc are NOT here — they are preprocessed (tree0). ts (= pc+1) and the
+/// target's v_after (= v_before+delta) are NOT columns either — they are inlined in `evaluate`.
 #[inline]
 fn cell_at(row: &Row, col: usize) -> u32 {
     debug_assert!(col < TRACE_COLUMNS);
+    #[inline]
+    fn access_cell(a: &AccessCols, i: usize) -> u32 {
+        // 0..ACCESS_COLS: addr, prev_ts, v ; then rc_lo, rc_hi.
+        match i {
+            0 => a.addr,
+            1 => a.prev_ts,
+            2 => a.v,
+            3 => a.rc_lo,
+            _ => a.rc_hi,
+        }
+    }
     let mut c = col;
     // Header (4 cols).
     const HEADER: [fn(&Row) -> u32; 4] = [
@@ -1342,44 +1522,21 @@ fn cell_at(row: &Row, col: usize) -> u32 {
         return HEADER[c](row);
     }
     c -= HEADER.len();
-    if c < N_LIMBS {
-        return row.in_limb[c];
+    // target block: ACCESS_BLOCK access cols (no v_after column — inlined as v_before+delta).
+    if c < ACCESS_BLOCK {
+        return access_cell(&row.target, c);
     }
-    c -= N_LIMBS;
-    if c < N_LIMBS {
-        return row.out_limb[c];
+    c -= ACCESS_BLOCK;
+    // ctrl_a block.
+    if c < ACCESS_BLOCK {
+        return access_cell(&row.ctrl_a, c);
     }
-    c -= N_LIMBS;
-    // Three read blocks of READ_COLS each.
-    if c < 3 * READ_COLS {
-        let which = c / READ_COLS;
-        let mut rc = c % READ_COLS;
-        let r = match which {
-            0 => &row.target,
-            1 => &row.ctrl_a,
-            _ => &row.ctrl_b,
-        };
-        // Block order: q, limb_idx, bit_pos, mask, lsel[32], lo, hi, bit.
-        return match rc {
-            0 => r.q,
-            1 => r.limb_idx,
-            2 => r.bit_pos,
-            3 => r.mask,
-            _ => {
-                rc -= 4;
-                if rc < N_LIMBS {
-                    r.lsel[rc]
-                } else {
-                    match rc - N_LIMBS {
-                        0 => r.lo,
-                        1 => r.hi,
-                        _ => r.bit,
-                    }
-                }
-            }
-        };
+    c -= ACCESS_BLOCK;
+    // ctrl_b block.
+    if c < ACCESS_BLOCK {
+        return access_cell(&row.ctrl_b, c);
     }
-    c -= 3 * READ_COLS;
+    c -= ACCESS_BLOCK;
     // Tail: ab, fire, delta.
     match c {
         0 => row.ab,
@@ -1466,31 +1623,36 @@ fn to_prover(
         .collect()
 }
 
-fn generate_qdecode_preprocessed(
+/// Preprocessed positional columns for the boundary table: (shot, addr) per row.
+fn generate_boundary_preprocessed(
+    bnd: &BoundaryTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let mut q = vec![0u32; N_QUBITS];
-    let mut limb = vec![0u32; N_QUBITS];
-    let mut pos = vec![0u32; N_QUBITS];
-    let mut mask = vec![0u32; N_QUBITS];
-    for qi in 0..N_QUBITS {
-        let (l, p, m) = qubit_decode(qi as u16);
-        q[qi] = qi as u32;
-        limb[qi] = l;
-        pos[qi] = p;
-        mask[qi] = m;
-    }
+    let shot: Vec<u32> = bnd.rows.iter().map(|r| r.shot_id).collect();
+    let addr: Vec<u32> = bnd.rows.iter().map(|r| r.addr).collect();
+    // Real-row enabler: 1 for the first `n_shots*N_QUBITS` rows, 0 on padding. POSITIONAL /
+    // shard-invariant (depends only on the shot count). Gates the boundary emission so a non-power-of-
+    // two `n_shots*N_QUBITS` (e.g. 9024 shots) does not inject unmatched LogUp terms on padding rows.
+    let real = bnd.n_shots * N_QUBITS;
+    let enabler: Vec<u32> = (0..bnd.rows.len()).map(|i| (i < real) as u32).collect();
     vec![
-        col_from_values(&q),
-        col_from_values(&limb),
-        col_from_values(&pos),
-        col_from_values(&mask),
+        col_from_values(&shot),
+        col_from_values(&addr),
+        col_from_values(&enabler),
     ]
 }
 
-fn generate_rc_preprocessed(
-    idx: &RcIndex,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(&idx.pos_col), col_from_values(&idx.val_col)]
+/// Boundary-table witness (x, y, ts_last), in the order BoundaryTableEval reads them.
+fn generate_boundary_witness(
+    bnd: &BoundaryTable,
+) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
+    let x: Vec<u32> = bnd.rows.iter().map(|r| r.x).collect();
+    let y: Vec<u32> = bnd.rows.iter().map(|r| r.y).collect();
+    let ts_last: Vec<u32> = bnd.rows.iter().map(|r| r.ts_last).collect();
+    vec![
+        col_from_values(&x),
+        col_from_values(&y),
+        col_from_values(&ts_last),
+    ]
 }
 
 /// Preprocessed `enabler` column: 1 on real rows, 0 on padding. SHARD-INVARIANT and POSITIONAL —
@@ -1569,10 +1731,18 @@ fn generate_program_witness(
     ]
 }
 
-fn generate_multiplicity_trace(
-    counts: &[u32],
+/// Preprocessed rc-table membership columns (pos, val), in the order RcTableEval reads them.
+fn generate_rc_preprocessed(
+    rc: &RcTable,
+) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
+    vec![col_from_values(&rc.pos), col_from_values(&rc.val)]
+}
+
+/// rc-table witness (multiplicity tree): a single multiplicity column.
+fn generate_rc_witness(
+    rc: &RcTable,
 ) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(counts)]
+    vec![col_from_values(&rc.multiplicity)]
 }
 
 // ----------------------------------------------------------------------------
@@ -1587,14 +1757,16 @@ fn pack(lane: &[&Row; LANE_COUNT], get: impl Fn(&Row) -> u32) -> PackedM31 {
 }
 
 /// Main component interaction trace. Logup batches mirror the relation entries
-/// emitted in `evaluate`, finalized in pairs. Order must match (12 entries -> 6
-/// full pairs):
-///   pair0: state_in (+enabler), state_out (-enabler)
-///   pair1: qdecode target (+enabler), qdecode ctrl_a (+a_active)
-///   pair2: qdecode ctrl_b (+b_active), rc_lo target (+enabler)
-///   pair3: rc_hi target (+enabler), rc_lo ctrl_a (+a_active)
-///   pair4: rc_hi ctrl_a (+a_active), rc_lo ctrl_b (+b_active)
-///   pair5: rc_hi ctrl_b (+b_active), program (+enabler)
+/// emitted in `evaluate`, finalized in pairs. Order must match (7 entries -> 4 columns):
+///   pair0: qubitmem target Use (+enabler), target Yield (-enabler)
+///   pair1: qubitmem ctrl_a Use (+a_active), ctrl_a Yield (-a_active)
+///   pair2: qubitmem ctrl_b Use (+b_active), ctrl_b Yield (-b_active)
+///   pair3: rc target lo (+enabler), target hi (+enabler)
+///   pair4: rc ctrl_a lo (+a_active), ctrl_a hi (+a_active)
+///   pair5: rc ctrl_b lo (+b_active), ctrl_b hi (+b_active)
+///   col6:  program (+enabler)  [odd tail => a singleton batch, not a pair]
+/// 13 relation entries -> 6 pairs + 1 singleton => 7 batches => 28 interaction columns. The rc terms
+/// are the ts-ordering range-check limb lookups (TAG_RC, pos, limb) mirroring `add_rc_lookup`.
 fn gen_main_interaction(
     rows: &[Row],
     padded_rows: usize,
@@ -1607,54 +1779,69 @@ fn gen_main_interaction(
 ) {
     let mut gen = LogupTraceGenerator::new(log_n_rows);
 
-    // Entry combiners.
-    let state_in = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
-        v.push(ptag(TAG_STATE));
-        v.push(pack(lane, |r| r.shot_id));
-        v.push(pack(lane, |r| r.pc));
-        for j in 0..N_LIMBS {
-            v.push(pack(lane, |r| r.in_limb[j]));
-        }
-        el.state.combine(&v)
+    fn sel_t(r: &Row) -> &AccessCols {
+        &r.target
+    }
+    fn sel_a(r: &Row) -> &AccessCols {
+        &r.ctrl_a
+    }
+    fn sel_b(r: &Row) -> &AccessCols {
+        &r.ctrl_b
+    }
+
+    // Chain USE (predecessor): (shot, addr, prev_ts, v_before).
+    let qm_use = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
+        el.qubitmem.combine(&[
+            ptag(TAG_QUBITMEM),
+            pack(lane, |r| r.shot_id),
+            pack(lane, |r| sel(r).addr),
+            pack(lane, |r| sel(r).prev_ts),
+            pack(lane, |r| sel(r).v),
+        ])
     };
-    let state_out = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
-        v.push(ptag(TAG_STATE));
-        v.push(pack(lane, |r| r.shot_id));
-        v.push(pack(lane, |r| r.pc + 1));
-        for j in 0..N_LIMBS {
-            v.push(pack(lane, |r| r.out_limb[j]));
-        }
-        el.state.combine(&v)
+    // Chain YIELD (successor): (shot, addr, ts=pc+1, v_after). ts is the inlined `pc + 1` (not a
+    // column). For the target, v_after = v_before + delta; for controls the value propagates (== v).
+    let qm_yield_t = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
+        el.qubitmem.combine(&[
+            ptag(TAG_QUBITMEM),
+            pack(lane, |r| r.shot_id),
+            pack(lane, |r| r.target.addr),
+            pack(lane, |r| r.pc + 1),
+            // v_after = v_before + delta, computed as the exact bit v_before ^ fire (canonical M31,
+            // avoids the non-canonical p that a raw `v_before + delta_to_m31(-1)` would produce).
+            pack(lane, |r| r.target.v ^ r.fire),
+        ])
     };
+    let qm_yield_ctrl =
+        |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
+            el.qubitmem.combine(&[
+                ptag(TAG_QUBITMEM),
+                pack(lane, |r| r.shot_id),
+                pack(lane, |r| sel(r).addr),
+                pack(lane, |r| r.pc + 1),
+                pack(lane, |r| sel(r).v),
+            ])
+        };
     let enabler = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.enabler);
     let a_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_cnot + r.is_toffoli);
     let b_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_toffoli);
 
-    let qdecode = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
-        el.qdecode.combine(&[
-            ptag(TAG_QDECODE),
-            pack(lane, |r| sel(r).q),
-            pack(lane, |r| sel(r).limb_idx),
-            pack(lane, |r| sel(r).bit_pos),
-            pack(lane, |r| sel(r).mask),
+    // ts-ordering range-check use-side denominators: (TAG_RC, pos, limb) per limb of each access.
+    let rc_lo = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
+        el.rc.combine(&[
+            ptag(TAG_RC),
+            ptag(RC_POS_LO),
+            pack(lane, |r| sel(r).rc_lo),
         ])
     };
-    let rc_lo = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
-        el.rc_lo.combine(&[
-            ptag(TAG_RC_LO),
-            pack(lane, |r| sel(r).bit_pos),
-            pack(lane, |r| sel(r).lo),
+    let rc_hi = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
+        el.rc.combine(&[
+            ptag(TAG_RC),
+            ptag(RC_POS_HI),
+            pack(lane, |r| sel(r).rc_hi),
         ])
     };
-    let rc_hi = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &ReadCols| -> PackedSecureField {
-        el.rc_hi.combine(&[
-            ptag(TAG_RC_HI),
-            pack(lane, |r| sel(r).bit_pos),
-            pack(lane, |r| sel(r).hi),
-        ])
-    };
+
     // Program use-side denominator. pc_in_prog = pc mod n_gates (preprocessed in
     // the AIR; recomputed here for the prover). opcode_scalar from the one-hot.
     let ng = n_gates as u32;
@@ -1663,21 +1850,11 @@ fn gen_main_interaction(
             ptag(TAG_PROGRAM),
             pack(lane, |r| r.pc % ng),
             pack(lane, |r| r.is_not + 2 * r.is_cnot + 3 * r.is_toffoli),
-            pack(lane, |r| r.target.q),
-            pack(lane, |r| r.ctrl_a.q),
-            pack(lane, |r| r.ctrl_b.q),
+            pack(lane, |r| r.target.addr),
+            pack(lane, |r| r.ctrl_a.addr),
+            pack(lane, |r| r.ctrl_b.addr),
         ])
     };
-
-    fn sel_t(r: &Row) -> &ReadCols {
-        &r.target
-    }
-    fn sel_a(r: &Row) -> &ReadCols {
-        &r.ctrl_a
-    }
-    fn sel_b(r: &Row) -> &ReadCols {
-        &r.ctrl_b
-    }
 
     // Write one logup column for a pair of relation entries: fraction = m0/d0 + m1/d1.
     // PARALLEL over vec_rows: the per-row combine (35-element dot products) is the cost; computing
@@ -1716,6 +1893,32 @@ fn gen_main_interaction(
         });
         gen.col_from_par_iter(col_iter);
     }
+    // Write one logup column for a SINGLE relation entry: fraction = m0/d0. Used for the odd tail
+    // (program) so the prover-side batching matches `finalize_logup_in_pairs`'s last (singleton)
+    // chunk when the relation-entry count is odd.
+    fn write_single_par<N0, D0>(
+        gen: &mut LogupTraceGenerator,
+        rows: &[Row],
+        n_vec: usize,
+        num0: N0,
+        den0: D0,
+        sign0: i32,
+    ) where
+        N0: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
+        D0: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
+    {
+        use rayon::prelude::*;
+        let pad = Row::padding();
+        let col_iter = (0..n_vec).into_par_iter().map(|vec_row| {
+            let lane: [&Row; LANE_COUNT] =
+                std::array::from_fn(|l| rows.get(vec_row * LANE_COUNT + l).unwrap_or(&pad));
+            let m0 = PackedSecureField::from(num0(&lane));
+            let m0 = if sign0 < 0 { -m0 } else { m0 };
+            let d0 = den0(&lane);
+            (m0, d0)
+        });
+        gen.col_from_par_iter(col_iter);
+    }
     let n_vec = padded_rows / LANE_COUNT;
     let write_pair = |gen: &mut LogupTraceGenerator,
                       num0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
@@ -1727,66 +1930,68 @@ fn gen_main_interaction(
         write_pair_par(gen, rows, n_vec, num0, den0, sign0, num1, den1, sign1);
     };
 
-    // pair0: state_in (+enabler), state_out (-enabler).
+    // pair0: qubitmem target Use (+enabler), target Yield (-enabler).
     write_pair(
         &mut gen,
         &enabler,
-        &state_in,
+        &|l| qm_use(l, sel_t),
         1,
         &enabler,
-        &state_out,
+        &qm_yield_t,
         -1,
     );
-    // pair1: qdecode target (+enabler), qdecode ctrl_a (+a_active).
+    // pair1: qubitmem ctrl_a Use (+a_active), ctrl_a Yield (-a_active).
     write_pair(
         &mut gen,
-        &enabler,
-        &|l| qdecode(l, sel_t),
+        &a_active,
+        &|l| qm_use(l, sel_a),
         1,
         &a_active,
-        &|l| qdecode(l, sel_a),
-        1,
+        &|l| qm_yield_ctrl(l, sel_a),
+        -1,
     );
-    // pair2: qdecode ctrl_b (+b_active), rc_lo target (+enabler).
+    // pair2: qubitmem ctrl_b Use (+b_active), ctrl_b Yield (-b_active).
     write_pair(
         &mut gen,
         &b_active,
-        &|l| qdecode(l, sel_b),
+        &|l| qm_use(l, sel_b),
         1,
+        &b_active,
+        &|l| qm_yield_ctrl(l, sel_b),
+        -1,
+    );
+    // pair3: rc target lo (+enabler), rc target hi (+enabler).
+    write_pair(
+        &mut gen,
         &enabler,
         &|l| rc_lo(l, sel_t),
         1,
-    );
-    // pair3: rc_hi target (+enabler), rc_lo ctrl_a (+a_active).
-    write_pair(
-        &mut gen,
         &enabler,
         &|l| rc_hi(l, sel_t),
         1,
+    );
+    // pair4: rc ctrl_a lo (+a_active), rc ctrl_a hi (+a_active).
+    write_pair(
+        &mut gen,
         &a_active,
         &|l| rc_lo(l, sel_a),
         1,
-    );
-    // pair4: rc_hi ctrl_a (+a_active), rc_lo ctrl_b (+b_active).
-    write_pair(
-        &mut gen,
         &a_active,
         &|l| rc_hi(l, sel_a),
         1,
-        &b_active,
-        &|l| rc_lo(l, sel_b),
-        1,
     );
-    // pair5: rc_hi ctrl_b (+b_active), program (+enabler).
+    // pair5: rc ctrl_b lo (+b_active), rc ctrl_b hi (+b_active).
     write_pair(
         &mut gen,
         &b_active,
+        &|l| rc_lo(l, sel_b),
+        1,
+        &b_active,
         &|l| rc_hi(l, sel_b),
         1,
-        &enabler,
-        &program,
-        1,
     );
+    // col6: program (+enabler). Odd tail => a singleton batch (matches finalize_logup_in_pairs).
+    write_single_par(&mut gen, rows, n_vec, enabler, program, 1);
 
     // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
     // prover backend happens later via `to_prover` at the `extend_evals` boundary.
@@ -1903,49 +2108,109 @@ fn gen_table_interaction(
 }
 
 // ----------------------------------------------------------------------------
-// Public boundary sums
+// Boundary supply interaction + public sums
 // ----------------------------------------------------------------------------
 
-fn public_boundary_sum(
-    cases: &[TestCase],
-    n_gates: usize,
-    k: usize,
-    state: &GateRel,
-) -> Result<SecureField> {
-    let mut sum = SecureField::zero();
-    let total_pc = (n_gates * k) as u32;
-    // Tagged state tuple: [TAG_STATE, shot_id, pc, limbs...].
-    let tagged = |t: &[BaseField; STATE_WIDTH]| -> Vec<BaseField> {
-        let mut v = Vec::with_capacity(GATE_REL_WIDTH);
-        v.push(BaseField::from_u32_unchecked(TAG_STATE));
-        v.extend_from_slice(t);
-        v
+/// Boundary component interaction trace (PHASE-3 re-keyed): per (shot, addr) row emit the internal
+/// final Use[+1](shot, addr, ts_last, y) and the PUBLIC final Yield[-1](shot, addr, TS_FINAL, y) on
+/// TAG_QUBITMEM. Two terms per row -> one batch (paired), matching `BoundaryTableEval`.
+///
+/// GPU TODO (validated on the box, NOT here): the boundary component is CPU-only — the opt-in CUDA
+/// kernel (`gate-air-cuda-kernel` / `evaluate_gate_air.cu`) applies ONLY to the gate_air MAIN
+/// component (fingerprint `is_gate_air_main`), and the K4 device interaction path computes ONLY the
+/// main interaction; `boundary_interaction` here is always built on the host in both the CPU and cuda
+/// paths. MAIN is UNCHANGED by this fix, so no GPU kernel edit is required for correctness. BUT this
+/// change alters the whole base-proof fingerprint (Phase-2 byte-identity must be re-established on the
+/// box), and if a future device-side boundary path is added it must mirror the (B)+(D) re-key +
+/// TS_FINAL exactly.
+fn gen_boundary_interaction(
+    bnd: &BoundaryTable,
+    el: &GateRel,
+) -> (
+    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
+    let mut gen = LogupTraceGenerator::new(bnd.log_size);
+    let mut col = gen.new_col();
+    let n_vec = 1usize << (bnd.log_size - LOG_N_LANES);
+    let pack_f = |vec_row: usize, f: &dyn Fn(&BoundaryRow) -> u32| -> PackedM31 {
+        PackedM31::from_array(std::array::from_fn(|lane| {
+            BaseField::from_u32_unchecked(f(&bnd.rows[(vec_row << LOG_N_LANES) + lane]))
+        }))
     };
-    for (shot_id, case) in cases.iter().enumerate() {
-        let x = hex::decode(&case.x_hex)?;
-        let y = hex::decode(&case.y_hex)?;
-        let x_limbs = state_to_limbs(&x);
-        let y_limbs = state_to_limbs(&y);
-        let initial = state_tuple(shot_id as u32, 0, &x_limbs);
-        let final_ = state_tuple(shot_id as u32, total_pc, &y_limbs);
-        let ci: SecureField = state.combine(&tagged(&initial));
-        let cf: SecureField = state.combine(&tagged(&final_));
-        sum += ci.inverse() - cf.inverse();
+    let ts_final = PackedM31::broadcast(BaseField::from_u32_unchecked(TS_FINAL));
+    let real = bnd.n_shots * N_QUBITS;
+    for vec_row in 0..n_vec {
+        let tag = ptag(TAG_QUBITMEM);
+        let shot = pack_f(vec_row, &|r| r.shot_id);
+        let addr = pack_f(vec_row, &|r| r.addr);
+        let y = pack_f(vec_row, &|r| r.y);
+        let ts_last = pack_f(vec_row, &|r| r.ts_last);
+        // Real-row enabler per lane (mirrors the gate_bnd_enabler preprocessed column).
+        let enabler = PackedM31::from_array(std::array::from_fn(|lane| {
+            BaseField::from_u32_unchecked(((vec_row << LOG_N_LANES) + lane < real) as u32)
+        }));
+        let enabler = PackedSecureField::from(enabler);
+        // Phase-3 re-keyed boundary (mirrors BoundaryTableEval), gated by the real-row enabler:
+        //   (B) internal final Use[+enabler] / (shot, addr, ts_last, y).
+        let d_use: PackedSecureField = el.combine(&[tag, shot, addr, ts_last, y]);
+        //   (D) public   final Yield[-enabler] / (shot, addr, TS_FINAL, y).
+        let d_pub: PackedSecureField = el.combine(&[tag, shot, addr, ts_final, y]);
+        // fraction = (+enabler)/d_use + (-enabler)/d_pub.
+        col.write_frac(vec_row, enabler * d_pub + (-enabler) * d_use, d_use * d_pub);
     }
-    Ok(sum)
+    col.finalize_col();
+    let (cols, sum) = gen.finalize_last();
+    (cols, sum)
 }
 
-fn state_tuple(shot_id: u32, pc: u32, limbs: &[u32; N_LIMBS]) -> [BaseField; STATE_WIDTH] {
-    std::array::from_fn(|i| {
-        let v = if i == 0 {
-            shot_id
-        } else if i == 1 {
-            pc
-        } else {
-            limbs[i - 2]
-        };
-        BaseField::from_u32_unchecked(v)
-    })
+/// Boundary component claimed sum (supply side): Σ_rows [ +1/combine(ts_last,y) − 1/combine(TS_FINAL,y) ]
+/// — the re-keyed final terms (B)+(D). Must equal `boundary_sum`; recomputed from the committed
+/// boundary table (y/ts_last witness) so a mistranscribed term is caught before FRI.
+fn boundary_public_sum(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
+    let mut sum = SecureField::zero();
+    let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
+    let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
+    // Only REAL rows emit (gated by gate_bnd_enabler); padding rows contribute nothing.
+    let real = bnd.n_shots * N_QUBITS;
+    for r in &bnd.rows[..real] {
+        let shot = BaseField::from_u32_unchecked(r.shot_id);
+        let addr = BaseField::from_u32_unchecked(r.addr);
+        let y = BaseField::from_u32_unchecked(r.y);
+        let ts_last = BaseField::from_u32_unchecked(r.ts_last);
+        // (B) internal final Use[+1] and (D) public final Yield[-1]: +1/d_use − 1/d_pub.
+        let d_use: SecureField = el.combine(&[tag, shot, addr, ts_last, y]);
+        let d_pub: SecureField = el.combine(&[tag, shot, addr, ts_final, y]);
+        sum += d_use.inverse() - d_pub.inverse();
+    }
+    sum
+}
+
+/// Phase-3 PUBLIC boundary term B = Σ_rows [ +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ].
+/// This is exactly the base's total dangling (unconsumed) LogUp sum: main leaves +[0,x] & −[ts_last,y]
+/// per touched (shot,addr), the boundary consumes [ts_last,y] and re-emits −[TS_FINAL,y], so the net is
+/// +[0,x] − [TS_FINAL,y]. The base's committed claimed sums must satisfy
+/// `main_sum + program_sum + boundary_sum == B` (was `== 0`), and the LEAF's `public_logup_sum` equals
+/// `−B` over its GUESSED x/y — so the verifier balance `public_logup_sum + Σ claimed_sums == 0` forces
+/// guessed == committed. For UNTOUCHED addrs (ts_last=0) the prover's `x == y`, so the ts=0 term here
+/// (using `x`) faithfully matches the actual dangling +[0,y]; the equality thus also checks x==y there.
+fn boundary_public_term(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
+    let mut sum = SecureField::zero();
+    let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
+    let zero = BaseField::zero();
+    let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
+    // Only REAL rows are dangling; padding rows emit no main NOR boundary term (gated by enablers).
+    let real = bnd.n_shots * N_QUBITS;
+    for r in &bnd.rows[..real] {
+        let shot = BaseField::from_u32_unchecked(r.shot_id);
+        let addr = BaseField::from_u32_unchecked(r.addr);
+        let x = BaseField::from_u32_unchecked(r.x);
+        let y = BaseField::from_u32_unchecked(r.y);
+        let d_init: SecureField = el.combine(&[tag, shot, addr, zero, x]);
+        let d_pub: SecureField = el.combine(&[tag, shot, addr, ts_final, y]);
+        sum += d_init.inverse() - d_pub.inverse();
+    }
+    sum
 }
 
 /// Supply (table-side) public sum for a single-relation table: sum_i count_i / denom_i.
@@ -2006,29 +2271,37 @@ fn gpu_flat_inputs(
 
 /// Build the (size-sorted) preprocessed tree-0 columns for one shard shape. Shared by the
 /// per-shard rebuild path AND the precompute build, so the committed column order/sizes are
-/// IDENTICAL by construction. tree-0 is SHARD-INVARIANT: every column is either constant
-/// (qdecode/rc) or POSITIONAL (enabler/shot_id/pc/pc_in_prog from row index, prog_slot/program
-/// witness from the shared program with constant multiplicity = shots_per_shard*k), so for a fixed
-/// (k, n_gates, shots_per_shard) shape these columns are the same for every shard.
+/// IDENTICAL by construction. tree-0 is SHARD-INVARIANT: every column is POSITIONAL
+/// (enabler/shot_id/pc/pc_in_prog from row index, prog_slot/program witness from the shared program
+/// with constant multiplicity = shots_per_shard*k, bnd_shot/bnd_addr from the boundary layout), so
+/// for a fixed (k, n_gates, shots_per_shard) shape these columns are the same for every shard. The
+/// rc-table membership columns (pos, val) are also shard-invariant (fixed [0,range) table).
 fn build_tree0_columns(
     program: &ProgramTable,
     rows: &[Row],
     padded_rows: usize,
     log_n_rows: u32,
     n_gates: usize,
-    rc_lo_index: &RcIndex,
-    rc_hi_index: &RcIndex,
+    boundary: &BoundaryTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let qsz = N_QUBITS.ilog2();
     let mut tagged: Vec<(u32, CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>)> =
-        generate_qdecode_preprocessed().into_iter().map(|c| (qsz, c)).collect();
+        Vec::new();
     tagged.push((program.log_size, generate_prog_slot_preprocessed(program)));
     tagged.push((log_n_rows, generate_enabler_preprocessed(rows, padded_rows)));
     tagged.push((log_n_rows, generate_shot_id_preprocessed(rows, padded_rows)));
     tagged.push((log_n_rows, generate_pc_preprocessed(rows, padded_rows)));
     tagged.push((log_n_rows, generate_pc_in_prog_preprocessed(rows, padded_rows, n_gates)));
-    tagged.extend(generate_rc_preprocessed(rc_lo_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
-    tagged.extend(generate_rc_preprocessed(rc_hi_index).into_iter().map(|c| (RC_LOG_SIZE, c)));
+    tagged.extend(
+        generate_boundary_preprocessed(boundary)
+            .into_iter()
+            .map(|c| (boundary.log_size, c)),
+    );
+    let rc = RcTable::new();
+    tagged.extend(
+        generate_rc_preprocessed(&rc)
+            .into_iter()
+            .map(|c| (RC_LOG_SIZE, c)),
+    );
     tagged.sort_by_key(|(s, _)| *s); // stable: identical key+listing order as preprocessed_columns_sorted
     tagged.into_iter().map(|(_, c)| c).collect()
 }
@@ -2050,6 +2323,9 @@ struct BaseProverPrecompute {
     tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
     /// Shared N1 program table (constant multiplicity across shards).
     program: ProgramTable,
+    /// Shard-invariant boundary table SHAPE (positional (shot, addr); witness x/y/ts_last are
+    /// per-shard, but the preprocessed columns depend only on the shape, which is shard-invariant).
+    boundary: BoundaryTable,
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
     padded_rows: usize,
     log_n_rows: u32,
@@ -2076,11 +2352,10 @@ impl BaseProverPrecompute {
         max_log_size: u32,
         program0: ProgramTable,
         rows0: &[Row],
+        boundary0: BoundaryTable,
         padded_rows: usize,
         log_n_rows: u32,
         n_gates: usize,
-        rc_lo_index: &RcIndex,
-        rc_hi_index: &RcIndex,
         #[cfg(feature = "cuda")] gates_flat: &[u32],
         #[cfg(feature = "cuda")] off_lo: &[u32],
         #[cfg(feature = "cuda")] off_hi: &[u32],
@@ -2103,7 +2378,7 @@ impl BaseProverPrecompute {
         // does (it uses the same scheme config, which has lifting_log_size from leaf_pcs_config). The
         // store flag is FALSE to match the base proof's barycentric-OODS path (no stored coeffs).
         let cols = build_tree0_columns(
-            &program0, rows0, padded_rows, log_n_rows, n_gates, rc_lo_index, rc_hi_index,
+            &program0, rows0, padded_rows, log_n_rows, n_gates, &boundary0,
         );
         let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
         let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -2135,6 +2410,7 @@ impl BaseProverPrecompute {
             twiddles,
             tree0,
             program: program0,
+            boundary: boundary0,
             padded_rows,
             log_n_rows,
             #[cfg(feature = "cuda")]
@@ -2159,8 +2435,6 @@ fn assert_tree0_matches_rebuild(
     pc: &BaseProverPrecompute,
     rows0: &[Row],
     n_gates: usize,
-    rc_lo_index: &RcIndex,
-    rc_hi_index: &RcIndex,
 ) {
     // Rebuild via the exact old path (fresh scheme/channel; columns from the same builder).
     let twiddles = ProverBackend::precompute_twiddles(
@@ -2173,7 +2447,7 @@ fn assert_tree0_matches_rebuild(
     let mut scheme =
         CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(pc.config, &twiddles);
     let cols = build_tree0_columns(
-        &pc.program, rows0, pc.padded_rows, pc.log_n_rows, n_gates, rc_lo_index, rc_hi_index,
+        &pc.program, rows0, pc.padded_rows, pc.log_n_rows, n_gates, &pc.boundary,
     );
     let n_cols = cols.len();
     let mut tb = scheme.tree_builder();
@@ -2254,8 +2528,10 @@ fn main() -> Result<()> {
         bail!("samples and repetitions must be non-zero");
     }
 
+    // `rc_lo_index` now feeds ONLY the CUDA trace-gen glue (device offset buffers); unused on the
+    // CPU-only default build after the per-address +1 counter fix removed the range-check lookup.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let rc_lo_index = build_rc_lo();
-    let rc_hi_index = build_rc_hi();
     let program = build_program_table(&gates, samples, k);
 
     let cases = &fixture.test_cases[..samples];
@@ -2266,10 +2542,10 @@ fn main() -> Result<()> {
     #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
     if let Ok(which) = std::env::var("GATE_AIR_GPU_TEST") {
         if which == "k4" {
-            gpu_tracegen::k4_byte_identity(&gates, cases, k, &rc_lo_index, &rc_hi_index)
+            gpu_tracegen::k4_byte_identity(&gates, cases, k, &rc_lo_index, &rc_lo_index)
                 .map_err(|e| anyhow::anyhow!(e))?;
         } else {
-            gpu_tracegen::k1_byte_identity(&gates, cases, k, &rc_lo_index, &rc_hi_index)
+            gpu_tracegen::k1_byte_identity(&gates, cases, k, &rc_lo_index, &rc_lo_index)
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
         return Ok(());
@@ -2297,11 +2573,11 @@ fn main() -> Result<()> {
     // In FOLD mode this top-level buffer is DEAD (each shard rebuilds its own), so skip it — at
     // large N it is the single O(N)-scaling host allocation (`Row` is 776 bytes) and OOMs the box.
     let fold_active = std::env::var("GATE_AIR_FOLD").is_ok();
-    let (rows, counts) = if fold_active {
-        (Vec::<Row>::new(), LookupCounts::new())
+    let (rows, boundary) = if fold_active {
+        (Vec::<Row>::new(), BoundaryTable::new(0))
     } else {
         let build_start = Instant::now();
-        let (rows, counts) = build_rows(&gates, cases, k, &rc_lo_index, &rc_hi_index)?;
+        let (rows, boundary) = build_rows(&gates, cases, k)?;
         let build_elapsed = build_start.elapsed();
 
         eprintln!(
@@ -2319,7 +2595,7 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
-        (rows, counts)
+        (rows, boundary)
     };
 
     // ---- Multiverifier-tree integration (Milestone 3), gated by GATE_AIR_FOLD ----
@@ -2429,7 +2705,7 @@ fn main() -> Result<()> {
                                 shard_cases: &[TestCase]|
          -> Result<_> {
             let shard_samples = shard_cases.len();
-            let (rows, counts) = build_rows(&gates, shard_cases, k, &rc_lo_index, &rc_hi_index)?;
+            let (rows, boundary) = build_rows(&gates, shard_cases, k)?;
             let real_rows = rows.len();
             let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
             let log_n_rows = padded_rows.ilog2();
@@ -2487,7 +2763,7 @@ fn main() -> Result<()> {
                     // Old path: build the (size-sorted) preprocessed columns, then interpolate + LDE +
                     // Merkle-commit them inline (the shard-invariant work this precompute eliminates).
                     let pp = build_tree0_columns(
-                        program, &rows, padded_rows, log_n_rows, n_gates, &rc_lo_index, &rc_hi_index,
+                        program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
                     );
                     let mut tree_builder = commitment_scheme.tree_builder();
                     tree_builder.extend_evals(to_prover(pp));
@@ -2501,12 +2777,14 @@ fn main() -> Result<()> {
             #[cfg(feature = "cuda")]
             let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
 
-            // Tree 1: main trace + table multiplicities + program witness.
+            // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
+            let rc_table = build_rc_table(&rows);
+
+            // Tree 1: main trace + program witness + boundary witness + rc multiplicity.
             let small_main = {
-                let mut v = generate_multiplicity_trace(&counts.qdecode);
-                v.extend(generate_multiplicity_trace(&counts.rc_lo));
-                v.extend(generate_multiplicity_trace(&counts.rc_hi));
-                v.extend(generate_program_witness(&program));
+                let mut v = generate_program_witness(&program);
+                v.extend(generate_boundary_witness(&boundary));
+                v.extend(generate_rc_witness(&rc_table));
                 v
             };
             let mut tree_builder = commitment_scheme.tree_builder();
@@ -2532,7 +2810,7 @@ fn main() -> Result<()> {
                     ),
                     None => {
                         let (gates_flat, _x, off_lo, off_hi) =
-                            gpu_flat_inputs(&gates, shard_cases, &rc_lo_index, &rc_hi_index)?;
+                            gpu_flat_inputs(&gates, shard_cases, &rc_lo_index, &rc_lo_index)?;
                         gpu_tracegen::gpu_gen_main_trace_device(
                             &gates_flat, &x_states, &off_lo, &off_hi,
                             k as u32, n_gates as u32, shard_samples as u32, padded_rows, log_n_rows,
@@ -2591,7 +2869,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "cuda")]
             {
                 gate_air_cuda_kernel::register();
-                let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.state);
+                let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
                 gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
             }
 
@@ -2630,39 +2908,6 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "cuda"))]
             let (main_interaction, main_sum) =
                 gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-            let (qdecode_interaction, qdecode_sum) = {
-                let el = elements.qdecode.clone();
-                let q: Vec<u32> = (0..N_QUBITS as u32).collect();
-                gen_table_interaction(&counts.qdecode, N_QUBITS.ilog2(), |vec_row| {
-                    el.combine(&[
-                        ptag(TAG_QDECODE),
-                        pack_seq(&q, vec_row),
-                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).0),
-                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).1),
-                        pack_decode(vec_row, |qi| qubit_decode(qi as u16).2),
-                    ])
-                })
-            };
-            let (rc_lo_interaction, rc_lo_sum) = {
-                let el = elements.rc_lo.clone();
-                gen_table_interaction(&counts.rc_lo, RC_LOG_SIZE, |vec_row| {
-                    el.combine(&[
-                        ptag(TAG_RC_LO),
-                        pack_seq(&rc_lo_index.pos_col, vec_row),
-                        pack_seq(&rc_lo_index.val_col, vec_row),
-                    ])
-                })
-            };
-            let (rc_hi_interaction, rc_hi_sum) = {
-                let el = elements.rc_hi.clone();
-                gen_table_interaction(&counts.rc_hi, RC_LOG_SIZE, |vec_row| {
-                    el.combine(&[
-                        ptag(TAG_RC_HI),
-                        pack_seq(&rc_hi_index.pos_col, vec_row),
-                        pack_seq(&rc_hi_index.val_col, vec_row),
-                    ])
-                })
-            };
             let (program_interaction, program_sum) = {
                 let el = elements.program.clone();
                 gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
@@ -2676,22 +2921,39 @@ fn main() -> Result<()> {
                     ])
                 })
             };
+            let (boundary_interaction, boundary_sum) =
+                gen_boundary_interaction(&boundary, &elements.qubitmem);
+            // rc supply: -multiplicity / combine(TAG_RC, pos, val).
+            let (rc_interaction, rc_sum) = {
+                let el = elements.rc.clone();
+                gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
+                    el.combine(&[
+                        ptag(TAG_RC),
+                        pack_seq(&rc_table.pos, vec_row),
+                        pack_seq(&rc_table.val, vec_row),
+                    ])
+                })
+            };
 
-            // Cross-check claimed sums against this shard's public boundary + table sums.
-            let boundary_sum = public_boundary_sum(shard_cases, n_gates, k, &elements.state)?;
-            if main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum != boundary_sum {
-                bail!("shard main claimed sum != public boundary sum");
+            // Phase-3 x/y binding: the base is NO LONGER internally balanced. The boundary re-keys y
+            // to TS_FINAL, leaving a PUBLIC dangling term B = Σ(+[0,x] − [TS_FINAL,y]); the base's
+            // claimed sums must net to B (not 0). The leaf's public_logup_sum supplies −B over its
+            // guessed x/y, so the verifier balance forces guessed == committed. The rc demand (main)
+            // and rc supply (rc_sum) cancel, so they contribute 0 to the net. (stwo's native verify
+            // does NOT require Σ claimed_sums == 0; this is a prover self-check.)
+            let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+            if main_sum + program_sum + boundary_sum + rc_sum != b_public {
+                bail!("shard claimed sums do not net to the public boundary term B");
             }
 
-            let claimed_sums = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+            let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
             prover_channel.mix_felts(&claimed_sums);
 
-            // Tree 2: interaction (same component order as the claimed sums).
+            // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
             let small_interaction = {
-                let mut v = qdecode_interaction;
-                v.extend(rc_lo_interaction);
-                v.extend(rc_hi_interaction);
-                v.extend(program_interaction);
+                let mut v = program_interaction;
+                v.extend(boundary_interaction);
+                v.extend(rc_interaction);
                 v
             };
             let mut tree_builder = commitment_scheme.tree_builder();
@@ -2716,12 +2978,12 @@ fn main() -> Result<()> {
             let components = build_components(
                 log_n_rows,
                 program.log_size,
+                boundary.log_size,
                 &elements,
                 main_sum,
-                qdecode_sum,
-                rc_lo_sum,
-                rc_hi_sum,
                 program_sum,
+                boundary_sum,
+                rc_sum,
             );
             let prover_refs = components.prover_refs();
             let extended = prove_ex::<ProverBackend, Blake2sM31MerkleChannel>(
@@ -2738,8 +3000,7 @@ fn main() -> Result<()> {
                 let y = state_to_limbs(&hex::decode(&case.y_hex)?);
                 shard_boundary.push((x, y));
             }
-            let claim: Vec<SecureField> =
-                vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+            let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
             Ok((
                 extended,
                 claim,
@@ -2769,8 +3030,8 @@ fn main() -> Result<()> {
             let t_pc = Instant::now();
             // Shard 0's shape (every shard shares it: equal shot count, same program + k).
             let program0 = build_program_table(&gates, shots_per_shard, k);
-            let (rows0, _counts0) =
-                build_rows(&gates, &shard_case_sets[0], k, &rc_lo_index, &rc_hi_index)?;
+            let (rows0, boundary0) =
+                build_rows(&gates, &shard_case_sets[0], k)?;
             let real_rows0 = rows0.len();
             let padded_rows0 = real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
             let log_n_rows0 = padded_rows0.ilog2();
@@ -2782,17 +3043,16 @@ fn main() -> Result<()> {
             let config0 = leaf::leaf_pcs_config(max_log_size0, base_blowup);
             #[cfg(feature = "cuda")]
             let (gates_flat0, _x0, off_lo0, off_hi0) =
-                gpu_flat_inputs(&gates, &shard_case_sets[0], &rc_lo_index, &rc_hi_index)?;
+                gpu_flat_inputs(&gates, &shard_case_sets[0], &rc_lo_index, &rc_lo_index)?;
             let pc = BaseProverPrecompute::new(
                 config0,
                 max_log_size0,
                 program0,
                 &rows0,
+                boundary0,
                 padded_rows0,
                 log_n_rows0,
                 n_gates,
-                &rc_lo_index,
-                &rc_hi_index,
                 #[cfg(feature = "cuda")]
                 &gates_flat0,
                 #[cfg(feature = "cuda")]
@@ -2801,7 +3061,7 @@ fn main() -> Result<()> {
                 &off_hi0,
             )?;
             // Load-bearing soundness gate: cached tree0 root == independent shard-0 rebuild.
-            assert_tree0_matches_rebuild(&pc, &rows0, n_gates, &rc_lo_index, &rc_hi_index);
+            assert_tree0_matches_rebuild(&pc, &rows0, n_gates);
             eprintln!(
                 "gate-air: base precompute built (tree0+twiddles+N1{}) in {:.3}s",
                 if cfg!(feature = "cuda") { "+N3" } else { "" },
@@ -2911,9 +3171,12 @@ fn main() -> Result<()> {
             INTERACTION_POW_BITS,
         );
         let pp_root0: ReducedHashValue<SecureField> = base0_extended.proof.commitments[0].into();
+        // Boundary table log-size is shard-invariant (n_shots_per_shard * 512 rows, padded).
+        let boundary_log_size = BoundaryTable::new(shots_per_shard).log_size;
         let shape_params = GateAirLeafParams {
             main_log_size: base0_log_n_rows,
             program_log_size: base0_prog_log_size,
+            boundary_log_size,
             preprocessed_root: pp_root0,
             boundary: base0_boundary.clone(),
             total_pc: base0_total_pc,
@@ -2969,6 +3232,7 @@ fn main() -> Result<()> {
             let params_i = GateAirLeafParams {
                 main_log_size: *log_n_rows_i,
                 program_log_size: *prog_log_i,
+                boundary_log_size,
                 preprocessed_root: pp_root_i,
                 boundary: boundary_i.clone(),
                 total_pc: *total_pc_i,
@@ -3170,7 +3434,7 @@ fn main() -> Result<()> {
     let t_phase = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     let pp = build_tree0_columns(
-        &program, &rows, padded_rows, log_n_rows, n_gates, &rc_lo_index, &rc_hi_index,
+        &program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
     );
     tree_builder.extend_evals(to_prover(pp));
     tree_builder.commit(prover_channel);
@@ -3187,13 +3451,16 @@ fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
 
-    // Tree 1: main trace + table multiplicities + program witness (op cols+mult).
+    // ts-ordering range-check supply table (multiplicity counted from the active accesses' limb
+    // lookups). Shard-invariant membership (pos/val) lives in tree0; only the multiplicity is witness.
+    let rc_table = build_rc_table(&rows);
+
+    // Tree 1: main trace + program witness (op cols+mult) + boundary witness + rc multiplicity.
     let t_phase = Instant::now();
     let small_main = {
-        let mut v = generate_multiplicity_trace(&counts.qdecode);
-        v.extend(generate_multiplicity_trace(&counts.rc_lo));
-        v.extend(generate_multiplicity_trace(&counts.rc_hi));
-        v.extend(generate_program_witness(&program));
+        let mut v = generate_program_witness(&program);
+        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_rc_witness(&rc_table));
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -3205,7 +3472,7 @@ fn main() -> Result<()> {
     if gpu_tracegen {
         // Device K1: 191 main columns generated on the GPU, fed in as device-resident BaseFieldVecs.
         let (gates_flat, x_states, off_lo, off_hi) =
-            gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_hi_index)?;
+            gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_lo_index)?;
         let (main_dev, _qd, _lo, _hi, d_cols) = gpu_tracegen::gpu_gen_main_trace_device(
             &gates_flat, &x_states, &off_lo, &off_hi,
             k as u32, n_gates as u32, samples as u32, padded_rows, log_n_rows,
@@ -3301,7 +3568,7 @@ fn main() -> Result<()> {
         // Install the downstream gate_air GPU constraint kernel into the generic CudaBackend prover,
         // then thread the drawn (z, alpha) challenges to it.
         gate_air_cuda_kernel::register();
-        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.state);
+        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
         gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
     }
 
@@ -3358,39 +3625,6 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-    let (qdecode_interaction, qdecode_sum) = {
-        let el = elements.qdecode.clone();
-        let q: Vec<u32> = (0..N_QUBITS as u32).collect();
-        gen_table_interaction(&counts.qdecode, N_QUBITS.ilog2(), |vec_row| {
-            el.combine(&[
-                ptag(TAG_QDECODE),
-                pack_seq(&q, vec_row),
-                pack_decode(vec_row, |qi| qubit_decode(qi as u16).0),
-                pack_decode(vec_row, |qi| qubit_decode(qi as u16).1),
-                pack_decode(vec_row, |qi| qubit_decode(qi as u16).2),
-            ])
-        })
-    };
-    let (rc_lo_interaction, rc_lo_sum) = {
-        let el = elements.rc_lo.clone();
-        gen_table_interaction(&counts.rc_lo, RC_LOG_SIZE, |vec_row| {
-            el.combine(&[
-                ptag(TAG_RC_LO),
-                pack_seq(&rc_lo_index.pos_col, vec_row),
-                pack_seq(&rc_lo_index.val_col, vec_row),
-            ])
-        })
-    };
-    let (rc_hi_interaction, rc_hi_sum) = {
-        let el = elements.rc_hi.clone();
-        gen_table_interaction(&counts.rc_hi, RC_LOG_SIZE, |vec_row| {
-            el.combine(&[
-                ptag(TAG_RC_HI),
-                pack_seq(&rc_hi_index.pos_col, vec_row),
-                pack_seq(&rc_hi_index.val_col, vec_row),
-            ])
-        })
-    };
     let (program_interaction, program_sum) = {
         let el = elements.program.clone();
         gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
@@ -3401,6 +3635,19 @@ fn main() -> Result<()> {
                 pack_seq(&program.target, vec_row),
                 pack_seq(&program.ctrl_a, vec_row),
                 pack_seq(&program.ctrl_b, vec_row),
+            ])
+        })
+    };
+    let (boundary_interaction, boundary_sum) =
+        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    // rc supply: -multiplicity / combine(TAG_RC, pos, val).
+    let (rc_interaction, rc_sum) = {
+        let el = elements.rc.clone();
+        gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
+            el.combine(&[
+                ptag(TAG_RC),
+                pack_seq(&rc_table.pos, vec_row),
+                pack_seq(&rc_table.val, vec_row),
             ])
         })
     };
@@ -3420,51 +3667,6 @@ fn main() -> Result<()> {
         );
         eprintln!("gate-air: GATE_AIR_ASSERT main OK");
 
-        // qdecode table.
-        let qd_pp = generate_qdecode_preprocessed();
-        let qd_mult = generate_multiplicity_trace(&counts.qdecode);
-        assert_table_constraints(
-            N_QUBITS.ilog2(),
-            &qd_pp,
-            &qd_mult,
-            &qdecode_interaction,
-            qdecode_sum,
-            QDecodeTableEval {
-                elements: elements.qdecode.clone(),
-            },
-        );
-        eprintln!("gate-air: GATE_AIR_ASSERT qdecode OK");
-
-        // rc_lo table.
-        let lo_pp = generate_rc_preprocessed(&rc_lo_index);
-        let lo_mult = generate_multiplicity_trace(&counts.rc_lo);
-        assert_table_constraints(
-            RC_LOG_SIZE,
-            &lo_pp,
-            &lo_mult,
-            &rc_lo_interaction,
-            rc_lo_sum,
-            RcLoTableEval {
-                elements: elements.rc_lo.clone(),
-            },
-        );
-        eprintln!("gate-air: GATE_AIR_ASSERT rc_lo OK");
-
-        // rc_hi table.
-        let hi_pp = generate_rc_preprocessed(&rc_hi_index);
-        let hi_mult = generate_multiplicity_trace(&counts.rc_hi);
-        assert_table_constraints(
-            RC_LOG_SIZE,
-            &hi_pp,
-            &hi_mult,
-            &rc_hi_interaction,
-            rc_hi_sum,
-            RcHiTableEval {
-                elements: elements.rc_hi.clone(),
-            },
-        );
-        eprintln!("gate-air: GATE_AIR_ASSERT rc_hi OK");
-
         // program-consistency table.
         let prog_pp = vec![generate_prog_slot_preprocessed(&program)];
         let prog_wit = generate_program_witness(&program);
@@ -3479,83 +3681,74 @@ fn main() -> Result<()> {
                 elements: elements.program.clone(),
             },
         );
-        eprintln!("gate-air: GATE_AIR_ASSERT program OK (all components satisfied on trace)");
+        eprintln!("gate-air: GATE_AIR_ASSERT program OK");
 
-        // Validate the prover cross-check (boundary identity incl. program) here
-        // too, so the assert path exercises soundness wiring without FRI. Allow
-        // skipping the heavy FRI prove (laptop rule) via GATE_AIR_ASSERT_ONLY.
+        // qubit-memory boundary table.
+        let bnd_pp = generate_boundary_preprocessed(&boundary);
+        let bnd_wit = generate_boundary_witness(&boundary);
+        assert_table_constraints(
+            boundary.log_size,
+            &bnd_pp,
+            &bnd_wit,
+            &boundary_interaction,
+            boundary_sum,
+            BoundaryTableEval {
+                log_size: boundary.log_size,
+                elements: elements.qubitmem.clone(),
+            },
+        );
+        eprintln!("gate-air: GATE_AIR_ASSERT boundary OK");
+
+        // ts-ordering range-check supply table.
+        let rc_pp = generate_rc_preprocessed(&rc_table);
+        let rc_wit = generate_rc_witness(&rc_table);
+        assert_table_constraints(
+            rc_table.log_size,
+            &rc_pp,
+            &rc_wit,
+            &rc_interaction,
+            rc_sum,
+            RcTableEval {
+                elements: elements.rc.clone(),
+            },
+        );
+        eprintln!("gate-air: GATE_AIR_ASSERT rc OK (all components satisfied on trace)");
+
+        // Validate the prover cross-check here too, so the assert path exercises the full LogUp
+        // balance (incl. the rc demand/supply cancellation) without FRI. Skip the heavy FRI prove via
+        // GATE_AIR_ASSERT_ONLY.
         if std::env::var("GATE_AIR_ASSERT_ONLY").is_ok() {
-            let boundary = public_boundary_sum(cases, n_gates, k, &elements.state)?;
-            if main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum != boundary {
-                bail!("ASSERT_ONLY: main+tables+program != boundary");
+            let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+            if main_sum + program_sum + boundary_sum + rc_sum != b_public {
+                bail!("ASSERT_ONLY: claimed sums do not net to the public boundary term B");
             }
             eprintln!("gate-air: GATE_AIR_ASSERT_ONLY cross-check OK (skipping FRI prove)");
             return Ok(());
         }
     }
 
-    // Cross-check claimed sums against the public boundary + table sums.
+    // Cross-check the committed claimed sums. PHASE-3: the base is NO LONGER internally balanced — the
+    // boundary re-keys y to TS_FINAL, leaving a PUBLIC dangling term
+    //     B = Σ_{shot,addr} ( +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ),
+    // so the global identity is now
+    //     main_sum + program_sum + boundary_sum == B.
+    // The leaf's `public_logup_sum` equals −B over the guessed x/y, so the in-circuit verifier balance
+    // `public_logup_sum + Σ claimed_sums == 0` forces guessed == committed (the recursion x/y binding).
+    // We ALSO cross-check the supply sums independently (program, boundary) against a direct
+    // recomputation, so a mistranscribed supply term is caught before FRI.
     //
-    // LogUp sign accounting (matches the iadd reference in ../src/main.rs):
-    //   * The main component emits, per row:
-    //       state:   +enabler / state_in   -enabler / state_out   (telescopes
-    //                to the public boundary = sum_shot (1/ci - 1/cf)).
-    //       lookups: +active / row         (the "use" side, positive mult).
-    //   * Each table component emits the "supply" side: -mult / row.
-    //   `gen_table_interaction` therefore returns the *supply* sum
-    //   (-sum count/denom), and `table_public_sum` recomputes that same
-    //   negated supply sum -- so the per-table checks below compare like with
-    //   like and are already correct.
-    //   `gen_main_interaction` returns the boundary PLUS the positive use
-    //   sides, i.e. main_sum = boundary - (qdecode_sum + rc_lo_sum + rc_hi_sum
-    //   + program_sum), because each use side equals -(its supply sum).
-    //   Rearranged, the global identity is:
-    //     main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum == boundary.
-    //   The program use side balances the program table's -multiplicity supply
-    //   iff every execution row's (opcode,target,ctrl_a,ctrl_b) equals
-    //   program[pc_in_prog]: the single hidden program, run in cyclic order.
-    //
-    // SOUNDNESS INVARIANT (per-input guarantee): the "P run K times on EACH of
-    // N inputs" statement comes from public_boundary_sum being PER-SHOT -- it
-    // sums N distinct source/sink pairs (shot_i, 0, x_i) and
-    // (shot_i, K*n_gates, y_i). If this boundary is ever collapsed to a single
-    // (x, y) pair, the statement silently degrades to "P run K*N times" with no
-    // per-input binding -- keep it per-shot. Program-consistency (forcing one
-    // shared program) does NOT replace this: it constrains WHICH program runs,
-    // not that each of the N inputs is independently mapped x_i -> y_i.
-    let boundary = public_boundary_sum(cases, n_gates, k, &elements.state)?;
-    if main_sum + qdecode_sum + rc_lo_sum + rc_hi_sum + program_sum != boundary {
-        bail!("main claimed sum != public boundary sum");
-    }
-    let qdecode_expected = table_public_sum(&counts.qdecode, &elements.qdecode, TAG_QDECODE, |qi| {
-        let (l, p, m) = qubit_decode(qi as u16);
-        vec![
-            BaseField::from_u32_unchecked(qi as u32),
-            BaseField::from_u32_unchecked(l),
-            BaseField::from_u32_unchecked(p),
-            BaseField::from_u32_unchecked(m),
-        ]
-    });
-    if qdecode_sum != qdecode_expected {
-        bail!("qdecode claimed sum mismatch");
-    }
-    let rc_lo_expected = table_public_sum(&counts.rc_lo, &elements.rc_lo, TAG_RC_LO, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_lo_index.pos_col[i]),
-            BaseField::from_u32_unchecked(rc_lo_index.val_col[i]),
-        ]
-    });
-    if rc_lo_sum != rc_lo_expected {
-        bail!("rc_lo claimed sum mismatch");
-    }
-    let rc_hi_expected = table_public_sum(&counts.rc_hi, &elements.rc_hi, TAG_RC_HI, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_hi_index.pos_col[i]),
-            BaseField::from_u32_unchecked(rc_hi_index.val_col[i]),
-        ]
-    });
-    if rc_hi_sum != rc_hi_expected {
-        bail!("rc_hi claimed sum mismatch");
+    // SOUNDNESS: per-input binding (x_i -> y_i) — x is now bound via main's dangling init term at ts=0
+    // and y via the boundary's public TS_FINAL yield; the leaf pins BOTH to its guessed values through
+    // B. The preprocessed `shot_id` in every QubitMem tuple forbids cross-shot chain mixing. Chain
+    // acyclicity is the degree-1 equality `flag*(ts - prev_ts - 1) = 0` on the per-address +1 counter
+    // (a detached cycle would need Sum(1) == 0 mod p, i.e. loop length p ~ 2^31; load-bearing).
+    // Program-consistency forces the ONE shared hidden program.
+    // The rc range-check demand (in main) and supply (rc_sum) cancel exactly (each real limb lookup
+    // is matched by one table-supply unit), so they contribute 0 to the net; the global identity
+    // stays main + program + boundary + rc == B.
+    let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+    if main_sum + program_sum + boundary_sum + rc_sum != b_public {
+        bail!("claimed sums do not net to the public boundary term B");
     }
     let program_expected = table_public_sum(&program.multiplicity, &elements.program, TAG_PROGRAM, |i| {
         vec![
@@ -3569,21 +3762,31 @@ fn main() -> Result<()> {
     if program_sum != program_expected {
         bail!("program claimed sum mismatch");
     }
+    let boundary_expected = boundary_public_sum(&boundary, &elements.qubitmem);
+    if boundary_sum != boundary_expected {
+        bail!("boundary claimed sum mismatch");
+    }
+    let rc_expected = table_public_sum(&rc_table.multiplicity, &elements.rc, TAG_RC, |i| {
+        vec![
+            BaseField::from_u32_unchecked(rc_table.pos[i]),
+            BaseField::from_u32_unchecked(rc_table.val[i]),
+        ]
+    });
+    if rc_sum != rc_expected {
+        bail!("rc claimed sum mismatch");
+    }
 
     // Order MUST match the verifier's reconstruction below and build_components.
-    let claimed_sums = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
 
     eprintln!("gate-air: [phase] interaction witness gen+sumcheck {:.3}s", t_phase.elapsed().as_secs_f64());
-    // Tree 2: interaction (same component order as the claimed sums). The 24 main-interaction columns
-    // come first, then the four small table interactions (always CPU-built + uploaded). Under the GPU
-    // path the main columns are already device-resident; the CPU columns are converted via `to_prover`.
+    // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
     let t_phase = Instant::now();
     let small_interaction = {
-        let mut v = qdecode_interaction;
-        v.extend(rc_lo_interaction);
-        v.extend(rc_hi_interaction);
-        v.extend(program_interaction);
+        let mut v = program_interaction;
+        v.extend(boundary_interaction);
+        v.extend(rc_interaction);
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -3609,12 +3812,12 @@ fn main() -> Result<()> {
     let components = build_components(
         log_n_rows,
         program.log_size,
+        boundary.log_size,
         &elements,
         main_sum,
-        qdecode_sum,
-        rc_lo_sum,
-        rc_hi_sum,
         program_sum,
+        boundary_sum,
+        rc_sum,
     );
     let sizes = components.trace_log_sizes();
     let prover_refs = components.prover_refs();
@@ -3672,14 +3875,15 @@ fn main() -> Result<()> {
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
         let pp_root: ReducedHashValue<SecureField> = extended.proof.commitments[0].into();
-        let mut boundary = Vec::with_capacity(cases.len());
+        let mut boundary_xy = Vec::with_capacity(cases.len());
         for case in cases {
             let x = state_to_limbs(&hex::decode(&case.x_hex)?);
             let y = state_to_limbs(&hex::decode(&case.y_hex)?);
-            boundary.push((x, y));
+            boundary_xy.push((x, y));
         }
         let total_pc = (n_gates * k) as u32;
-        let claim: Vec<SecureField> = vec![main_sum, qdecode_sum, rc_lo_sum, rc_hi_sum, program_sum];
+        let boundary_log_size = boundary.log_size;
+        let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
 
         // NoValue circuit shape (the reference the real assignment is checked against).
         let novalue_circuit = {
@@ -3690,8 +3894,9 @@ fn main() -> Result<()> {
                 &mut nv,
                 log_n_rows,
                 program.log_size,
+                boundary_log_size,
                 pp_root.clone(),
-                boundary.clone(),
+                boundary_xy.clone(),
                 total_pc,
             );
             circuit_verify(&mut nv, &pv, &cfg, &stmt);
@@ -3706,8 +3911,9 @@ fn main() -> Result<()> {
             &mut ctx,
             log_n_rows,
             program.log_size,
+            boundary_log_size,
             pp_root,
-            boundary,
+            boundary_xy,
             total_pc,
         );
         circuit_verify(&mut ctx, &pv, &cfg, &stmt);
@@ -3731,28 +3937,11 @@ fn main() -> Result<()> {
     commitment_scheme_v.commit(proof.commitments[1], &sizes[1], verifier_channel);
     verifier_channel.mix_u64(interaction_pow_nonce);
     let v_elements = LookupElements::draw(verifier_channel);
-    let v_boundary = public_boundary_sum(cases, n_gates, k, &v_elements.state)?;
-    let v_qdecode = table_public_sum(&counts.qdecode, &v_elements.qdecode, TAG_QDECODE, |qi| {
-        let (l, p, m) = qubit_decode(qi as u16);
-        vec![
-            BaseField::from_u32_unchecked(qi as u32),
-            BaseField::from_u32_unchecked(l),
-            BaseField::from_u32_unchecked(p),
-            BaseField::from_u32_unchecked(m),
-        ]
-    });
-    let v_rc_lo = table_public_sum(&counts.rc_lo, &v_elements.rc_lo, TAG_RC_LO, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_lo_index.pos_col[i]),
-            BaseField::from_u32_unchecked(rc_lo_index.val_col[i]),
-        ]
-    });
-    let v_rc_hi = table_public_sum(&counts.rc_hi, &v_elements.rc_hi, TAG_RC_HI, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_hi_index.pos_col[i]),
-            BaseField::from_u32_unchecked(rc_hi_index.val_col[i]),
-        ]
-    });
+    // Supply sums the verifier recomputes (same-process native verify: it has the committed
+    // multiplicities + boundary witness + rc table). PHASE-3: the base is no longer internally balanced
+    // — the global identity is main + program + boundary + rc == B (the public dangling boundary term),
+    // so the main component's claimed sum is v_main = B − v_program − v_boundary − v_rc (the rc demand
+    // in main cancels the rc supply).
     let v_program = table_public_sum(&program.multiplicity, &v_elements.program, TAG_PROGRAM, |i| {
         vec![
             BaseField::from_u32_unchecked(program.slot[i]),
@@ -3762,25 +3951,27 @@ fn main() -> Result<()> {
             BaseField::from_u32_unchecked(program.ctrl_b[i]),
         ]
     });
-    // The main component's claimed sum is NOT the public boundary: the main
-    // component emits the boundary telescoping PLUS the positive "use" sides of
-    // every lookup, so main_sum = boundary - (qdecode + rc_lo + rc_hi +
-    // program). This must equal the prover's `main_sum`, both for the channel
-    // mix (Fiat-Shamir) and for the component's claimed sum used in the
-    // OODS/DEEP-ALI check. Subtraction order is irrelevant (commutative) but the
-    // mix_felts ORDER below must match the prover's exactly.
-    let v_main = v_boundary - v_qdecode - v_rc_lo - v_rc_hi - v_program;
-    let v_claimed = vec![v_main, v_qdecode, v_rc_lo, v_rc_hi, v_program];
+    let v_boundary = boundary_public_sum(&boundary, &v_elements.qubitmem);
+    let v_rc = table_public_sum(&rc_table.multiplicity, &v_elements.rc, TAG_RC, |i| {
+        vec![
+            BaseField::from_u32_unchecked(rc_table.pos[i]),
+            BaseField::from_u32_unchecked(rc_table.val[i]),
+        ]
+    });
+    let v_b_public = boundary_public_term(&boundary, &v_elements.qubitmem);
+    // main_sum = B − program − boundary − rc. mix_felts ORDER must match the prover's exactly.
+    let v_main = v_b_public - v_program - v_boundary - v_rc;
+    let v_claimed = vec![v_main, v_program, v_boundary, v_rc];
     verifier_channel.mix_felts(&v_claimed);
     let v_components = build_components(
         log_n_rows,
         program.log_size,
+        boundary.log_size,
         &v_elements,
         v_main,
-        v_qdecode,
-        v_rc_lo,
-        v_rc_hi,
         v_program,
+        v_boundary,
+        v_rc,
     );
     commitment_scheme_v.commit(proof.commitments[2], &sizes[2], verifier_channel);
     verify(
@@ -3809,6 +4000,7 @@ fn pack_seq(values: &[u32], vec_row: usize) -> PackedM31 {
 }
 
 // Pack a decoded value computed from the qubit index for the qdecode table.
+#[allow(dead_code)] // used by the cuda/gpu-cuda interaction paths
 fn pack_decode(vec_row: usize, f: impl Fn(usize) -> u32) -> PackedM31 {
     PackedM31::from_array(std::array::from_fn(|lane| {
         BaseField::from_u32_unchecked(f((vec_row << LOG_N_LANES) + lane))

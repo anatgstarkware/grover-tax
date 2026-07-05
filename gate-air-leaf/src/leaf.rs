@@ -45,6 +45,7 @@ use crate::circuit_statement::GateAirStatement;
 pub struct GateAirLeafParams {
     pub main_log_size: u32,
     pub program_log_size: u32,
+    pub boundary_log_size: u32,
     pub preprocessed_root: ReducedHashValue<QM31>,
     pub boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     pub total_pc: u32,
@@ -93,6 +94,7 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
         &mut context,
         params.main_log_size,
         params.program_log_size,
+        params.boundary_log_size,
         params.preprocessed_root.clone(),
         params.boundary.clone(),
         params.total_pc,
@@ -100,12 +102,17 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     let proof_vars = proof.guess(&mut context);
     verify(&mut context, &proof_vars, cfg, &statement);
 
-    // Leaf output: hash the (now GUESSED, witness) preprocessed root and verified state boundary, so
-    // the 2 reserved outputs commit to (x, y) for every shot. Preimage = [ppR.0, ppR.1, x.., y..].
-    // These are the SAME guessed Vars that `verify` bound: the root via the preprocessed-trace
-    // Merkle decommitment, and the x/y via the boundary LogUp sum. So the commitment is over the
-    // bound values, and keeping them witness (not `context.constant`) keeps the leaf's preprocessed
-    // trace — and `leaf_preprocessed_root` — identical across shards.
+    // Leaf output: hash the (GUESSED, witness) preprocessed root and per-shot state boundary, so the
+    // 2 reserved outputs commit to (x, y) for every shot. Preimage = [ppR.0, ppR.1, x.., y..].
+    // The preprocessed root IS bound by `verify` (via the preprocessed-trace Merkle decommitment).
+    // PHASE-3: the x/y limbs are NOW bound to the base proof's committed boundary. The base's re-keyed
+    // boundary leaves a PUBLIC dangling LogUp term B (main carries x at ts=0; the boundary re-emits y
+    // at the fixed public ts TS_FINAL), and `GateAirStatement::public_logup_sum` reconstructs −B over
+    // these guessed limbs (bit-decomposed, addr = limb*16 + bit). Since `verify` enforces
+    // `public_logup_sum + Σ claimed_sums == 0`, the guessed x/y are forced equal to the base's committed
+    // x/y — so this hash commits to the PROVEN boundary. Keeping the limbs witness (not
+    // `context.constant`) keeps the leaf's preprocessed trace — and `leaf_preprocessed_root` — identical
+    // across shards.
     let pp_root = statement.preprocessed_root_vars();
     let mut preimage = vec![pp_root.0, pp_root.1];
     for (x, y) in statement.boundary_vars() {

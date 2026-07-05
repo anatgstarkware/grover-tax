@@ -1,47 +1,60 @@
 //! P3.1 — K1: CUDA gate-sim + main-trace kernel for gate_air (on-device "model B").
 //!
-//! Generates the 191 main-trace columns + the 3 lookup histograms (qdecode / rc_lo / rc_hi)
-//! ENTIRELY on the GPU, so the trace never leaves device memory (avoiding the model-A transfer
-//! wall).
+//! ============================================================================================
+//! RE-SYNCED to the CURRENT (sound, final) CPU design: ts = pc+1 (inlined) + rc-table range-check, 22-col.
+//! --------------------------------------------------------------------------------------------
+//! This file mirrors the FINAL CPU encoding (`main.rs` `GateEval` / `cell_at` / `gen_main_interaction`
+//! / `build_rc_table`): the access timestamp is the affine `ts = pc + 1` of the preprocessed `pc`
+//! (NOT a witness column — inlined in K4 and the AIR), plus a range-check on `d = ts - prev_ts - 1 =
+//! pc - prev_ts` via two limbs looked up into an rc supply table. The target's `v_after` is likewise
+//! NOT a column (= v_before + delta, inlined). This dropped the 3 per-access `ts` columns + the target
+//! `v_after` column: 26 -> 22.
+//!   * ts closed form (thread-per-execution SURVIVES): `ts = pc + 1`, `pc = rep*n_gates + gate_idx` —
+//!     known per execution, shared by all accesses of the step (no per-gate slot).
+//!     `prev_ts` is the ts of the previous access to this addr (0 = init), so it is NO LONGER
+//!     `ts-1` in general; K1 reconstructs it from `prog_slot_meta`'s cyclic-predecessor constants
+//!     (predecessor pc + 1; see `prev_ts_of`).
+//!   * rc LIMBS: two range-check limb columns per access — `rc_lo = d & (2^RC_LO_BITS - 1)`,
+//!     `rc_hi = d >> RC_LO_BITS` with `d = pc - prev_ts`. Layout is now ACCESS_BLOCK = 5
+//!     (addr,prev_ts,v,rc_lo,rc_hi), TRACE_COLUMNS = 22 (see `cell_at`/`ACCESS_BLOCK` in main.rs).
+//!   * rc HISTOGRAM: a single 2^RC_LOG_SIZE multiplicity histogram over `row_of(pos,limb)` —
+//!     RC_POS_LO block rows [0, 2^RC_LO_BITS) hold the lo-limb counts, RC_POS_HI block rows
+//!     [2^RC_LO_BITS, 2^RC_LO_BITS + 2^RC_HI_BITS) hold the hi-limb counts (main.rs `RcTable::row_of`).
+//!     Each ACTIVE access bumps `hist[rc_lo] += 1` and `hist[2^RC_LO_BITS + rc_hi] += 1`. Emitted into
+//!     the (formerly unused) `rc_lo` device arg (`rc_hi` arg stays inert). NOTE: on the PRODUCTION
+//!     path the rc multiplicity WITNESS column is built ON THE HOST from the always-present CPU `rows`
+//!     (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is used ONLY
+//!     by the `k1_byte_identity` diagnostic to cross-check the device histogram against the CPU one.
+//!   * boundary: nothing on the MAIN kernel (the `gate_bnd_enabler`-gated (B)/(D) is host-only).
 //!
-//! THREAD-PER-EXECUTION (occupancy redesign, 2026-06-29).
-//! ------------------------------------------------------
-//! The original kernel was thread-per-SHOT: each of `n_shots` threads ran its shot's full
-//! `k * n_gates` chain. Parallelism was therefore fixed at `n_shots` regardless of total work,
-//! so at the real 9024-shot Tanuj benchmark only ~36 of an A100's 108 SMs were ever touched, and
-//! sharding across 8 GPUs (~1128 shots/GPU) lit only ~5 SMs/GPU (~95% idle) — worst at high k.
+//! QUBIT-MEMORY ENCODING (branch anatg/gate-air-qubit-mem).
+//! -------------------------------------------------------
+//! Generates the main-trace columns ENTIRELY on the GPU (trace never leaves device memory). The old
+//! whole-state (188/191-col TAG_STATE) encoding + its qdecode histograms are replaced by the
+//! per-qubit chain-lookup qubit-memory (TAG_QUBITMEM) + the ts-ordering rc-table lookup (TAG_RC),
+//! byte-identical to the CPU `simulate_shot` / `cell_at` / `build_rc_table`.
 //!
-//! The fix maps ONE THREAD PER EXECUTION = per (shot, rep) pair, so parallelism rises from
-//! `n_shots` to `n_shots * k` (~9M at k=1000) and saturates the device. The catch is that the
-//! `k` reps are a SEQUENTIAL state chain: rep r+1 of a shot starts from the state rep r ended on
-//! (Grover-style; the CPU `simulate_shot` never resets `limbs` between reps). So per-rep threads
-//! are NOT independent unless each knows its starting state.
+//! THREAD-PER-EXECUTION (survives via a closed-form ts).
+//! -----------------------------------------------------
+//! `ts` is a CLOSED FORM in the pc: for an access to addr `a` in rep `r` at gate `g`, the pc is
+//! `pc = r*n_gates + g` and `ts = pc*TS_STRIDE + slot` (slot from the access role). This depends only
+//! on (r, g, slot) — NOT on any running per-address counter — so the thread-per-EXECUTION split holds:
+//!   * `prog_slot_meta` — one-thread prepass: per gate-slot the program constant `prev_gate` = the
+//!     gate index of the PREVIOUS access to this addr within one pass (or a sentinel if none), so K1
+//!     can compute `prev_ts` (the predecessor's closed-form ts) without a serial history. See the
+//!     kernel doc for the exact prev_ts recovery (intra-rep predecessor vs. cross-rep / init).
+//!   * K0 `gate_sim_states` — thread-per-SHOT, VALUE-ONLY: snapshots the 512-qubit state (32 limbs)
+//!     at every (shot, rep) boundary (linear-in-k value chain). Seeds K1's per-execution value chain.
+//!   * K1 `gate_sim` — thread-per-EXECUTION: thread `(shot, rep)` loads its rep-boundary state, walks
+//!     the rep's n_gates gates for v_before/v_after, and fills ts (closed form) + prev_ts + the two
+//!     rc limbs, and bumps the rc histogram.
+//! Parallelism is n_shots·k. Row(shot,rep,g) = (shot*k+rep)*n_gates+g is the same contiguous per-shot
+//! block; only how ts/prev_ts/rc are produced changed.
 //!
-//! We resolve this with a TWO-KERNEL split that keeps total work LINEAR in k (a per-rep
-//! fast-forward would be O(k^2) — fatal at k=2000) and is NOT the forbidden per-gate-instance
-//! two-pass:
-//!   K0 `gate_sim_states` — thread-per-SHOT, but does ONLY the cheap limb update (no column
-//!       stores, no histogram atomics). It walks the full `k * n_gates` chain and records the
-//!       rep-BOUNDARY state of each shot: `rep_states[shot*k*N_LIMBS + rep*N_LIMBS + i]` = the
-//!       32-limb state at the START of (shot, rep) (rep 0 == x_states[shot]). This is k small
-//!       state snapshots per shot — not k*n_gates rows.
-//!   K1 `gate_sim` — thread-per-EXECUTION. Thread `exec = shot*k + rep` loads its start state
-//!       from `rep_states`, sets `pc = rep*n_gates` and `row = exec*n_gates`, then walks its own
-//!       `n_gates` gates writing the 191 columns + the 3 histograms exactly as before.
-//! The expensive phase (191 stores + 3 atomics per row) now runs with `n_shots*k` threads; the
-//! cheap sequential chain stays in K0 with `n_shots` threads (a small fraction of the old cost,
-//! since K0 omits all the per-row I/O that dominated the old kernel).
-//!
-//! SOUNDNESS / BYTE-IDENTITY: the output is unchanged. K1's per-gate body is the SAME line-for-line
-//! translation of `simulate_shot` / `ReadCols::live`/`inactive` / `qubit_decode` / `count_read` /
-//! `delta_to_m31` / the `cell_at` 191-column layout. The only change is the thread→(shot,rep,row,pc)
-//! mapping: row(shot,rep,g) = shot*k*n_gates + rep*n_gates + g is EXACTLY the row the old kernel
-//! wrote (old: row started at shot*k*n_gates and incremented through rep,g in order); pc = rep*n_gates
-//! + g matches the old monotonic `pc` (which also ran 0..k*n_gates per shot); and each thread's start
-//! state equals what the old kernel held entering rep r, because K0 reproduces the same chain. The
-//! histogram atomicAdds are the same set of increments, just issued by more threads — integer add is
-//! commutative/associative so the totals are identical. Validated by the GATE_AIR_GPU_TEST=k1 / k4
-//! column-by-column + histogram equality harness vs CPU before it is trusted.
+//! SOUNDNESS / BYTE-IDENTITY: K1's per-gate body mirrors `simulate_shot` (the ctrl_a/ctrl_b/target
+//! access order, the value gate-apply, delta_to_m31), the `cell_at` 22-column layout, the closed-form
+//! `ts = pc*TS_STRIDE + slot`, `prev_ts` (per-address chain), and the two rc limbs + histogram.
+//! Validated by GATE_AIR_GPU_TEST=k1 / k4 column-by-column (+ histogram) vs CPU.
 
 use std::sync::{Arc, OnceLock};
 
@@ -93,8 +106,15 @@ fn gate_sim_module(
     let res = LOADED.get_or_init(|| {
         first = true;
         let ptx = compile_ptx(GATE_SIM_KERNEL).map_err(|e| format!("nvrtc compile: {e}"))?;
-        dev.load_ptx(ptx, "gate_sim_mod", &["gate_sim_states", "gate_sim", "fill_padding"])
-            .map_err(|e| format!("load_ptx: {e}"))?;
+        // Qubit-memory encoding, thread-per-EXECUTION (recovered): `prog_slot_meta` precomputes the
+        // closed-form ts constants, K0 `gate_sim_states` snapshots per-rep-boundary values, K1
+        // `gate_sim` fills each (shot, rep)'s rows independently.
+        dev.load_ptx(
+            ptx,
+            "gate_sim_mod",
+            &["prog_slot_meta", "gate_sim_states", "gate_sim", "fill_padding"],
+        )
+        .map_err(|e| format!("load_ptx: {e}"))?;
         Ok(())
     });
     res.clone().map(|()| ("gate_sim_mod", first))
@@ -130,34 +150,180 @@ fn interaction_module(
     res.clone().map(|()| ("logup_mod", first))
 }
 
-/// NVRTC-compiled CUDA source for the gate-sim kernel. Layout/constants mirror gate_air `main.rs`:
-/// N_LIMBS=32, LIMB_BITS=16, TRACE_COLUMNS=191, READ_COLS=39, M31 modulus 2^31-1,
-/// opcodes NOP=0/NOT=1/CNOT=2/TOFFOLI=3.
+/// Allocate the thread-per-execution scratch buffers shared by every K1 launch wrapper:
+/// - `d_rep`: n_shots*k*N_LIMBS rep-boundary states (written by K0, read by K1).
+/// - `d_slot`: n_gates*9 predecessor constants ([a_pg,a_ps,a_wrap, b_pg,b_ps,b_wrap, t_pg,t_ps,t_wrap]
+///   per gate) — for each active access slot, the (gate, slot) of the previous access to the SAME addr
+///   in cyclic program order + a `wrap` flag (1 = predecessor is in the previous rep, 0 = same rep).
+///   K1 turns these into `prev_ts` (see the `gate_sim` doc). Filled ONCE here by `prog_slot_meta`.
+/// `prog_slot_meta` is a single-thread program pass (n_gates is tiny), launched here so the constants
+/// are ready before K0/K1. Returns (`d_rep`, `d_slot`).
+#[cfg(feature = "gpu-cuda")]
+fn alloc_rep_and_slot(
+    dev: &Arc<cudarc::driver::CudaDevice>,
+    d_gates: &cudarc::driver::CudaSlice<u32>,
+    k: u32,
+    n_gates: u32,
+    n_shots: u32,
+) -> Result<(cudarc::driver::CudaSlice<u32>, cudarc::driver::CudaSlice<u32>), String> {
+    use cudarc::driver::{LaunchAsync, LaunchConfig};
+    let n_exec = (n_shots as u64) * (k as u64);
+    let d_rep = dev
+        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
+        .map_err(|e| format!("alloc rep_states: {e}"))?;
+    let mut d_slot = dev
+        .alloc_zeros::<u32>((n_gates as usize) * 9)
+        .map_err(|e| format!("alloc slot_meta: {e}"))?;
+    // Closed-form ts prepass: one thread walks the program once (n_gates tiny).
+    let meta = dev
+        .get_func("gate_sim_mod", "prog_slot_meta")
+        .ok_or_else(|| "get_func prog_slot_meta".to_string())?;
+    let one = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        meta.launch(one, (d_gates, n_gates, &mut d_slot))
+            .map_err(|e| format!("launch prog_slot_meta: {e}"))?;
+    }
+    Ok((d_rep, d_slot))
+}
+
+/// Launch K0 `gate_sim_states`: thread-per-shot value-only pass filling `d_rep` with per-rep-boundary
+/// 512-qubit states (32 limbs each). Seeds K1's per-execution value chain.
+#[cfg(feature = "gpu-cuda")]
+fn launch_k0_states(
+    dev: &Arc<cudarc::driver::CudaDevice>,
+    d_gates: &cudarc::driver::CudaSlice<u32>,
+    d_x: &cudarc::driver::CudaSlice<u32>,
+    d_rep: &mut cudarc::driver::CudaSlice<u32>,
+    k: u32,
+    n_gates: u32,
+    n_shots: u32,
+) -> Result<(), String> {
+    use cudarc::driver::{LaunchAsync, LaunchConfig};
+    let states = dev
+        .get_func("gate_sim_mod", "gate_sim_states")
+        .ok_or_else(|| "get_func gate_sim_states".to_string())?;
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shots.div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        states
+            .launch(cfg, (d_gates, d_x, d_rep, k, n_gates, n_shots))
+            .map_err(|e| format!("launch gate_sim_states: {e}"))?;
+    }
+    Ok(())
+}
+
+/// NVRTC-compiled CUDA source for the gate-sim kernels. Layout/constants mirror gate_air `main.rs`:
+/// N_QUBITS=512, N_LIMBS=32, LIMB_BITS=16, TRACE_COLUMNS=22, M31 modulus 2^31-1,
+/// opcodes NOP=0/NOT=1/CNOT=2/TOFFOLI=3, ts = pc+1 (TS_STRIDE=1, no slot),
+/// RC_LO_BITS=15 (rc histogram: lo block rows [0,2^15), hi block rows [2^15, 2^15+2^10)).
 ///
 /// Buffers (all device):
 /// - `gates`:   n_gates * 4  (opcode, target_q, ctrl_a_q, ctrl_b_q), u32
 /// - `x_states`: n_shots * N_LIMBS  (initial state limbs per shot), u32
 /// - `rep_states`: n_shots * k * N_LIMBS — rep-boundary states K0 produces and K1 consumes:
 ///   rep_states[(shot*k + rep)*N_LIMBS + i] = limb i of the state at the START of (shot, rep).
-/// - `off_lo`/`off_hi`: 16 each — RcIndex offsets: off_lo[p]=2^p-1, off_hi[p]=2^16-2^(16-p)
+/// - `slot_meta`: n_gates * 9 — per-gate predecessor constants (see the `prog_slot_meta` prepass):
+///   [a_pg,a_ps,a_wrap, b_pg,b_ps,b_wrap, t_pg,t_ps,t_wrap] for ctrl_a / ctrl_b / target. For each
+///   active slot, (pg, ps) = (gate index, slot) of the PREVIOUS access to the same addr in cyclic
+///   program order, and wrap = 1 iff that predecessor is in the PREVIOUS rep (0 iff the same rep). K1
+///   turns them into `prev_ts` (the predecessor's closed-form ts, or 0 at the program-wide first access).
 /// - `cols`:    TRACE_COLUMNS * padded_rows, column-major (col c at cols[c*padded_rows + row]), u32
-/// - `qdecode`(512), `rc_lo`(65536), `rc_hi`(65536): histograms, u32, zero-initialized
+/// - `rc_lo` (repurposed): the 2^RC_LOG_SIZE rc-table MULTIPLICITY HISTOGRAM over row_of(pos,limb)
+///   (K1 atomically bumps hist[rc_lo] and hist[(1<<RC_LO_BITS)+rc_hi] per active access). Caller must
+///   zero it. `rc_hi` (repurposed) is INERT (kept for arg-list compatibility). NB: production uses the
+///   HOST-built rc multiplicity witness (main.rs build_rc_table); this histogram feeds only k1 tests.
 /// Scalars: k, n_gates, n_shots, padded_rows (shot_rows = k*n_gates computed in-kernel).
-/// NOTE: caller must zero `cols` + histograms first, and write padding rows (enabler=0, the 3
-/// read-block `mask` columns = 1, rest 0) for rows in [n_shots*shot_rows, padded_rows).
-/// Launch order: K0 `gate_sim_states` (fills rep_states), then K1 `gate_sim` (consumes it).
+/// NOTE: caller must zero `cols` first; padding rows [n_shots*shot_rows, padded_rows) stay 0
+/// (`Row::padding()` is all-zero — `fill_padding` is a no-op stub).
+/// Launch order: `prog_slot_meta` (fills slot_meta, once) → K0 `gate_sim_states` (fills rep_states)
+/// → K1 `gate_sim` (consumes both).
 pub const GATE_SIM_KERNEL: &str = r#"
+#define N_QUBITS 512u
 #define N_LIMBS 32u
 #define LIMB_BITS 16u
-#define READ_COLS 39u
 #define M31_MOD 2147483647u
 #define OP_NOP 0u
 #define OP_NOT 1u
 #define OP_CNOT 2u
 #define OP_TOFFOLI 3u
+#define TS_STRIDE 3u
+#define SLOT_CTRL_A 1u
+#define SLOT_CTRL_B 2u
+#define SLOT_TARGET 3u
+#define RC_LO_BITS 15u
+#define RC_LO_MASK 0x7FFFu
+#define RC_LO_LEN 0x8000u   /* 1u << RC_LO_BITS */
 
-// Apply one gate's target-bit flip to `limbs` in place. Pure state update (no column/histogram
-// I/O) — the part the K1 per-gate body and K0 share. Mirrors simulate_shot's limb math exactly.
+// QUBIT-MEMORY ENCODING (branch anatg/gate-air-qubit-mem) — THREAD-PER-EXECUTION, pc-pinned ts.
+// -------------------------------------------------------------------------------------------
+// The old whole-state (TAG_STATE, 188/191-col) chain is replaced by a per-qubit chain-lookup
+// qubit-memory (TAG_QUBITMEM, 22-col). Each row is ONE gate execution. Per row the CPU
+// `simulate_shot` (main.rs) maintains, PER SHOT (reset each shot, threaded across ALL k reps):
+//   last_ts[addr], last_val[addr]  — the (ts, value) of the most recent access at each qubit
+// An access reads (prev_ts = last_ts[addr], v_before = last_val[addr]), sets the PROGRAM-ORDER
+// timestamp ts = pc*TS_STRIDE + slot (slot ctrl_a=1/ctrl_b=2/target=3; pc = rep*n_gates + gate), then
+// writes last_ts[addr] = ts (and last_val[addr] = v_after for the target, unchanged for controls). The
+// diff d = ts - prev_ts - 1 (>= 0) is split into rc_lo = d & (2^RC_LO_BITS-1), rc_hi = d >> RC_LO_BITS.
+//
+// TIMESTAMP-ORDERING (pc-pinned ts + rc-table range-check, the FINAL sound design):
+//   * ts is PINNED to the preprocessed pc: ts == pc*TS_STRIDE + slot (AIR constraint). Closed form in
+//     (rep, gate, slot) — no running counter.
+//   * prev_ts < ts is proved by range-checking d = ts - prev_ts - 1 via its two limbs (rc_lo, rc_hi)
+//     looked up into the rc supply table.
+//
+// CLOSED-FORM ts + prev_ts (thread-per-EXECUTION survives): ts is closed form in the pc. prev_ts is
+// the closed-form ts of the PREVIOUS access to the same addr in cyclic program order. `prog_slot_meta`
+// precomputes, per active slot, (prev_gate, prev_slot, wrap): the (gate, slot) of that predecessor in
+// one pass and wrap=1 iff it lies in the PREVIOUS rep. K1 then sets
+//     prev_rep = wrap ? rep-1 : rep;  prev_ts = (wrap && rep==0) ? 0 : (prev_rep*n_gates+prev_gate) + 1
+// (prev_ts = 0 is the init boundary node — the program-wide first access to that addr). This needs
+// only (rep, program constants), NO serial per-address history, so K1 stays embarrassingly parallel.
+//
+// K0 / K1 SPLIT (thread-per-EXECUTION):
+//   K0 `gate_sim_states` — thread-per-SHOT, VALUE-ONLY. Walks the full k*n_gates chain doing only the
+//     cheap 32-limb bit-flip (apply_gate, no column I/O) and snapshots the 512-qubit state (as 32
+//     limbs) at the START of every (shot, rep) into rep_states. Seeds K1's per-execution value chain.
+//   K1 `gate_sim` — thread-per-EXECUTION. Thread `exec = shot*k + rep` seeds a local 512-state from
+//     rep_states[exec], processes the rep's n_gates gates updating that local state for v_before/
+//     v_after, fills ts (closed form) + prev_ts + rc_lo/rc_hi from `slot_meta`+`rep`, and atomically
+//     bumps the rc histogram. Grid = n_shots*k (full parallelism).
+//
+// 22-col cell_at layout (main.rs cell_at, all WITNESS; enabler/shot_id/pc/pc_in_prog are tree0;
+// ts = pc+1 and the target's v_after = v_before+delta are INLINED, not columns):
+//   [0..4)   is_nop, is_not, is_cnot, is_toffoli
+//   [4..9)   target:  addr, prev_ts, v_before, rc_lo, rc_hi   (ACCESS_BLOCK = 5)
+//   [9..14)  ctrl_a:  addr, prev_ts, v, rc_lo, rc_hi
+//   [14..19) ctrl_b:  addr, prev_ts, v, rc_lo, rc_hi
+//   [19..22) ab, fire, delta
+//
+// Boundary init/final is a SEPARATE CPU-built component (BoundaryTable); the GPU main-trace kernel
+// does not emit it.
+
+// prev_ts for one access from its (prev_gate, prev_slot, wrap) predecessor triple + this rep.
+// wrap=1 => the predecessor is in the PREVIOUS rep; at rep 0 that predecessor doesn't exist, so the
+// init boundary node prev_ts = 0 (matches simulate_shot's last_ts init of 0). Else prev_ts is the
+// predecessor's ts = prev_pc + 1 = (prev_rep*n_gates + prev_gate) + 1 (ts = pc+1, no slot; prev_slot
+// is unused now — the prepass still records it but the shared ts per step makes it irrelevant, since
+// a same-address predecessor is always in a DIFFERENT gate step / pc).
+__device__ __forceinline__ unsigned prev_ts_of(
+    unsigned prev_gate, unsigned prev_slot, unsigned wrap, unsigned rep, unsigned n_gates)
+{
+    (void)prev_slot;
+    if (wrap && rep == 0u) return 0u;
+    unsigned prev_rep = wrap ? (rep - 1u) : rep;
+    return (prev_rep * n_gates + prev_gate) + 1u;
+}
+
+// Apply one gate's target-bit flip to `limbs` in place. Pure state update (no column I/O) — the part
+// the K1 per-gate body and K0 share. Mirrors simulate_shot's value math exactly (fire in {0,1}).
 __device__ __forceinline__ void apply_gate(
     unsigned* limbs, const unsigned* __restrict__ gates, unsigned g)
 {
@@ -182,10 +348,82 @@ __device__ __forceinline__ void apply_gate(
     else if (delta_signed < 0) limbs[tl] -= mask;
 }
 
-// K0: thread-per-SHOT, state-only. Walk the full k*n_gates chain (cheap limb updates, NO column
-// stores, NO histogram atomics) and snapshot the state at the START of every (shot, rep) into
+// PREPASS: per-active-slot cyclic PREDECESSOR constants (gate, slot, wrap) — the program constants K1
+// needs to reconstruct `prev_ts` (the predecessor's closed-form ts) with NO serial per-address chain.
+// ONE thread walks the program ONCE in ctrl_a→ctrl_b→target order (matching simulate_shot's do_access
+// sequencing), maintaining per address the (gate, slot) of its MOST RECENT access seen so far in this
+// pass (`lg[a]`, `ls[a]`, valid iff `seen[a]`). For each active slot it records:
+//   pg, ps = the (gate, slot) of the previous access to that addr; wrap = 0 (predecessor is EARLIER in
+//   THIS pass, so same rep). If the addr has NOT been seen yet this pass (first access this pass), the
+//   predecessor is the LAST access to that addr in the pass — from the PREVIOUS rep — so we leave a
+//   marker (wrap=1) and backfill (pg, ps) after the full pass from the finished lg/ls (= the last
+//   access to the addr in one pass). At the program-wide first access (rep 0), K1 maps wrap&&rep==0 to
+//   prev_ts = 0 (the init boundary node), matching simulate_shot's `last_ts` init of 0.
+// slot_meta layout per gate g: [a_pg,a_ps,a_wrap, b_pg,b_ps,b_wrap, t_pg,t_ps,t_wrap] (9 u32).
+// Inactive controls leave their triple = 0 (unused: K1 zeroes an inactive ctrl AccessCols). Single-
+// thread is fine — n_gates is tiny (~2547 for iadd) and this runs ONCE per process-shard, dwarfed by K1.
+extern "C" __global__ void prog_slot_meta(
+    const unsigned* __restrict__ gates,
+    unsigned n_gates,
+    unsigned* __restrict__ slot_meta)
+{
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    unsigned lg[N_QUBITS];    // gate index of the addr's last access seen this pass
+    unsigned ls[N_QUBITS];    // its slot
+    unsigned char seen[N_QUBITS];
+    for (unsigned a = 0; a < N_QUBITS; a++) { lg[a] = 0u; ls[a] = 0u; seen[a] = 0u; }
+    // A record: for each active slot whose predecessor is a FIRST-in-pass wrap, remember where to
+    // backfill (slot_meta index for pg) and which addr, so the second pass can fill from lg/ls.
+    for (unsigned g = 0; g < n_gates; g++) {
+        unsigned opcode = gates[g * 4u + 0u];
+        unsigned tq     = gates[g * 4u + 1u];
+        unsigned aq     = gates[g * 4u + 2u];
+        unsigned bq     = gates[g * 4u + 3u];
+        unsigned is_cnot = (opcode == OP_CNOT) ? 1u : 0u;
+        unsigned is_tof = (opcode == OP_TOFFOLI) ? 1u : 0u;
+        unsigned a_active = is_cnot + is_tof;
+        unsigned b_active = is_tof;
+        unsigned base = g * 9u;
+        // Emit predecessor for one active access to addr q at slot `slot`; then record (g, slot) as the
+        // addr's latest access. `off` is the slot's base offset in slot_meta (0/3/6 for a/b/t).
+        #define PRED(q, slot, off) do {                                             \
+            if (seen[(q)]) {                                                         \
+                slot_meta[base + (off) + 0u] = lg[(q)];                             \
+                slot_meta[base + (off) + 1u] = ls[(q)];                             \
+                slot_meta[base + (off) + 2u] = 0u;   /* same rep */                 \
+            } else {                                                                \
+                /* first access to q this pass: predecessor is the pass's LAST     \
+                   access to q, from the previous rep. Marked wrap=1; pg/ps        \
+                   backfilled below. Stash the addr in the pg slot temporarily. */ \
+                slot_meta[base + (off) + 0u] = (q);   /* temp: addr, backfilled */  \
+                slot_meta[base + (off) + 1u] = 0u;                                  \
+                slot_meta[base + (off) + 2u] = 1u;   /* wrap */                     \
+            }                                                                       \
+            lg[(q)] = g; ls[(q)] = (slot); seen[(q)] = 1u;                          \
+        } while (0)
+        if (a_active) PRED(aq, SLOT_CTRL_A, 0u);
+        if (b_active) PRED(bq, SLOT_CTRL_B, 3u);
+        PRED(tq, SLOT_TARGET, 6u);   // target always active
+        #undef PRED
+    }
+    // Backfill every wrap=1 predecessor with the addr's LAST access in the pass (lg/ls now final).
+    for (unsigned g = 0; g < n_gates; g++) {
+        unsigned base = g * 9u;
+        #pragma unroll
+        for (unsigned off = 0u; off < 9u; off += 3u) {
+            if (slot_meta[base + off + 2u] == 1u) {
+                unsigned q = slot_meta[base + off + 0u];  // temp addr stashed above
+                slot_meta[base + off + 0u] = lg[q];
+                slot_meta[base + off + 1u] = ls[q];
+            }
+        }
+    }
+}
+
+// K0: thread-per-SHOT, VALUE-ONLY. Walk the full k*n_gates chain (cheap apply_gate limb updates, NO
+// column stores) and snapshot the 512-qubit state (32 limbs) at the START of every (shot, rep) into
 // rep_states. rep 0's snapshot is exactly x_states[shot]; rep r's is the state after r full passes.
-// This keeps total chain work LINEAR in k while letting K1 start each (shot,rep) independently.
+// Keeps total value-chain work LINEAR in k while letting K1 start each (shot, rep) independently.
 extern "C" __global__ void gate_sim_states(
     const unsigned* __restrict__ gates,
     const unsigned* __restrict__ x_states,
@@ -202,158 +440,158 @@ extern "C" __global__ void gate_sim_states(
     for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = x_states[shot * N_LIMBS + i];
 
     for (unsigned rep = 0; rep < k; rep++) {
-        // Snapshot the state entering this rep.
         unsigned long base = ((unsigned long)shot * (unsigned long)k + (unsigned long)rep) * N_LIMBS;
         #pragma unroll
         for (unsigned i = 0; i < N_LIMBS; i++) rep_states[base + i] = limbs[i];
-        // Advance through one full pass of the program.
         for (unsigned g = 0; g < n_gates; g++) apply_gate(limbs, gates, g);
     }
 }
 
+// K1: THREAD-PER-EXECUTION. One thread per (shot, rep). exec = shot*k + rep. Seeds a local 512-state
+// from K0's rep-boundary snapshot (so this execution starts exactly where simulate_shot was entering
+// rep `rep`), processes the rep's n_gates gates for v_before/v_after, and fills ts (closed form
+// pc*TS_STRIDE+slot), prev_ts (from slot_meta's cyclic-predecessor constants), and the two rc limbs.
+// `off_lo` is repurposed to carry rep_states and `off_hi` to carry slot_meta (both formerly-unused arg
+// slots — keeps the launch tuple at 8 pointers + 4 scalars, cudarc's cap). `qdecode` stays UNUSED;
+// `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM (atomic bumps); `rc_hi` stays INERT.
 extern "C" __global__ void gate_sim(
     const unsigned* __restrict__ gates,
-    const unsigned* __restrict__ rep_states,
-    const unsigned* __restrict__ off_lo,
-    const unsigned* __restrict__ off_hi,
+    const unsigned* __restrict__ x_states,      // UNUSED by K1 (state comes from rep_states); compat
+    const unsigned* __restrict__ rep_states,    // (was off_lo) n_shots*k*N_LIMBS rep-boundary states
+    const unsigned* __restrict__ slot_meta,     // (was off_hi) n_gates*9 predecessor constants
     unsigned* __restrict__ cols,
-    unsigned* __restrict__ qdecode,
-    unsigned* __restrict__ rc_lo,
-    unsigned* __restrict__ rc_hi,
+    unsigned* __restrict__ qdecode,             // UNUSED (kept for arg-list compatibility)
+    unsigned* __restrict__ rc_hist,             // (was rc_lo) 2^RC_LOG_SIZE rc multiplicity histogram
+    unsigned* __restrict__ rc_hi,               // INERT (kept for arg-list compatibility)
     unsigned k,
     unsigned n_gates,
     unsigned n_shots,
     unsigned long padded_rows)
 {
-    // THREAD-PER-EXECUTION: one thread per (shot, rep). exec = shot*k + rep.
+    (void)x_states; (void)qdecode; (void)rc_hi;
+
+    // THREAD-PER-EXECUTION: one thread per (shot, rep) = n_shots*k threads.
     unsigned long exec = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long n_exec = (unsigned long)n_shots * (unsigned long)k;
     if (exec >= n_exec) return;
-    unsigned shot = (unsigned)(exec / (unsigned long)k);
     unsigned rep  = (unsigned)(exec % (unsigned long)k);
 
-    // Per-thread state: the 32-limb register file, seeded from K0's rep-boundary snapshot so this
-    // (shot, rep) starts exactly where the old thread-per-shot kernel was when it entered rep.
+    // Local 512-qubit value state, seeded from K0's rep-boundary snapshot (32 limbs). This is the
+    // value of every qubit at the START of (shot, rep) — exactly last_val entering this rep. ts/prev_ts
+    // are CLOSED FORM (below) — no running per-address counter is threaded.
     unsigned limbs[N_LIMBS];
     #pragma unroll
     for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = rep_states[exec * N_LIMBS + i];
 
-    // Row range + pc this execution owns. row(shot,rep,g) = (shot*k + rep)*n_gates + g = exec*n_gates+g.
-    // pc is the monotonic per-shot counter the old kernel emitted: pc(rep,g) = rep*n_gates + g.
+    // Rows this execution owns: [exec*n_gates, (exec+1)*n_gates). row(shot,rep,g)=exec*n_gates+g.
     unsigned long row = exec * (unsigned long)n_gates;
-    unsigned pc = rep * n_gates;
-
-    // Per-read decoded fields (mirror ReadCols).
-    unsigned r_active[3], r_q[3], r_limb[3], r_bitpos[3], r_mask[3], r_lo[3], r_hi[3], r_bit[3];
 
     for (unsigned g = 0; g < n_gates; g++) {
-            unsigned opcode   = gates[g * 4u + 0u];
-            unsigned tq       = gates[g * 4u + 1u];
-            unsigned aq       = gates[g * 4u + 2u];
-            unsigned bq       = gates[g * 4u + 3u];
+        unsigned opcode = gates[g * 4u + 0u];
+        unsigned tq     = gates[g * 4u + 1u];
+        unsigned aq     = gates[g * 4u + 2u];
+        unsigned bq     = gates[g * 4u + 3u];
 
-            unsigned is_nop = (opcode == OP_NOP) ? 1u : 0u;
-            unsigned is_not = (opcode == OP_NOT) ? 1u : 0u;
-            unsigned is_cnot = (opcode == OP_CNOT) ? 1u : 0u;
-            unsigned is_tof = (opcode == OP_TOFFOLI) ? 1u : 0u;
-            unsigned a_active = is_cnot + is_tof;
-            unsigned b_active = is_tof;
+        unsigned is_nop = (opcode == OP_NOP) ? 1u : 0u;
+        unsigned is_not = (opcode == OP_NOT) ? 1u : 0u;
+        unsigned is_cnot = (opcode == OP_CNOT) ? 1u : 0u;
+        unsigned is_tof = (opcode == OP_TOFFOLI) ? 1u : 0u;
+        unsigned a_active = is_cnot + is_tof;
+        unsigned b_active = is_tof;
 
-            // qubits per read slot: 0=target (always active), 1=ctrl_a (a_active), 2=ctrl_b (b_active).
-            unsigned qslot[3] = { tq, aq, bq };
-            unsigned act[3]   = { 1u, a_active, b_active };
+        unsigned meta = g * 9u;
+        // pc for this execution's gate g = rep*n_gates + g (verifier-pinned per-shot program counter).
+        unsigned pc = rep * n_gates + g;
 
-            #pragma unroll
-            for (unsigned s = 0; s < 3u; s++) {
-                if (act[s]) {
-                    unsigned q = qslot[s];
-                    unsigned li = q / LIMB_BITS;
-                    unsigned bp = q % LIMB_BITS;
-                    unsigned l = limbs[li];
-                    r_active[s] = 1u; r_q[s] = q; r_limb[s] = li; r_bitpos[s] = bp;
-                    r_mask[s] = 1u << bp;
-                    r_lo[s] = l & ((1u << bp) - 1u);
-                    r_bit[s] = (l >> bp) & 1u;
-                    r_hi[s] = l >> (bp + 1u);
-                } else {
-                    // ReadCols::inactive(): mask=1, everything else 0.
-                    r_active[s] = 0u; r_q[s] = 0u; r_limb[s] = 0u; r_bitpos[s] = 0u;
-                    r_mask[s] = 1u; r_lo[s] = 0u; r_hi[s] = 0u; r_bit[s] = 0u;
-                }
-            }
+        // Read a qubit's current value from the local limb state.
+        #define QVAL(q) ((limbs[(q) / LIMB_BITS] >> ((q) % LIMB_BITS)) & 1u)
+        // prev_ts from a slot's (prev_gate, prev_slot, wrap) predecessor triple at slot_meta[meta+off].
+        #define PREVTS(off) prev_ts_of(slot_meta[meta+(off)+0u], slot_meta[meta+(off)+1u], \
+                                       slot_meta[meta+(off)+2u], rep, n_gates)
 
-            unsigned t_bit = r_bit[0], a_bit = r_bit[1], b_bit = r_bit[2];
-            unsigned ab = a_bit * b_bit;
-            unsigned fire = is_not + is_cnot * a_bit + is_tof * ab;   // in {0,1}
-            unsigned new_t = t_bit ^ fire;
-            int delta_signed = (int)new_t - (int)t_bit;              // {-1,0,1}
+        // Access order matches simulate_shot: ctrl_a, ctrl_b, then target. ts = pc + 1 (program-order
+        // timestamp), SHARED by all accesses of this step (no slot — ts is not emitted). Values are
+        // read from the local state (v_before); the target write updates the local state so LATER
+        // gates in this rep read the new value. d = ts - prev_ts - 1 = pc - prev_ts.
+        unsigned ts = pc + 1u;
+        // ctrl_a (active iff a_active): read propagates value (v unchanged).
+        unsigned a_addr = 0u, a_prev = 0u, a_v = 0u, a_lo = 0u, a_hi = 0u;
+        if (a_active) {
+            a_addr = aq;
+            a_v    = QVAL(aq);
+            a_prev = PREVTS(0u);
+            unsigned d = ts - a_prev - 1u;   // >= 0 (prev_ts is an earlier program-order ts or 0)
+            a_lo = d & RC_LO_MASK; a_hi = d >> RC_LO_BITS;
+            atomicAdd(&rc_hist[a_lo], 1u);
+            atomicAdd(&rc_hist[RC_LO_LEN + a_hi], 1u);
+        }
+        // ctrl_b (active iff b_active).
+        unsigned b_addr = 0u, b_prev = 0u, b_v = 0u, b_lo = 0u, b_hi = 0u;
+        if (b_active) {
+            b_addr = bq;
+            b_v    = QVAL(bq);
+            b_prev = PREVTS(3u);
+            unsigned d = ts - b_prev - 1u;
+            b_lo = d & RC_LO_MASK; b_hi = d >> RC_LO_BITS;
+            atomicAdd(&rc_hist[b_lo], 1u);
+            atomicAdd(&rc_hist[RC_LO_LEN + b_hi], 1u);
+        }
+        // target (always active): read+write.
+        unsigned t_addr = tq;
+        unsigned t_v    = QVAL(tq);     // v_before
+        unsigned t_prev = PREVTS(6u);
+        unsigned t_d    = ts - t_prev - 1u;
+        unsigned t_lo   = t_d & RC_LO_MASK, t_hi = t_d >> RC_LO_BITS;
+        atomicAdd(&rc_hist[t_lo], 1u);
+        atomicAdd(&rc_hist[RC_LO_LEN + t_hi], 1u);
 
-            // out_limb = in_limb with the target bit flipped (±mask on the target limb).
-            unsigned out_limb[N_LIMBS];
-            #pragma unroll
-            for (unsigned i = 0; i < N_LIMBS; i++) out_limb[i] = limbs[i];
-            if (delta_signed > 0) out_limb[r_limb[0]] += r_mask[0];
-            else if (delta_signed < 0) out_limb[r_limb[0]] -= r_mask[0];
+        unsigned ab = a_v * b_v;
+        unsigned fire = is_not + is_cnot * a_v + is_tof * ab;   // in {0,1}
+        unsigned v_after = t_v ^ fire;
+        int delta_signed = (int)v_after - (int)t_v;             // {-1,0,1}
 
-            // Lookup multiplicities (count_read for each active read).
-            #pragma unroll
-            for (unsigned s = 0; s < 3u; s++) {
-                if (r_active[s]) {
-                    atomicAdd(&qdecode[r_q[s]], 1u);
-                    atomicAdd(&rc_lo[off_lo[r_bitpos[s]] + r_lo[s]], 1u);
-                    atomicAdd(&rc_hi[off_hi[r_bitpos[s]] + r_hi[s]], 1u);
-                }
-            }
+        // Commit target write to the LOCAL state (so subsequent gates in this rep see the new value).
+        {
+            unsigned tl = tq / LIMB_BITS, tbp = tq % LIMB_BITS, mask = 1u << tbp;
+            if (delta_signed > 0) limbs[tl] += mask;
+            else if (delta_signed < 0) limbs[tl] -= mask;
+        }
+        #undef QVAL
+        #undef PREVTS
 
-            // Emit the 188 cells in cell_at order (running column counter cc).
-            // enabler / shot_id / pc were moved OUT of the main trace into the preprocessed tree
-            // (tree0); they are positional and are NOT written here. (`shot`/`pc` are still computed
-            // above to drive the simulation; they just no longer go into the committed trace.)
-            unsigned cc = 0u;
-            #define EMIT(v) cols[(unsigned long)(cc++) * padded_rows + row] = (v)
-            EMIT(is_nop); EMIT(is_not); EMIT(is_cnot); EMIT(is_tof);
-            #pragma unroll
-            for (unsigned i = 0; i < N_LIMBS; i++) EMIT(limbs[i]);     // in_limb
-            #pragma unroll
-            for (unsigned i = 0; i < N_LIMBS; i++) EMIT(out_limb[i]);  // out_limb
-            // 3 read blocks: q, limb_idx, bit_pos, mask, lsel[32], lo, hi, bit
-            #pragma unroll
-            for (unsigned s = 0; s < 3u; s++) {
-                EMIT(r_q[s]); EMIT(r_limb[s]); EMIT(r_bitpos[s]); EMIT(r_mask[s]);
-                #pragma unroll
-                for (unsigned i = 0; i < N_LIMBS; i++) EMIT(r_active[s] && (i == r_limb[s]) ? 1u : 0u); // lsel
-                EMIT(r_lo[s]); EMIT(r_hi[s]); EMIT(r_bit[s]);
-            }
-            EMIT(ab); EMIT(fire);
-            EMIT(delta_signed >= 0 ? (unsigned)delta_signed : (unsigned)((int)M31_MOD + delta_signed)); // delta_to_m31
-            #undef EMIT
+        // Emit the 22 cells in cell_at order (ACCESS_BLOCK = 5: addr,prev_ts,v,rc_lo,rc_hi). ts (=pc+1)
+        // and the target's v_after (=v_before+delta) are NOT emitted — they are inlined in the AIR /
+        // K4 interaction kernel. (void v_after / delta arithmetic still updates the local state above.)
+        unsigned cc = 0u;
+        #define EMIT(v) cols[(unsigned long)(cc++) * padded_rows + row] = (v)
+        EMIT(is_nop); EMIT(is_not); EMIT(is_cnot); EMIT(is_tof);              // 0..4
+        EMIT(t_addr); EMIT(t_prev); EMIT(t_v); EMIT(t_lo); EMIT(t_hi);        // 4..9  target
+        EMIT(a_addr); EMIT(a_prev); EMIT(a_v); EMIT(a_lo); EMIT(a_hi);        // 9..14 ctrl_a
+        EMIT(b_addr); EMIT(b_prev); EMIT(b_v); EMIT(b_lo); EMIT(b_hi);        // 14..19 ctrl_b
+        EMIT(ab); EMIT(fire);                                                 // 19..21
+        EMIT(delta_signed >= 0 ? (unsigned)delta_signed
+                               : (unsigned)((int)M31_MOD + delta_signed));    // 21 delta_to_m31
+        #undef EMIT
 
-            // Advance: state becomes out_limb for the next gate.
-            #pragma unroll
-            for (unsigned i = 0; i < N_LIMBS; i++) limbs[i] = out_limb[i];
-            pc += 1u;
-            row += 1u;
+        row += 1u;
     }
 }
 
-// Populate padding rows [real_rows, padded_rows) to match `Row::padding()`:
-// everything 0 except the 3 read-block `mask` columns (target=71, ctrl_a=110, ctrl_b=149),
-// which `ReadCols::inactive()` sets to 1. `cols` is pre-zeroed, so only the masks need writing.
-// (Indices shifted down by 3 from the old layout after enabler/shot_id/pc moved to tree0.)
+// Padding rows [real_rows, padded_rows) match `Row::padding()` = ALL ZERO (AccessCols::inactive()
+// is addr=ts=prev_ts=v=0; is_* = 0; ab=fire=delta=0). `cols` is pre-zeroed by the caller, so there
+// is nothing to write. Kept as a no-op stub so the Rust launch glue (get_func "fill_padding") and
+// its shard-loop call site do not need to change. (Old encoding wrote mask=1 on 3 columns; the new
+// AccessCols::inactive() has no such non-zero field.)
 extern "C" __global__ void fill_padding(
     unsigned* __restrict__ cols,
     unsigned long padded_rows,
     unsigned long real_rows)
 {
-    unsigned long row = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x + real_rows;
-    if (row >= padded_rows) return;
-    cols[(unsigned long)71u  * padded_rows + row] = 1u;
-    cols[(unsigned long)110u * padded_rows + row] = 1u;
-    cols[(unsigned long)149u * padded_rows + row] = 1u;
+    (void)cols; (void)padded_rows; (void)real_rows;
 }
 "#;
 
-pub const TRACE_COLUMNS: usize = 188;
+pub const TRACE_COLUMNS: usize = 22;
 
 /// Run K1 on the GPU and copy the trace + histograms back to the host (for the P3.1 byte-identity
 /// test). The production GPU-resident path (return BaseColumns, no D2H) is P3.4.
@@ -388,48 +626,38 @@ pub fn gpu_gen_main_trace(
         .get_func("gate_sim_mod", "gate_sim")
         .ok_or_else(|| "get_func gate_sim".to_string())?;
 
+    let _ = (off_lo, off_hi); // RcIndex offsets no longer used (repurposed arg slots carry rep_states/slot_meta).
     let d_gates = dev.htod_copy(gates_flat.to_vec()).map_err(|e| format!("htod gates: {e}"))?;
     let d_x = dev.htod_copy(x_states.to_vec()).map_err(|e| format!("htod x_states: {e}"))?;
-    let d_off_lo = dev.htod_copy(off_lo.to_vec()).map_err(|e| format!("htod off_lo: {e}"))?;
-    let d_off_hi = dev.htod_copy(off_hi.to_vec()).map_err(|e| format!("htod off_hi: {e}"))?;
     let mut d_cols = dev
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
     let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
     let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
-    // K0 boundary-state buffer: n_shots * k * N_LIMBS (rep-start state per execution).
-    let n_exec = (n_shots as u64) * (k as u64);
-    let mut d_rep = dev
-        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
-        .map_err(|e| format!("alloc rep_states: {e}"))?;
+
+    // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
+    let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, &d_gates, k, n_gates, n_shots)?;
 
     let block = 256u32;
-    // K0: thread-per-shot — fill rep-boundary states.
-    let k0_cfg = LaunchConfig {
-        grid_dim: (n_shots.div_ceil(block), 1, 1),
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        dev.get_func("gate_sim_mod", "gate_sim_states")
-            .ok_or_else(|| "get_func gate_sim_states".to_string())?
-            .launch(k0_cfg, (&d_gates, &d_x, &mut d_rep, k, n_gates, n_shots))
-            .map_err(|e| format!("launch gate_sim_states: {e}"))?;
-    }
-    // K1: thread-per-execution — one thread per (shot, rep) = n_shots*k threads.
+    // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
+    launch_k0_states(&dev, &d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
+    // K1: thread-per-EXECUTION — one thread per (shot, rep) = n_shots*k threads. rep_states seeds the
+    // value chain, slot_meta gives the closed-form ts; d_x/d_qd/d_lo/d_hi are UNUSED (arg compat).
+    let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    // 8 device pointers + 4 scalars = 12 args (cudarc launch tuple cap).
+    // 8 device pointers + 4 scalars = 12 args (cudarc launch tuple cap). off_lo slot = rep_states,
+    // off_hi slot = slot_meta.
     unsafe {
         func.launch(
             cfg,
             (
-                &d_gates, &d_rep, &d_off_lo, &d_off_hi, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
+                &d_gates, &d_x, &d_rep, &d_slot, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
                 k, n_gates, n_shots, padded_rows as u64,
             ),
         )
@@ -468,17 +696,18 @@ pub fn gpu_gen_main_trace(
     Ok((cols, qd, lo, hi))
 }
 
-/// P3.1 soundness gate: assert the GPU K1 trace (real rows + lookup histograms) is BYTE-IDENTICAL
-/// to the CPU reference (`build_rows` + `cell_at` + `LookupCounts`). Run on a small fixture (k1-n4)
-/// via `GATE_AIR_GPU_TEST=1` (hooked in main). Compares the 191 main columns cell-by-cell over the
-/// real rows and the qdecode/rc_lo/rc_hi histograms; padding rows are handled separately (TODO).
+/// P3.1 soundness gate: assert the GPU K1 trace (real rows + rc multiplicity histogram) is
+/// BYTE-IDENTICAL to the CPU reference (`build_rows` + `cell_at` + `build_rc_table`). Run on a small
+/// fixture (k1-n4) via `GATE_AIR_GPU_TEST=k1` (hooked in main). Compares the 22 main columns
+/// cell-by-cell over the real rows AND the rc-table multiplicity histogram (2^RC_LOG_SIZE rows over
+/// `row_of(pos,limb)`) against `build_rc_table(&rows).multiplicity`; padding rows are all-zero.
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn k1_byte_identity(
     gates: &[crate::Gate],
     cases: &[crate::TestCase],
     k: usize,
     rc_lo: &crate::RcIndex,
-    rc_hi: &crate::RcIndex,
+    _rc_hi: &crate::RcIndex, // UNUSED (qubit-memory encoding dropped rc_hi); kept for call-site compat.
 ) -> Result<(), String> {
     let n_gates = gates.len();
     let n_shots = cases.len();
@@ -487,12 +716,15 @@ pub fn k1_byte_identity(
         .next_power_of_two()
         .max(1 << (crate::LOG_N_LANES + 2)); // matches main.rs
 
-    // CPU reference.
-    let (rows, counts) =
-        crate::build_rows(gates, cases, k, rc_lo, rc_hi).map_err(|e| e.to_string())?;
+    // CPU reference (qubit-memory `build_rows`: (rows, boundary)); boundary is a separate component
+    // not covered by K1, so it is ignored here. `build_rc_table` gives the CPU rc multiplicity
+    // histogram (one row per row_of(pos,limb)) that the K1 device histogram must match.
+    let (rows, _boundary) =
+        crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     if rows.len() != real_rows {
         return Err(format!("rows.len()={} != real_rows={}", rows.len(), real_rows));
     }
+    let cpu_rc = crate::build_rc_table(&rows);
 
     // Host-prep the flat GPU inputs (mirror state_to_limbs / the gate fields / RcIndex offsets).
     let mut gates_flat = Vec::with_capacity(n_gates * 4);
@@ -507,11 +739,12 @@ pub fn k1_byte_identity(
         let bytes = hex::decode(&c.x_hex).map_err(|e| format!("decode x_hex: {e}"))?;
         x_states.extend_from_slice(&crate::state_to_limbs(&bytes));
     }
+    // off_lo/off_hi are unused by the kernel now (arg-compat only); pass the RcIndex offsets.
     let off_lo: Vec<u32> = (0..crate::LIMB_BITS).map(|p| rc_lo.offset[p] as u32).collect();
-    let off_hi: Vec<u32> = (0..crate::LIMB_BITS).map(|p| rc_hi.offset[p] as u32).collect();
+    let off_hi = off_lo.clone();
 
-    // GPU.
-    let (cols, qd, lo, hi) = gpu_gen_main_trace(
+    // GPU. `hist` (2nd histogram return) is the rc multiplicity histogram; `qd`/`hi` are unused.
+    let (cols, _qd, hist, _hi) = gpu_gen_main_trace(
         &gates_flat,
         &x_states,
         &off_lo,
@@ -522,7 +755,7 @@ pub fn k1_byte_identity(
         padded_rows,
     )?;
 
-    // Compare the 191 main columns over the real rows.
+    // Compare the 22 main columns over the real rows.
     let mut mismatches = 0usize;
     let mut samples = Vec::new();
     for r in 0..real_rows {
@@ -538,35 +771,33 @@ pub fn k1_byte_identity(
         }
     }
 
-    // Compare lookup histograms.
-    let cmp = |name: &str, g: &[u32], c: &[u32]| -> Option<String> {
-        if g.len() < c.len() {
-            return Some(format!("{name}: gpu len {} < cpu len {}", g.len(), c.len()));
+    // Compare the rc multiplicity histogram (GPU device histogram vs CPU build_rc_table). The device
+    // histogram is indexed by row_of(pos,limb): lo block rows [0,2^RC_LO_BITS), hi block rows
+    // [2^RC_LO_BITS, 2^RC_LO_BITS+2^RC_HI_BITS) — exactly RcTable's flattened (pos,val) row order.
+    let mut hist_mismatches = 0usize;
+    for i in 0..cpu_rc.multiplicity.len() {
+        if hist[i] != cpu_rc.multiplicity[i] {
+            hist_mismatches += 1;
+            if samples.len() < 20 {
+                samples.push(format!("hist row {i}: gpu={} cpu={}", hist[i], cpu_rc.multiplicity[i]));
+            }
         }
-        (0..c.len())
-            .find(|&i| g[i] != c[i])
-            .map(|i| format!("{name}[{i}]: gpu={} cpu={}", g[i], c[i]))
-    };
-    let q_e = cmp("qdecode", &qd, &counts.qdecode);
-    let lo_e = cmp("rc_lo", &lo, &counts.rc_lo);
-    let hi_e = cmp("rc_hi", &hi, &counts.rc_hi);
+    }
 
     eprintln!(
-        "[K1 byte-identity] real_rows={real_rows} padded_rows={padded_rows} col_mismatches={mismatches}"
+        "[K1 byte-identity] real_rows={real_rows} padded_rows={padded_rows} \
+         col_mismatches={mismatches} hist_mismatches={hist_mismatches}"
     );
     for s in &samples {
         eprintln!("    {s}");
     }
-    for e in [&q_e, &lo_e, &hi_e].into_iter().flatten() {
-        eprintln!("    HIST {e}");
-    }
 
-    if mismatches == 0 && q_e.is_none() && lo_e.is_none() && hi_e.is_none() {
-        eprintln!("[K1 byte-identity] PASS — GPU trace == CPU trace (real rows + histograms)");
+    if mismatches == 0 && hist_mismatches == 0 {
+        eprintln!("[K1 byte-identity] PASS — GPU trace == CPU trace (22 main columns + rc histogram)");
         Ok(())
     } else {
         Err(format!(
-            "K1 byte-identity FAILED: {mismatches} column mismatches; hist q={q_e:?} lo={lo_e:?} hi={hi_e:?}"
+            "K1 byte-identity FAILED: {mismatches} column + {hist_mismatches} histogram mismatches"
         ))
     }
 }
@@ -575,16 +806,17 @@ pub fn k1_byte_identity(
 // P3.2 — K4: CUDA LogUp interaction trace (full on-device).
 // ============================================================================
 //
-// Generates gate_air's 24 interaction M31 columns (6 LogUp columns × 4 coords) +
-// claimed_sum on the GPU, byte-identical to the CPU `gen_main_interaction` /
-// `LogupTraceGenerator`. Consumes K1's main-trace columns (no re-simulation).
+// Generates gate_air's main-component interaction M31 columns (N_LOGUP_COLS=7 LogUp columns ×
+// 4 coords = 28) + claimed_sum on the GPU, byte-identical to the CPU `gen_main_interaction` /
+// `LogupTraceGenerator`. Consumes K1's main-trace columns (no re-simulation). The last LogUp column
+// (k = N_LOGUP_COLS-1 = 6) is the program SINGLETON batch and carries the cumsum_shift.
 //
-// Pipeline (per LogUp column k=0..5, sequential — col k accumulates onto col k-1):
-//   1. logup_col_gen[pair k]: per row, combine the two relation tuples -> (num, denom)
+// Pipeline (per LogUp column k=0..N_LOGUP_COLS, sequential — col k accumulates onto col k-1):
+//   1. logup_col_gen[batch k]: per row, combine the batch's relation tuple(s) -> (num, denom)
 //      where d = (Σ_i alpha^i · values[i]) − z   (QM31), num = m0·d1 + m1·d0, denom = d0·d1.
 //   2. logup_finalize_col: value = num · denom^{-1} (per-element QM31 inverse — byte-identical
 //      to the CPU batch inverse, since the field inverse is unique); running sum across columns.
-// Then once, on the last column (k=5):
+// Then once, on the last column (k = N_LOGUP_COLS-1 = 6):
 //   3. logup_cumsum_reduce  -> coordinate_sums = claimed_sum (Σ rows of last col, per coord).
 //   4. logup_cumsum_shift   -> subtract cumsum_shift = claimed_sum / 2^log_size.
 //   5. inclusive_prefix_sum (per coord): bit-reverse -> circle→coset -> scan -> coset→circle ->
@@ -595,7 +827,7 @@ pub fn k1_byte_identity(
 // (mul = (a.r·b.r − a.i·b.i, a.r·b.i + a.i·b.r)); QM31 = CM31[j]/(j^2 − (2+i)), R = (2,1).
 // (NB: obelyzk fft.rs uses a different u^2=2 convention — NOT used here.)
 //
-// SOUNDNESS: validated by `k4_byte_identity` (24 cols + claimed_sum) vs the CPU reference
+// SOUNDNESS: validated by `k4_byte_identity` (28 cols + claimed_sum) vs the CPU reference
 // using a FIXED `GateRel::dummy()` (z,alpha) before it is trusted.
 //
 // OCCUPANCY: K4 is ALREADY thread-per-EXECUTION-instance — every per-row kernel here
@@ -608,12 +840,17 @@ pub fn k1_byte_identity(
 // fully occupied.) The K4 column writes are coordinate-major (4 coords × padded_rows); each thread
 // writes its row's 4 coords at stride padded_rows, the same layout K1 uses.
 
-/// Number of LogUp columns (pairs) gate_air emits. Each is a SecureColumnByCoords (4 M31).
-pub const N_LOGUP_COLS: usize = 6;
-/// Number of M31 interaction columns committed = 6 × 4.
+/// Number of LogUp columns (batches) gate_air's main component emits. The pc-pinned ts + rc-table
+/// range-check encoding emits 13 relation entries — 3 qubitmem pairs (target/ctrl_a/ctrl_b Use+Yield),
+/// 3 rc-limb pairs (target/ctrl_a/ctrl_b lo+hi), and 1 program singleton — folded by
+/// `finalize_logup_in_pairs` into 7 batches (6 pairs + 1 singleton tail). Each batch is a
+/// SecureColumnByCoords (4 M31). Order MUST match `gen_main_interaction` (main.rs) exactly.
+pub const N_LOGUP_COLS: usize = 7;
+/// Number of M31 interaction columns committed = 7 × 4 = 28.
 pub const N_INTERACTION_COLS: usize = N_LOGUP_COLS * 4;
-/// GateRel width (= `relation!(GateRel, 35)`): number of alpha powers uploaded.
-pub const GATE_REL_WIDTH: usize = 35;
+/// GateRel width (= `relation!(GateRel, 6)`): number of alpha powers uploaded (widest tuple =
+/// program = tag + 5 payload = 6).
+pub const GATE_REL_WIDTH: usize = 6;
 
 /// NVRTC source: M31/CM31/QM31 device arithmetic + the K4 interaction kernels.
 pub const INTERACTION_KERNEL: &str = r#"
@@ -703,8 +940,23 @@ __device__ __forceinline__ qm31 logup_combine(
     return qm31_sub(acc, z);
 }
 
-// K4a: per-row (num, denom) for one of the 6 pairs. Reads K1's main-trace columns
-// (column-major in `cols`). Outputs interleaved per row: num[row*4+j], denom[row*4+j].
+// K4a: per-row (num, denom) for one of the 7 batches (3 qubitmem pairs + 3 rc-limb pairs + 1 program
+// singleton). Reads K1's 22 main-trace columns (column-major in `cols`). Outputs interleaved per row:
+// num[row*4+j], denom[row*4+j].
+//
+// Column layout (cell_at, 22 cols, ACCESS_BLOCK=5): 0..4 opcode one-hots;
+//   target addr=4,prev_ts=5,v=6,rc_lo=7,rc_hi=8;
+//   ctrl_a addr=9,prev_ts=10,v=11,rc_lo=12,rc_hi=13;
+//   ctrl_b addr=14,prev_ts=15,v=16,rc_lo=17,rc_hi=18; ab=19,fire=20,delta=21.
+// ts (= pc+1) and the target's v_after (= v_before+delta) are INLINED here (recomputed from pc / the
+// v+delta columns), NOT read as columns.
+// Relation tags: QUBITMEM=1, RC=2, PROGRAM=5; rc pos: RC_POS_LO=0, RC_POS_HI=1. Widths: qubitmem
+// tuple=5, rc tuple=3, program tuple=6 (rel width = GATE_REL_WIDTH = 6). Batch order MUST match
+// gen_main_interaction / circuit_statement EXACTLY:
+//   case 0..2 : 3 qubitmem pairs   (target / ctrl_a / ctrl_b : Use[+active] / Yield[-active])
+//   case 3..5 : 3 rc-limb pairs    (target / ctrl_a / ctrl_b : lo[+active] / hi[+active])
+//   case 6    : program SINGLETON  (+enabler)
+// A batch is a SINGLETON when n1 == 0 (only v0/m0 contribute: num = m0, den = d0); else a pair.
 extern "C" __global__ void logup_col_gen(
     const unsigned* __restrict__ cols,
     unsigned long padded_rows,
@@ -722,61 +974,73 @@ extern "C" __global__ void logup_col_gen(
     unsigned long shot_stride = dims[1];
     #define COL(c) cols[(unsigned long)(c) * padded_rows + row]
 
-    unsigned v0[35]; int n0 = 0;
-    unsigned v1[35]; int n1 = 0;
+    unsigned v0[6]; int n0 = 0;
+    unsigned v1[6]; int n1 = 0;
     unsigned m0 = 0u, m1 = 0u; int s0 = 1, s1 = 1;
 
-    // enabler / shot_id / pc moved to the preprocessed tree (tree0). They are POSITIONAL, so K4
-    // recomputes them from `row` — identical values to the old in-trace columns (enabler = real-row
-    // indicator, shot_id = row / shot_stride, pc = row % shot_stride). All-column indices below
-    // shifted down by 3 (header is now just the 4 opcode one-hots at COL 0..3).
+    // enabler / shot_id / pc are tree0 (POSITIONAL). K4 recomputes them from `row` — identical
+    // values to the preprocessed columns (enabler = real-row indicator, shot_id = row / shot_stride,
+    // pc = row % shot_stride). pc feeds only the program term's pc_in_prog = pc % n_gates.
     unsigned enabler  = (row < real_rows) ? 1u : 0u;
     unsigned shot_id  = (row < real_rows) ? (unsigned)(row / shot_stride) : 0u;
     unsigned pc       = (row < real_rows) ? (unsigned)(row % shot_stride) : 0u;
     unsigned a_active = m31_add(COL(2), COL(3));   // is_cnot + is_toffoli
     unsigned b_active = COL(3);                     // is_toffoli
+    // ts = pc + 1 (INLINED, shared by all accesses of the step; not a column).
+    unsigned ts = m31_add(pc, 1u);
+    // v_after = v_before + delta = t.v(col6) + delta(col21) (INLINED target write value; not a column).
+    unsigned v_after = m31_add(COL(6), COL(21));
 
     switch (pair_id) {
-    case 0: // state_in (+enabler), state_out (-enabler)
-        v0[0]=1u; v0[1]=shot_id; v0[2]=pc;
-        for (int i=0;i<32;i++) v0[3+i]=COL(4+i);
-        n0=35;
-        v1[0]=1u; v1[1]=shot_id; v1[2]=pc+1u;
-        for (int i=0;i<32;i++) v1[3+i]=COL(36+i);
-        n1=35;
+    case 0: // qubitmem target Use (+enabler): [1, shot, t.addr, t.prev_ts, t.v_before]
+            //          target Yield (-enabler): [1, shot, t.addr, ts=pc+1,  v_after]
+        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(4); v0[3]=COL(5); v0[4]=COL(6); n0=5;   // t.addr,t.prev_ts,t.v
+        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(4); v1[3]=ts;     v1[4]=v_after; n1=5;   // ts=pc+1, v_after=v+delta
         m0=enabler; s0=1; m1=enabler; s1=-1; break;
-    case 1: // qdecode target (+enabler), qdecode ctrl_a (+a_active)
-        v0[0]=2u; v0[1]=COL(68);  v0[2]=COL(69);  v0[3]=COL(70);  v0[4]=COL(71);  n0=5;
-        v1[0]=2u; v1[1]=COL(107); v1[2]=COL(108); v1[3]=COL(109); v1[4]=COL(110); n1=5;
-        m0=enabler; m1=a_active; break;
-    case 2: // qdecode ctrl_b (+b_active), rc_lo target (+enabler)
-        v0[0]=2u; v0[1]=COL(146); v0[2]=COL(147); v0[3]=COL(148); v0[4]=COL(149); n0=5;
-        v1[0]=3u; v1[1]=COL(70);  v1[2]=COL(104); n1=3;
-        m0=b_active; m1=enabler; break;
-    case 3: // rc_hi target (+enabler), rc_lo ctrl_a (+a_active)
-        v0[0]=4u; v0[1]=COL(70);  v0[2]=COL(105); n0=3;
-        v1[0]=3u; v1[1]=COL(109); v1[2]=COL(143); n1=3;
-        m0=enabler; m1=a_active; break;
-    case 4: // rc_hi ctrl_a (+a_active), rc_lo ctrl_b (+b_active)
-        v0[0]=4u; v0[1]=COL(109); v0[2]=COL(144); n0=3;
-        v1[0]=3u; v1[1]=COL(148); v1[2]=COL(182); n1=3;
-        m0=a_active; m1=b_active; break;
-    case 5: // rc_hi ctrl_b (+b_active), program (+enabler)
-        v0[0]=4u; v0[1]=COL(148); v0[2]=COL(183); n0=3;
-        v1[0]=5u; v1[1]=(unsigned)((unsigned long)pc % (unsigned long)n_gates);
-        v1[2]=m31_add(m31_add(COL(1), m31_mul(2u,COL(2))), m31_mul(3u,COL(3))); // opcode_scalar
-        v1[3]=COL(68); v1[4]=COL(107); v1[5]=COL(146); n1=6;
-        m0=b_active; m1=enabler; break;
+    case 1: // qubitmem ctrl_a Use (+a_active): [1, shot, a.addr, a.prev_ts, a.v]
+            //          ctrl_a Yield (-a_active): [1, shot, a.addr, ts=pc+1,  a.v]  (read propagates)
+        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(9); v0[3]=COL(10); v0[4]=COL(11); n0=5; // a.addr,a.prev_ts,a.v
+        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(9); v1[3]=ts;      v1[4]=COL(11); n1=5;
+        m0=a_active; s0=1; m1=a_active; s1=-1; break;
+    case 2: // qubitmem ctrl_b Use (+b_active): [1, shot, b.addr, b.prev_ts, b.v]
+            //          ctrl_b Yield (-b_active): [1, shot, b.addr, ts=pc+1,  b.v]
+        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(14); v0[3]=COL(15); v0[4]=COL(16); n0=5; // b.addr,b.prev_ts,b.v
+        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(14); v1[3]=ts;      v1[4]=COL(16); n1=5;
+        m0=b_active; s0=1; m1=b_active; s1=-1; break;
+    case 3: // rc target: lo (+enabler): [2, 0, t.rc_lo] / hi (+enabler): [2, 1, t.rc_hi]
+        v0[0]=2u; v0[1]=0u; v0[2]=COL(7);  n0=3;                                   // t.rc_lo=col7
+        v1[0]=2u; v1[1]=1u; v1[2]=COL(8);  n1=3;                                   // t.rc_hi=col8
+        m0=enabler; s0=1; m1=enabler; s1=1; break;
+    case 4: // rc ctrl_a: lo (+a_active): [2, 0, a.rc_lo] / hi (+a_active): [2, 1, a.rc_hi]
+        v0[0]=2u; v0[1]=0u; v0[2]=COL(12); n0=3;                                   // a.rc_lo=col12
+        v1[0]=2u; v1[1]=1u; v1[2]=COL(13); n1=3;                                   // a.rc_hi=col13
+        m0=a_active; s0=1; m1=a_active; s1=1; break;
+    case 5: // rc ctrl_b: lo (+b_active): [2, 0, b.rc_lo] / hi (+b_active): [2, 1, b.rc_hi]
+        v0[0]=2u; v0[1]=0u; v0[2]=COL(17); n0=3;                                   // b.rc_lo=col17
+        v1[0]=2u; v1[1]=1u; v1[2]=COL(18); n1=3;                                   // b.rc_hi=col18
+        m0=b_active; s0=1; m1=b_active; s1=1; break;
+    case 6: // program SINGLETON (+enabler): [5, pc%n_gates, opcode_scalar, t.addr, a.addr, b.addr]
+        v0[0]=5u; v0[1]=(unsigned)((unsigned long)pc % (unsigned long)n_gates);
+        v0[2]=m31_add(m31_add(COL(1), m31_mul(2u,COL(2))), m31_mul(3u,COL(3))); // opcode_scalar
+        v0[3]=COL(4); v0[4]=COL(9); v0[5]=COL(14); n0=6;                        // t/a/b addr
+        m0=enabler; s0=1; n1=0; break;                                             // n1=0 => singleton
     }
 
+    // SINGLETON (n1 == 0): num = m0, den = d0. PAIR: num = m0*d1 + m1*d0, den = d0*d1.
     qm31 d0 = logup_combine(v0, n0, z0,z1,z2,z3, ap);
-    qm31 d1 = logup_combine(v1, n1, z0,z1,z2,z3, ap);
     unsigned mm0 = (s0 < 0) ? m31_neg(m0) : m0;
-    unsigned mm1 = (s1 < 0) ? m31_neg(m1) : m1;
     qm31 qm0 = { {mm0,0u}, {0u,0u} };
-    qm31 qm1 = { {mm1,0u}, {0u,0u} };
-    qm31 nume = qm31_add(qm31_mul(qm0, d1), qm31_mul(qm1, d0));
-    qm31 den  = qm31_mul(d0, d1);
+    qm31 nume, den;
+    if (n1 == 0) {
+        nume = qm0;
+        den  = d0;
+    } else {
+        qm31 d1 = logup_combine(v1, n1, z0,z1,z2,z3, ap);
+        unsigned mm1 = (s1 < 0) ? m31_neg(m1) : m1;
+        qm31 qm1 = { {mm1,0u}, {0u,0u} };
+        nume = qm31_add(qm31_mul(qm0, d1), qm31_mul(qm1, d0));
+        den  = qm31_mul(d0, d1);
+    }
 
     num[row*4+0]=nume.a.a; num[row*4+1]=nume.a.b; num[row*4+2]=nume.b.a; num[row*4+3]=nume.b.b;
     denom[row*4+0]=den.a.a; denom[row*4+1]=den.a.b; denom[row*4+2]=den.b.a; denom[row*4+3]=den.b.b;
@@ -784,7 +1048,7 @@ extern "C" __global__ void logup_col_gen(
 }
 
 // K4b: value = num · denom^{-1}; running sum onto previous logup column.
-// `inter` holds the 24 interaction columns, column-major (logup col k coord j = (k*4+j)).
+// `inter` holds the N_INTERACTION_COLS (28) interaction columns, column-major (logup col k coord j = (k*4+j)).
 extern "C" __global__ void logup_finalize_col(
     unsigned rep_index,
     unsigned long padded_rows,
@@ -932,7 +1196,7 @@ extern "C" __global__ void ps_add_offsets(unsigned* out, const unsigned* scanned
 }
 "#;
 
-/// Run the full K4 interaction pipeline on the GPU and copy the 24 interaction columns +
+/// Run the full K4 interaction pipeline on the GPU and copy the N_INTERACTION_COLS (16) interaction columns +
 /// claimed_sum back to the host. Inputs: the host-side main trace `cols` (column-major,
 /// TRACE_COLUMNS × padded_rows), the drawn `z` and `alpha_powers` (each QM31 → 4 M31, length
 /// GATE_REL_WIDTH), and dims. Returns (interaction_cols [N_INTERACTION_COLS × padded_rows,
@@ -1153,7 +1417,7 @@ where
     Ok(())
 }
 
-/// P3.2 soundness gate: assert the GPU K4 interaction trace (24 M31 columns + claimed_sum) is
+/// P3.2 soundness gate: assert the GPU K4 interaction trace (N_INTERACTION_COLS=28 M31 columns + claimed_sum) is
 /// byte-identical to the CPU `gen_main_interaction` / `LogupTraceGenerator`, using a FIXED
 /// `GateRel::dummy()` (z, alpha) so both sides see the same challenges. Run via
 /// `GATE_AIR_GPU_TEST=k4` on a small fixture (k1-n4).
@@ -1162,8 +1426,8 @@ pub fn k4_byte_identity(
     gates: &[crate::Gate],
     cases: &[crate::TestCase],
     k: usize,
-    rc_lo: &crate::RcIndex,
-    rc_hi: &crate::RcIndex,
+    _rc_lo: &crate::RcIndex, // UNUSED (arg-compat); rc limbs come from the K1 main trace columns.
+    _rc_hi: &crate::RcIndex, // UNUSED (qubit-memory encoding); kept for call-site compat.
 ) -> Result<(), String> {
     use stwo::prover::backend::Column;
 
@@ -1176,8 +1440,8 @@ pub fn k4_byte_identity(
     let log_n_rows = padded_rows.ilog2();
 
     // CPU reference: build rows + fixed dummy elements + gen_main_interaction.
-    let (rows, _counts) =
-        crate::build_rows(gates, cases, k, rc_lo, rc_hi).map_err(|e| e.to_string())?;
+    let (rows, _boundary) =
+        crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     let elements = crate::LookupElements::dummy();
     let (cpu_cols, cpu_sum) =
         crate::gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
@@ -1195,8 +1459,8 @@ pub fn k4_byte_identity(
         let bytes = hex::decode(&c.x_hex).map_err(|e| format!("decode x_hex: {e}"))?;
         x_states.extend_from_slice(&crate::state_to_limbs(&bytes));
     }
-    let off_lo: Vec<u32> = (0..crate::LIMB_BITS).map(|p| rc_lo.offset[p] as u32).collect();
-    let off_hi: Vec<u32> = (0..crate::LIMB_BITS).map(|p| rc_hi.offset[p] as u32).collect();
+    let off_lo: Vec<u32> = (0..crate::LIMB_BITS).map(|p| _rc_lo.offset[p] as u32).collect();
+    let off_hi = off_lo.clone(); // unused by the kernel; passed for arg-list compat.
     let (main_cols, _qd, _lo, _hi) = gpu_gen_main_trace(
         &gates_flat, &x_states, &off_lo, &off_hi,
         k as u32, n_gates as u32, n_shots as u32, padded_rows,
@@ -1207,7 +1471,7 @@ pub fn k4_byte_identity(
     // challenges (dummy here, real-drawn in P3.4): combine(values) = Σ α^i·v[i] − z, so
     //   combine([0])      = −z                  → z      = −combine([0])
     //   combine(unit_i)   = α^i − z             → α^i    = combine(unit_i) + z
-    let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.state);
+    let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.qubitmem);
     let z = secure_to_m31x4(z_qm);
     let alpha_powers: Vec<[u32; 4]> =
         alpha_powers_qm.iter().map(|p| secure_to_m31x4(*p)).collect();
@@ -1222,7 +1486,7 @@ pub fn k4_byte_identity(
         (k * n_gates) as u64,
     )?;
 
-    // Compare the 24 interaction columns over ALL padded rows (prefix sum spans them).
+    // Compare the N_INTERACTION_COLS (16) interaction columns over ALL padded rows (prefix sum spans them).
     let mut mismatches = 0usize;
     let mut samples: Vec<String> = Vec::new();
     for c in 0..N_INTERACTION_COLS {
@@ -1250,7 +1514,7 @@ pub fn k4_byte_identity(
     }
 
     if mismatches == 0 && sum_ok {
-        eprintln!("[K4 byte-identity] PASS — GPU interaction == CPU interaction (24 cols + claimed_sum)");
+        eprintln!("[K4 byte-identity] PASS — GPU interaction == CPU interaction (28 cols + claimed_sum)");
         Ok(())
     } else {
         Err(format!(
@@ -1399,13 +1663,13 @@ fn borrowed_column(
     CircleEvaluation::<_, _, BitReversedOrder>::new(domain, view)
 }
 
-/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 191 main
+/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 22 main
 /// columns as `CircleEvaluation<CudaBackend>` (device-resident, no host upload),
 /// plus the qdecode/rc_lo/rc_hi histograms copied to the host (tiny; the
 /// multiplicity columns are still built + uploaded on the CPU path in main.rs),
 /// plus the raw column-major main-trace device buffer `d_cols` so the interaction
 /// path (K4) can REUSE it instead of re-running K0/K1 (no re-simulation, no
-/// re-upload). The 191 returned `CircleEvaluation`s are independent D2D copies of
+/// re-upload). The 22 returned `CircleEvaluation`s are independent D2D copies of
 /// `d_cols`'s columns (see `d2d_column`), so handing `d_cols` back to the caller
 /// does not alias or mutate them.
 ///
@@ -1553,25 +1817,17 @@ pub fn gpu_gen_main_trace_device_d(
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
     let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
     let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
-    let n_exec = (n_shots as u64) * (k as u64);
-    let mut d_rep = dev
-        .alloc_zeros::<u32>((n_exec as usize) * crate::N_LIMBS)
-        .map_err(|e| format!("alloc rep_states: {e}"))?;
+    let _ = (d_off_lo, d_off_hi); // RcIndex offsets unused (arg slots repurposed for rep_states/slot_meta).
+
+    // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
+    let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, d_gates, k, n_gates, n_shots)?;
 
     let block = 256u32;
-    // K0: thread-per-shot — fill rep-boundary states (cheap, state-only chain).
-    let k0_cfg = LaunchConfig {
-        grid_dim: (n_shots.div_ceil(block), 1, 1),
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        dev.get_func("gate_sim_mod", "gate_sim_states")
-            .ok_or_else(|| "get_func gate_sim_states".to_string())?
-            .launch(k0_cfg, (d_gates, &d_x, &mut d_rep, k, n_gates, n_shots))
-            .map_err(|e| format!("launch gate_sim_states: {e}"))?;
-    }
-    // K1: thread-per-execution — n_shots*k threads.
+    // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
+    launch_k0_states(&dev, d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
+    // K1: thread-per-EXECUTION — one thread per (shot, rep). rep_states (off_lo slot) seeds the value
+    // chain; slot_meta (off_hi slot) gives the closed-form ts. d_x/d_qd/d_lo/d_hi are UNUSED (compat).
+    let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
@@ -1582,7 +1838,7 @@ pub fn gpu_gen_main_trace_device_d(
         func.launch(
             cfg,
             (
-                d_gates, &d_rep, d_off_lo, d_off_hi, &mut *d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
+                d_gates, &d_x, &d_rep, &d_slot, &mut *d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
                 k, n_gates, n_shots, padded_rows as u64,
             ),
         )
@@ -1610,11 +1866,11 @@ pub fn gpu_gen_main_trace_device_d(
     }
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
-    // Device handoff: build the 188 CudaBackend columns from `d_cols` (column-major; column c at
+    // Device handoff: build the 22 CudaBackend columns from `d_cols` (column-major; column c at
     // element offset c*padded_rows). No host copy.
     //
     // Fix (b) (`GATE_AIR_FUSED_INTERP`): when set, build BORROWED views into `d_cols` (zero extra
-    // device memory) instead of 188 D2D copies. This drops the second full main-trace resident copy
+    // device memory) instead of 26 D2D copies. This drops the second full main-trace resident copy
     // so a 2^25 base proof fits a 40 GB A100. The views hold UN-interpolated base-domain evals; the
     // CudaBackend commit's fused per-column-interpolate path (poly.rs) interpolates each into a
     // reused temp (never touching `d_cols`), so K4's reuse of `d_cols` stays correct. When unset,
@@ -1857,7 +2113,7 @@ pub fn gpu_gen_interaction_device(
     assert!(padded_rows.is_power_of_two(), "padded_rows must be 2^k");
 
     // Recover the real drawn (z, alpha_powers) from the relation's public combine.
-    let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.state);
+    let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.qubitmem);
     let z = secure_to_m31x4(z_qm);
     let alpha_powers: Vec<[u32; 4]> =
         alpha_powers_qm.iter().map(|p| secure_to_m31x4(*p)).collect();
@@ -2015,7 +2271,7 @@ pub fn gpu_gen_interaction_device(
         let _ = view.leak();
     }
 
-    // Device-to-device handoff: 24 interaction columns straight to CudaBackend.
+    // Device-to-device handoff: 28 interaction columns straight to CudaBackend.
     let domain = CanonicCoset::new(log_n_rows).circle_domain();
     let cols: Vec<_> = (0..N_INTERACTION_COLS)
         .map(|c| d2d_column(&d_inter, c * padded_rows, padded_rows, domain))

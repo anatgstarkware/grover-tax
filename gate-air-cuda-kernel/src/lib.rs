@@ -10,8 +10,9 @@
 //! path to the audited CPU delegate — no host constraint-eval math is touched.
 //!
 //! # Soundness status (READ THIS)
-//! The CUDA kernel is BOX-UNVALIDATED (cannot compile without nvcc). Its algebraic core (151
-//! constraints) is transcribed line-for-line from `GateEval::evaluate`; the LogUp pair-batch part
+//! The CUDA kernel is BOX-UNVALIDATED (cannot compile without nvcc). Its algebraic core (19
+//! constraints, qubit-memory + pc-pinned ts + rc-table encoding) is transcribed line-for-line from
+//! `GateEval::evaluate`; the LogUp pair-batch part
 //! is the Phase-2 soundness gate. The kernel only ever runs behind the explicit `CUDA_GPU_CONSTRAINTS=1`
 //! opt-in, and falls back to the host delegate (returns `false`) if the drawn relation is not
 //! installed via [`set_gate_air_relation`].
@@ -68,11 +69,17 @@ extern "C" {
 }
 
 /// gate_air structural constants (must equal the Rust constants in gate-air-leaf src/main.rs).
-const GATE_AIR_TRACE_COLUMNS: usize = 188; // main columns (trace1); witness-shrink moved enabler/shot_id/pc to tree0
-const GATE_AIR_INTERACTION_COLUMNS: usize = 24; // 6 LogUp cols * 4 QM31 coords (trace2)
+/// QUBIT-MEMORY + pc-pinned ts + rc-table encoding (branch anatg/gate-air-qubit-mem): the whole-state
+/// 188-col TAG_STATE encoding is replaced by the 22-col per-qubit chain-lookup qubit-memory with the
+/// ts-ordering rc-table range-check (ACCESS_BLOCK = 5 = addr,prev_ts,v,rc_lo,rc_hi; ts=pc+1 inlined).
+/// These MUST match the actual component's shape — `is_gate_air_main` uses them to decide whether the
+/// GPU kernel applies, so a stale value silently FALLS BACK to the host delegate (no fail-fast).
+const GATE_AIR_TRACE_COLUMNS: usize = 22; // main cols (trace1): 4 opcode + 3*ACCESS_BLOCK(5) + 3 (ts=pc+1 and v_after=v_before+delta inlined)
+const GATE_AIR_INTERACTION_COLUMNS: usize = 28; // 7 LogUp cols * 4 QM31 coords (trace2)
 const GATE_AIR_PREPROCESSED_COLUMNS: usize = 4; // enabler, shot_id, pc, pc_in_prog (trace0), in get_preprocessed_column call order
-const GATE_AIR_N_CONSTRAINTS: usize = 151 + 6; // 151 algebraic + 6 LogUp pair-batch constraints
-const GATE_AIR_LOGUP_COUNTS: u32 = 12; // 12 relation entries -> 6 pairs
+const GATE_AIR_N_CONSTRAINTS: usize = 15 + 7; // 15 algebraic (19 -3 PIN -1 v_after eq) + 7 LogUp pair-batch constraints
+const GATE_AIR_LOGUP_COUNTS: u32 = 13; // 13 relation entries -> 6 pairs + 1 singleton = 7 batches
+const GATE_AIR_REL_WIDTH: usize = 6; // relation!(GateRel, 6): tag + widest payload (program = 5)
 
 /// `fnv1a("gate_air_main")` — kept for parity with the eval struct's first field (`CommonEval`).
 const fn fnv1a(s: &[u8]) -> u32 {
@@ -106,19 +113,23 @@ fn is_gate_air_main(
 
 /// The `GateAirEval` struct passed through the FFI `void *eval` arg. Layout MUST match the CUDA
 /// `struct GateAirEval` (evaluate_gate_air.cuh): `{ unsigned eval_id; unsigned log_n_rows;
-/// LookupElementsBasic<35> relation; }` where `LookupElementsBasic<35>` is
-/// `{ qm31 z; qm31 alpha; qm31 alpha_powers[35]; }`. All `qm31` are 4xu32.
+/// LookupElementsBasic<6> relation; }` where `LookupElementsBasic<6>` is
+/// `{ qm31 z; qm31 alpha; qm31 alpha_powers[6]; }`. All `qm31` are 4xu32.
 #[repr(C)]
 struct GateAirEvalFfi {
     eval_id: u32,
     log_n_rows: u32,
     z: [u32; 4],
     alpha: [u32; 4],
-    alpha_powers: [[u32; 4]; 35],
+    alpha_powers: [[u32; 4]; GATE_AIR_REL_WIDTH],
 }
 
 impl GateAirEvalFfi {
-    fn new_with_relation(log_n_rows: u32, z: [u32; 4], alpha_powers: [[u32; 4]; 35]) -> Self {
+    fn new_with_relation(
+        log_n_rows: u32,
+        z: [u32; 4],
+        alpha_powers: [[u32; 4]; GATE_AIR_REL_WIDTH],
+    ) -> Self {
         Self {
             eval_id: GATE_AIR_EVAL_ID,
             log_n_rows,
@@ -131,23 +142,24 @@ impl GateAirEvalFfi {
     }
 }
 
-/// gate_air's drawn LogUp challenges (z, alpha_powers[0..35]), each an M31x4 (QM31 coord) value.
+/// gate_air's drawn LogUp challenges (z, alpha_powers[0..6]), each an M31x4 (QM31 coord) value.
 /// Set by the leaf prover AFTER drawing the LogUp relation and BEFORE `prove_ex` — the challenges
 /// live inside the opaque `GateEval`, so this gate_air-specific hook threads them to the kernel.
 /// `None` until set → [`run_gate_air_kernel`] returns `false` (host-delegate fallback).
-static GATE_AIR_RELATION: Mutex<Option<([u32; 4], [[u32; 4]; 35])>> = Mutex::new(None);
+static GATE_AIR_RELATION: Mutex<Option<([u32; 4], [[u32; 4]; GATE_AIR_REL_WIDTH])>> =
+    Mutex::new(None);
 
 /// Install gate_air's drawn LogUp relation challenges for the GPU constraint kernel. `alpha_powers`
-/// must contain 35 entries (alpha^0..alpha^34), each as M31x4 coords. No effect unless the kernel
-/// gate (`CUDA_GPU_CONSTRAINTS=1` + gate_air main) fires.
+/// must contain GATE_AIR_REL_WIDTH (6) entries (alpha^0..alpha^5), each as M31x4 coords. No effect
+/// unless the kernel gate (`CUDA_GPU_CONSTRAINTS=1` + gate_air main) fires.
 pub fn set_gate_air_relation(z: [u32; 4], alpha_powers: Vec<[u32; 4]>) {
     assert_eq!(
         alpha_powers.len(),
-        35,
-        "gate_air relation needs 35 alpha powers"
+        GATE_AIR_REL_WIDTH,
+        "gate_air relation needs {GATE_AIR_REL_WIDTH} alpha powers"
     );
-    let mut ap = [[0u32; 4]; 35];
-    ap.copy_from_slice(&alpha_powers[..35]);
+    let mut ap = [[0u32; 4]; GATE_AIR_REL_WIDTH];
+    ap.copy_from_slice(&alpha_powers[..GATE_AIR_REL_WIDTH]);
     *GATE_AIR_RELATION.lock().unwrap() = Some((z, ap));
 }
 
