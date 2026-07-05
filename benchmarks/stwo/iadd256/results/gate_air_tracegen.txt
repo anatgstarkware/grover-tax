@@ -1,0 +1,72 @@
+=== gate_air trace_gen-at-scale re-measure Sun 21 Jun 2026 20:37:46 UTC ===
+Starting instance(s) stwo-development-server...
+.................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.45.99.226
+ssh up Sun 21 Jun 2026 20:38:56 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sun 21 Jun 2026 20:39:06 UTC
+=== build Sun 21 Jun 2026 20:39:06 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+    Finished `release` profile [optimized] target(s) in 1.42s
+=== trace_gen+prove at full shot parallelism (k1-n9024) Sun 21 Jun 2026 20:39:16 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":2256,"repetitions":1,"n_gates":2547,"real_rows":5746032,"padded_rows":8388608,"log_rows":23,"trace_columns":191,"proved":true,"trace_gen_s":7.526,"prove_s":2.074,"verify_s":0.028}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":4512,"repetitions":1,"n_gates":2547,"real_rows":11492064,"padded_rows":16777216,"log_rows":24,"trace_columns":191,"proved":true,"trace_gen_s":14.977,"prove_s":4.036,"verify_s":0.029}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":9024,"repetitions":1,"n_gates":2547,"real_rows":22984128,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":29.053,"prove_s":7.995,"verify_s":0.039}
+--- k10 (reps=10) at ~2^25, 1316 shots ---
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":1316,"repetitions":10,"n_gates":2547,"real_rows":33518520,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":33.801,"prove_s":8.018,"verify_s":0.024}
+=== base concurrency (fixed timing): 1x/2x/3x concurrent 2^24 (k1 s=4512) Sun 21 Jun 2026 20:41:24 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+CONCURRENCY K=1 wall=23s for 1 x 2^24 proves (=> per-prove 23s, throughput x1)
+CONCURRENCY K=2 wall=28s for 2 x 2^24 proves (=> per-prove 28s, throughput x2)
+CONCURRENCY K=3 wall=34s for 3 x 2^24 proves (=> per-prove 34s, throughput x3)
+=== stopping VM Sun 21 Jun 2026 20:42:53 UTC ===
+Stopping instance(s) stwo-development-server...
+.......................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 20:43:54 UTC ===

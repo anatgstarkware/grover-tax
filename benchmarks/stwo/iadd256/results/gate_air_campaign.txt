@@ -1,0 +1,121 @@
+=== gate_air single-machine campaign Sun 21 Jun 2026 20:22:29 UTC ===
+Starting instance(s) stwo-development-server...
+........................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 35.184.202.85
+ssh up Sun 21 Jun 2026 20:23:42 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+96
+               total        used        free      shared  buff/cache   available
+Mem:             732           4         730           0           0         727
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sun 21 Jun 2026 20:24:01 UTC
+=== build Sun 21 Jun 2026 20:24:01 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+    Finished `release` profile [optimized] target(s) in 1.43s
+=== (A) base throughput sweep (single all-core prove) Sun 21 Jun 2026 20:24:11 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":1,"repetitions":1000,"n_gates":2547,"real_rows":2547000,"padded_rows":4194304,"log_rows":22,"trace_columns":191,"proved":true,"trace_gen_s":3.610,"prove_s":0.998,"verify_s":0.016}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":2,"repetitions":1000,"n_gates":2547,"real_rows":5094000,"padded_rows":8388608,"log_rows":23,"trace_columns":191,"proved":true,"trace_gen_s":7.674,"prove_s":2.068,"verify_s":0.019}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":4,"repetitions":1000,"n_gates":2547,"real_rows":10188000,"padded_rows":16777216,"log_rows":24,"trace_columns":191,"proved":true,"trace_gen_s":17.177,"prove_s":4.064,"verify_s":0.023}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":27.449,"prove_s":7.970,"verify_s":0.022}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":16,"repetitions":1000,"n_gates":2547,"real_rows":40752000,"padded_rows":67108864,"log_rows":26,"trace_columns":191,"proved":true,"trace_gen_s":64.863,"prove_s":16.150,"verify_s":0.022}
+=== (B) memory ceiling: samples=32 (2^27) Sun 21 Jun 2026 20:27:10 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":32,"repetitions":1000,"n_gates":2547,"real_rows":81504000,"padded_rows":134217728,"log_rows":27,"trace_columns":191,"proved":true,"trace_gen_s":156.987,"prove_s":33.460,"verify_s":0.022}
+EXIT=0
+gate-air: shots simulated and self-checked (final state == y) in 21.829s
+gate-air: trace generation (full witness build) in 156.987s
+=== (C) base concurrency: 1x vs 2x vs 3x concurrent samples=4 (2^24) Sun 21 Jun 2026 20:30:27 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+CONCURRENCY K=1 wall=s for 1 x 2^24 proves
+bash: line 8: bc: command not found
+CONCURRENCY K=2 wall=s for 2 x 2^24 proves
+bash: line 8: bc: command not found
+bash: line 8: bc: command not found
+CONCURRENCY K=3 wall=s for 3 x 2^24 proves
+=== (D) recursion at scale: GATE_AIR_FOLD=4, samples=8 (2^25 shard) Sun 21 Jun 2026 20:31:55 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=8 K=1000 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 5.719s
+gate-air: trace generation (full witness build) in 28.390s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.5s (target qm31_ops=1048576)
+gate-air: proving 4 leaves ...
+thread '<unnamed>' (4938) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+assertion `left == right` failed
+thread '<unnamed>' (4986) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+assertion `left == right` failed
+thread 'main' (4839) panicked at /home/anatg_starkware_co/workspace/proving-utils/crates/recursive_aggregate/src/lib.rs:184:40:
+pool job panicked: Any { .. }
+=== stopping VM Sun 21 Jun 2026 20:32:41 UTC ===
+Stopping instance(s) stwo-development-server...
+.................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 20:33:43 UTC ===

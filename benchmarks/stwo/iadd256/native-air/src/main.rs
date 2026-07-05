@@ -769,7 +769,10 @@ fn main() -> Result<()> {
         commitment_scheme.set_store_polynomials_coefficients();
     }
     if args.low_memory {
-        commitment_scheme.set_low_memory();
+        anyhow::bail!(
+            "--low-memory requires a stwo build exposing set_low_memory(); \
+             unavailable in the pinned upstream stwo"
+        );
     }
 
     let mut tree_builder = commitment_scheme.tree_builder();

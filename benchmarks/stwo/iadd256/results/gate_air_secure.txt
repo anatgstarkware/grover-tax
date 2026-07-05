@@ -1,0 +1,69 @@
+=== F1 secure base config Mon 22 Jun 2026 08:19:57 UTC ===
+Starting instance(s) stwo-development-server...
+..............................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.170.163.249
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling gate-air-leaf v0.1.0 (/home/anatg_starkware_co/workspace/grover-tax-v02/gate-air-leaf)
+    Finished `release` profile [optimized] target(s) in 9.76s
+=== base prove_s (secure) at 2^22 / 2^25 ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":1,"repetitions":1000,"n_gates":2547,"real_rows":2547000,"padded_rows":4194304,"log_rows":22,"trace_columns":191,"proved":true,"trace_gen_s":3.681,"prove_s":0.941,"verify_s":0.018}
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":29.634,"prove_s":7.670,"verify_s":0.025}
+=== REALISTIC leaf: FOLD=4 at 2^25 (secure base) ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=8 K=1000 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 5.598s
+gate-air: trace generation (full witness build) in 35.744s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 2.7s (target qm31_ops=2097152)
+gate-air: proving 4 leaves ...
+gate-air: 4 leaves proved in 11.5s
+gate-air: folded to root in 11.0s (2 levels)
+gate-air: multiverifier fold OK
+gate-air: root verification OK in 2.0s (trace 2^20, 4 leaf outputs unpacked + zk-blinded)
+=== stopping VM Mon 22 Jun 2026 08:23:52 UTC ===
+Stopping instance(s) stwo-development-server...
+.......................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 08:24:52 UTC ===

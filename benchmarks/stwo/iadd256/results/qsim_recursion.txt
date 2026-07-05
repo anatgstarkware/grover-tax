@@ -1,0 +1,133 @@
+=== qsim recursion pipeline Sat 20 Jun 2026 17:46:19 UTC ===
+Starting instance(s) stwo-development-server...
+...................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 35.222.63.132
+ssh up Sat 20 Jun 2026 17:47:38 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sat 20 Jun 2026 17:47:53 UTC
+=== regenerate qsim cairo proof (binary, Blake2sM31) Sat 20 Jun 2026 17:47:53 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+REGEN_EXIT=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+      "VerifyBitwiseXor_4": 131072,
+      "PartialEcMulWindowBits18": 278528,
+      "VerifyInstruction": 2998864,
+      "RangeCheck_9_9_D": 2097152,
+      "MemoryIdToBig": 6581488,
+      "VerifyBitwiseXor_7": 131072,
+      "PedersenPointsTableWindowBits18": 262144
+    }
+2026-06-20T17:48:22.243917Z  INFO run:stwo_run_and_prove:prove:verify_cairo: stwo::core::verifier: Split composition polynomial log degree bound: 23
+2026-06-20T17:48:22.244673Z  INFO run:stwo_run_and_prove:prove:verify_cairo: stwo::core::verifier: Sampling 3087 columns.
+2026-06-20T17:48:22.244679Z  INFO run:stwo_run_and_prove:prove:verify_cairo: stwo::core::verifier: Total sample points: 3275.
+2026-06-20T17:48:22.255276Z  INFO run:stwo_run_and_prove:prove:verify_cairo: cairo_air::verifier: close time.busy=17.1ms time.idle=1.33µs
+2026-06-20T17:48:22.255322Z  INFO run:stwo_run_and_prove:prove:Serialize proof: cairo_air::utils: enter
+2026-06-20T17:48:22.498761Z  INFO run:stwo_run_and_prove:prove:Serialize proof: cairo_air::utils: close time.busy=243ms time.idle=1.02µs
+2026-06-20T17:48:22.498927Z  INFO run:stwo_run_and_prove:prove: stwo_run_and_prove: Proof generated and verified successfully.
+2026-06-20T17:48:22.498931Z  INFO run:stwo_run_and_prove:prove: stwo_run_and_prove: close time.busy=23.1s time.idle=773ns
+2026-06-20T17:48:22.505780Z  INFO run:stwo_run_and_prove: stwo_run_and_prove: close time.busy=24.1s time.idle=845ns
+2026-06-20T17:48:22.505796Z  INFO run: stwo_run_and_prove: close time.busy=24.1s time.idle=1.11µs
+[2026-06-20T17:48:22Z INFO  stwo_cairo_utils::binary_utils] stwo_run_and_prove succeeded
+iadd-sim-prove: ✅ proved + verified; proof: 2918576 bytes
+-rw-rw-r-- 1 anatg_starkware_co anatg_starkware_co 2918576 Jun 20 17:48 /home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim.proof.bin
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+-rw-rw-r-- 1 anatg_starkware_co anatg_starkware_co 2918576 Jun 20 17:48 /home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim.proof.bin
+=== build + run iadd-recursion (N=4, target-cpu=native) Sat 20 Jun 2026 17:48:29 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+EXIT=0
+=== result ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+4:Deserializing qsim cairo proof from "/home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim.proof.bin"
+6:  config derived in 6.9s: leaf/node roots fixed, target_padding qm31_ops=8388608
+44:  4 leaves proved in 40.8s
+73:  folded to root in 36.2s (2 levels)
+83:  ROOT-VERIFY OK: proof built in 1.9s; trace 2^20; 4 leaf outputs unpacked + zk-blinded
+85:✅ qsim recursion pipeline complete: 4 qsim leaves -> root -> blinded root verification
+=== tail (panic/error region) ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+[2m2026-06-20T17:49:37.946978Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 17: 8
+[2m2026-06-20T17:49:37.947025Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 22: 49
+[2m2026-06-20T17:49:37.947027Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 25: 115
+[2m2026-06-20T17:49:37.947030Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 21: 18
+[2m2026-06-20T17:49:37.947031Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 26: 36
+[2m2026-06-20T17:49:37.947033Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 23: 70
+[2m2026-06-20T17:49:37.947034Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 19: 15
+[2m2026-06-20T17:49:37.947036Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 11: 8
+[2m2026-06-20T17:49:39.776154Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover[0m[2m:[0m [3mproof_size_estimate[0m[2m=[0m157796
+[2m2026-06-20T17:49:50.022493Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 17: 8
+[2m2026-06-20T17:49:50.022537Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 25: 115
+[2m2026-06-20T17:49:50.022540Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 22: 49
+[2m2026-06-20T17:49:50.022543Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 23: 70
+[2m2026-06-20T17:49:50.022545Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 11: 8
+[2m2026-06-20T17:49:50.022547Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 19: 15
+[2m2026-06-20T17:49:50.022549Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 21: 18
+[2m2026-06-20T17:49:50.022551Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 26: 36
+[2m2026-06-20T17:49:51.864868Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover[0m[2m:[0m [3mproof_size_estimate[0m[2m=[0m157796
+[2m2026-06-20T17:50:02.160613Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 22: 49
+[2m2026-06-20T17:50:02.160715Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 11: 8
+[2m2026-06-20T17:50:02.160720Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 21: 18
+[2m2026-06-20T17:50:02.160723Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 26: 36
+[2m2026-06-20T17:50:02.160754Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 17: 8
+[2m2026-06-20T17:50:02.160756Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 23: 70
+[2m2026-06-20T17:50:02.160757Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 25: 115
+[2m2026-06-20T17:50:02.160759Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 19: 15
+[2m2026-06-20T17:50:03.976890Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover[0m[2m:[0m [3mproof_size_estimate[0m[2m=[0m156884
+  folded to root in 36.2s (2 levels)
+Proving the root verification (verify + unpack + zk-blind) ...
+[2m2026-06-20T17:50:06.487299Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 19: 64
+[2m2026-06-20T17:50:06.487335Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 21: 8
+[2m2026-06-20T17:50:06.487338Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 22: 115
+[2m2026-06-20T17:50:06.487340Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 11: 8
+[2m2026-06-20T17:50:06.487341Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 20: 19
+[2m2026-06-20T17:50:06.487343Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 23: 87
+[2m2026-06-20T17:50:06.487345Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover::pcs[0m[2m:[0m Log size 17: 18
+[2m2026-06-20T17:50:06.835783Z[0m [32m INFO[0m [1mprove_ex[0m[2m:[0m [2mstwo::prover[0m[2m:[0m [3mproof_size_estimate[0m[2m=[0m133188
+  ROOT-VERIFY OK: proof built in 1.9s; trace 2^20; 4 leaf outputs unpacked + zk-blinded
+
+✅ qsim recursion pipeline complete: 4 qsim leaves -> root -> blinded root verification
+=== stopping VM Sat 20 Jun 2026 17:50:14 UTC ===
+Stopping instance(s) stwo-development-server...
+...........................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sat 20 Jun 2026 17:51:14 UTC ===

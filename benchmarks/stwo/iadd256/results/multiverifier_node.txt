@@ -1,0 +1,42 @@
+=== multiverifier node measure Thu 18 Jun 2026 11:42:42 UTC ===
+Starting instance(s) stwo-development-server...
+..............................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.41.224.128
+ssh up Thu 18 Jun 2026 11:43:58 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced; building + running multiverifier prove test (target-cpu=native) Thu 18 Jun 2026 11:44:05 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+EXIT=0
+=== prove spans / test result ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+193:running 1 test
+196:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.33s
+=== full prove-related tail ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling stwo-cairo-prover v1.2.2 (https://github.com/starkware-libs/stwo-cairo?rev=b0b74007#b0b74007)
+   Compiling circuit-prover v0.1.0 (/home/anatg_starkware_co/workspace/sc-pr507/crates/circuit_prover)
+test verify::verify_test::test_prove_multiverifier_of_two_cairo_subcircuits ... ok
+=== stopping VM Thu 18 Jun 2026 11:45:50 UTC ===
+Stopping instance(s) stwo-development-server...
+................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Thu 18 Jun 2026 11:46:50 UTC ===

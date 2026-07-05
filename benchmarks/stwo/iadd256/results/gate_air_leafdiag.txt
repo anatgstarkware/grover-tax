@@ -1,0 +1,122 @@
+=== gate_air leaf-prove panic localization Sun 21 Jun 2026 20:53:44 UTC ===
+Starting instance(s) stwo-development-server...
+.....................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 35.184.202.85
+ssh up Sun 21 Jun 2026 20:55:02 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+=== baseline (known good): 2^14, 1 shot ===
+>>> INCIRCUIT k4 s=1 (2^16,1shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=4 n_gates=2547 real_rows=10188 padded_rows=16384 log_rows=14 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.012s
+gate-air: trace generation (full witness build) in 0.068s
+gate-air: in-circuit verify OK
+{"schema":"gate-air-report/v1","samples":1,"repetitions":4,"n_gates":2547,"real_rows":10188,"padded_rows":16384,"log_rows":14,"trace_columns":191,"proved":true,"trace_gen_s":0.068,"prove_s":0.036,"verify_s":0.002}
+>>> FOLD=2 k4 s=1 (2^16,1shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=4 n_gates=2547 real_rows=10188 padded_rows=16384 log_rows=14 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.007s
+gate-air: trace generation (full witness build) in 0.050s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.8s (target qm31_ops=1048576)
+gate-air: proving 2 leaves ...
+gate-air: 2 leaves proved in 3.5s
+gate-air: folded to root in 2.4s (1 levels)
+=== axis: SHOT COUNT (small trace, many shots) ===
+>>> INCIRCUIT k4 s=4 (2^16,4shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=4 K=4 n_gates=2547 real_rows=40752 padded_rows=65536 log_rows=16 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.016s
+gate-air: trace generation (full witness build) in 0.087s
+gate-air: in-circuit verify OK
+{"schema":"gate-air-report/v1","samples":4,"repetitions":4,"n_gates":2547,"real_rows":40752,"padded_rows":65536,"log_rows":16,"trace_columns":191,"proved":true,"trace_gen_s":0.087,"prove_s":0.034,"verify_s":0.003}
+>>> FOLD=2 k4 s=4 (2^16,4shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=4 K=4 n_gates=2547 real_rows=40752 padded_rows=65536 log_rows=16 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.015s
+gate-air: trace generation (full witness build) in 0.088s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.8s (target qm31_ops=1048576)
+gate-air: proving 2 leaves ...
+gate-air: 2 leaves proved in 4.1s
+gate-air: folded to root in 2.5s (1 levels)
+=== axis: TRACE SIZE (1 shot, bigger trace) ===
+>>> INCIRCUIT k1000 s=1 (2^22,1shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=1000 n_gates=2547 real_rows=2547000 padded_rows=4194304 log_rows=22 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.931s
+gate-air: trace generation (full witness build) in 3.485s
+thread 'main' (3603) panicked at src/main.rs:2258:45:
+gate-air: in-circuit verify FAILED: "(2034141501 + 1499915333i) + (177953192 + 1849105690i)u != (1990508864 + 157177136i) + (698946784 + 1130124547i)u"
+>>> FOLD=2 k1000 s=1 (2^22,1shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=1000 n_gates=2547 real_rows=2547000 padded_rows=4194304 log_rows=22 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.941s
+gate-air: trace generation (full witness build) in 3.574s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.3s (target qm31_ops=1048576)
+gate-air: proving 2 leaves ...
+thread '<unnamed>' (3891) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+assertion `left == right` failed
+=== combination: bigger trace + multishot ===
+>>> FOLD=2 k1000 s=4 (2^24,4shot)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=4 K=1000 n_gates=2547 real_rows=10188000 padded_rows=16777216 log_rows=24 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 2.908s
+gate-air: trace generation (full witness build) in 14.210s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.5s (target qm31_ops=1048576)
+gate-air: proving 2 leaves ...
+thread '<unnamed>' (4129) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+assertion `left == right` failed
+=== stopping VM Sun 21 Jun 2026 20:56:41 UTC ===
+Stopping instance(s) stwo-development-server...
+.....................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 20:57:44 UTC ===

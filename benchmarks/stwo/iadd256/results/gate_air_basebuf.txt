@@ -1,0 +1,66 @@
+=== base-blowup sweep (BASE_BLOWUP 1/2/3 @ 2^25) Mon 22 Jun 2026 09:18:24 UTC ===
+Starting instance(s) stwo-development-server...
+........................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.68.30.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+>>> BASE_BLOWUP=1 (2^25 shard) — base prove_s + leaf cost
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: config derived in 2.7s (target qm31_ops=2097152)
+gate-air: 2 leaves proved in 5.6s
+gate-air: folded to root in 4.6s (1 levels)
+gate-air: root verification OK in 2.0s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":29.863,"prove_s":7.717,"verify_s":0.033}
+>>> BASE_BLOWUP=2 (2^25 shard) — base prove_s + leaf cost
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: config derived in 2.2s (target qm31_ops=1048576)
+gate-air: 2 leaves proved in 3.3s
+gate-air: folded to root in 2.4s (1 levels)
+gate-air: root verification OK in 1.9s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":34.927,"prove_s":11.386,"verify_s":0.031}
+>>> BASE_BLOWUP=3 (2^25 shard) — base prove_s + leaf cost
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: config derived in 2.0s (target qm31_ops=1048576)
+gate-air: 2 leaves proved in 3.2s
+gate-air: folded to root in 2.5s (1 levels)
+gate-air: root verification OK in 1.7s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":44.336,"prove_s":18.287,"verify_s":0.029}
+=== stopping VM Mon 22 Jun 2026 09:23:32 UTC ===
+Stopping instance(s) stwo-development-server...
+....................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 09:24:34 UTC ===

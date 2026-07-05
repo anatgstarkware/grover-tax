@@ -1,0 +1,63 @@
+=== recursion smoke (N=4 cairo leaves) Fri 19 Jun 2026 16:11:38 UTC ===
+Starting instance(s) stwo-development-server...
+.............................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 35.184.196.158
+ssh up Fri 19 Jun 2026 16:12:46 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Fri 19 Jun 2026 16:12:52 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+info: checking for self-update (current version: 1.29.0)
+=== build + run smoke (target-cpu=native, release) Fri 19 Jun 2026 16:12:56 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+EXIT=0
+=== result / timing ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+7:test smoke_fold_four_cairo_leaves ... SMOKE OK (no blinding): 4 cairo leaves folded to root in 9.32s (2 levels, 3 node proves); root output_values = [(1466062331 + 2095555614i) + (814256726 + 92449459i)u, (160575954 + 794103935i) + (313097236 + 1202656710i)u]
+9:test smoke_root_verification ... ROOT-VERIFY OK: proof built in 1.82s; trace 2^20; unpacked 4 leaf outputs bound to root
+11:test smoke_root_verification_zk_blinded ... ROOT-VERIFY ZK OK: blinded proof built in 1.68s; trace 2^20; n_padding=23
+14:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.79s
+=== full panic / error region (last 70 lines) ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling recursive-aggregate v1.2.2 (/home/anatg_starkware_co/workspace/proving-utils/crates/recursive_aggregate)
+    Finished `release` profile [optimized] target(s) in 6.84s
+     Running tests/smoke_cairo_tree.rs (target/release/deps/smoke_cairo_tree-c4d08fade9d90626)
+
+running 4 tests
+test opener_recomputes_known_root ... ok
+test smoke_fold_four_cairo_leaves ... SMOKE OK (no blinding): 4 cairo leaves folded to root in 9.32s (2 levels, 3 node proves); root output_values = [(1466062331 + 2095555614i) + (814256726 + 92449459i)u, (160575954 + 794103935i) + (313097236 + 1202656710i)u]
+ok
+test smoke_root_verification ... ROOT-VERIFY OK: proof built in 1.82s; trace 2^20; unpacked 4 leaf outputs bound to root
+ok
+test smoke_root_verification_zk_blinded ... ROOT-VERIFY ZK OK: blinded proof built in 1.68s; trace 2^20; n_padding=23
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.79s
+
+=== stopping VM Fri 19 Jun 2026 16:13:45 UTC ===
+Stopping instance(s) stwo-development-server...
+................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Fri 19 Jun 2026 16:14:47 UTC ===

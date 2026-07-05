@@ -1,0 +1,77 @@
+=== gate_air multiverifier fold (M3) Sun 21 Jun 2026 18:02:02 UTC ===
+Starting instance(s) stwo-development-server...
+...........................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.45.100.3
+ssh up Sun 21 Jun 2026 18:03:10 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sun 21 Jun 2026 18:03:26 UTC
+=== build Sun 21 Jun 2026 18:03:26 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling gate-air-leaf v0.1.0 (/home/anatg_starkware_co/workspace/grover-tax-v02/gate-air-leaf)
+    Finished `release` profile [optimized] target(s) in 9.74s
+=== run k4-n16 samples=1, GATE_AIR_FOLD=4 Sun 21 Jun 2026 18:03:44 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=4 n_gates=2547 real_rows=10188 padded_rows=16384 log_rows=14 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.009s
+gate-air: trace generation (full witness build) in 0.051s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.8s (target qm31_ops=1048576)
+gate-air: proving 4 leaves ...
+gate-air: 4 leaves proved in 6.9s
+gate-air: folded to root in 5.3s (2 levels)
+gate-air: multiverifier fold OK
+gate-air: root verification OK in 1.8s (trace 2^20, 4 leaf outputs unpacked + zk-blinded)
+--- tail ---
+gate-air: samples=1 K=4 n_gates=2547 real_rows=10188 padded_rows=16384 log_rows=14 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.009s
+gate-air: trace generation (full witness build) in 0.051s
+gate-air: deriving aggregate config ...
+gate-air: config derived in 1.8s (target qm31_ops=1048576)
+gate-air: proving 4 leaves ...
+gate-air: 4 leaves proved in 6.9s
+gate-air: folded to root in 5.3s (2 levels)
+gate-air: multiverifier fold OK
+gate-air: root verification OK in 1.8s (trace 2^20, 4 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":1,"repetitions":4,"n_gates":2547,"real_rows":10188,"padded_rows":16384,"log_rows":14,"trace_columns":191,"proved":true,"trace_gen_s":0.051,"prove_s":0.032,"verify_s":0.007}
+=== stopping VM Sun 21 Jun 2026 18:04:08 UTC ===
+Stopping instance(s) stwo-development-server...
+.....................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 18:05:11 UTC ===

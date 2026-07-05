@@ -1,0 +1,52 @@
+=== base saturation sweep (concurrency x shard) Mon 22 Jun 2026 09:04:26 UTC ===
+Starting instance(s) stwo-development-server...
+............................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.170.163.249
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+96
+               total        used        free      shared  buff/cache   available
+Mem:             732           4         730           0           0         727
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+SAT S=4(2^24) K=1 wall=23s rows=10188000 ok=1 aggMrows_per_s=0.443
+SAT S=4(2^24) K=2 wall=26s rows=20376000 ok=2 aggMrows_per_s=0.784
+SAT S=4(2^24) K=3 wall=33s rows=30564000 ok=3 aggMrows_per_s=0.926
+SAT S=4(2^24) K=4 wall=38s rows=40752000 ok=4 aggMrows_per_s=1.072
+SAT S=8(2^25) K=1 wall=45s rows=20376000 ok=1 aggMrows_per_s=0.453
+SAT S=8(2^25) K=2 wall=51s rows=40752000 ok=2 aggMrows_per_s=0.799
+SAT S=8(2^25) K=3 wall=64s rows=61128000 ok=3 aggMrows_per_s=0.955
+SAT S=8(2^25) K=4 wall=75s rows=81504000 ok=4 aggMrows_per_s=1.087
+SAT S=16(2^26) K=1 wall=80s rows=40752000 ok=1 aggMrows_per_s=0.509
+SAT S=16(2^26) K=2 wall=102s rows=81504000 ok=2 aggMrows_per_s=0.799
+SAT S=16(2^26) K=3 wall=129s rows=122256000 ok=3 aggMrows_per_s=0.948
+=== stopping VM Mon 22 Jun 2026 09:17:03 UTC ===
+Stopping instance(s) stwo-development-server...
+...................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 09:18:06 UTC ===

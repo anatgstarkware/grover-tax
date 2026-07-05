@@ -1,0 +1,55 @@
+=== trace_gen phase profile @ 2^25 Mon 22 Jun 2026 10:05:37 UTC ===
+Starting instance(s) stwo-development-server...
+.......................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.170.163.249
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+=== samples=8 (2^25), base prove only ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: shots simulated and self-checked (final state == y) in 5.577s
+gate-air: [phase] preprocessed gen+commit 1.076s
+gate-air: [phase] main_trace witness gen 1.946s
+gate-air: [phase] tree1 commit (NTT+Merkle) 4.458s
+gate-air: [phase] interaction witness gen+sumcheck 0.977s
+gate-air: [phase] tree2 commit (NTT+Merkle) 0.885s
+gate-air: trace generation (full witness build) in 15.249s
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":15.249,"prove_s":7.830,"verify_s":0.025}
+--- repeat (noise check) ---
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: shots simulated and self-checked (final state == y) in 5.584s
+gate-air: [phase] preprocessed gen+commit 1.079s
+gate-air: [phase] main_trace witness gen 1.980s
+gate-air: [phase] tree1 commit (NTT+Merkle) 4.593s
+gate-air: [phase] interaction witness gen+sumcheck 1.001s
+gate-air: [phase] tree2 commit (NTT+Merkle) 0.876s
+gate-air: trace generation (full witness build) in 15.439s
+=== stopping VM Mon 22 Jun 2026 10:08:04 UTC ===
+Stopping instance(s) stwo-development-server...
+.....................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 10:09:07 UTC ===

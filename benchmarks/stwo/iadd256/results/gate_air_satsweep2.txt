@@ -1,0 +1,50 @@
+=== base saturation v2 (fast interaction) Mon 22 Jun 2026 10:37:25 UTC ===
+Starting instance(s) stwo-development-server...
+.........done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.134.187.124
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+               total        used        free      shared  buff/cache   available
+Mem:             732           5         723           0           6         726
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+SAT2 S=4 K=1 wall=13s aggMrows_per_s=0.784
+SAT2 S=4 K=2 wall=19s aggMrows_per_s=1.072
+SAT2 S=4 K=3 wall=23s aggMrows_per_s=1.329
+SAT2 S=4 K=4 wall=29s aggMrows_per_s=1.405
+SAT2 S=4 K=5 wall=34s aggMrows_per_s=1.498
+SAT2 S=4 K=6 wall=40s aggMrows_per_s=1.528
+SAT2 S=4 K=7 wall=45s aggMrows_per_s=1.585
+SAT2 S=4 K=8 wall=50s aggMrows_per_s=1.63
+WARNING: [0] Failed to send all data from [stdin].
+client_loop: send disconnect: Broken pipe
+=== stopping VM Mon 22 Jun 2026 10:42:43 UTC ===
+Stopping instance(s) stwo-development-server...
+....................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 10:43:02 UTC ===

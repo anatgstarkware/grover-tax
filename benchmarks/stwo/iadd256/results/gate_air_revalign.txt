@@ -1,0 +1,60 @@
+=== gate_air rev-align validation Sun 21 Jun 2026 13:06:20 UTC ===
+Starting instance(s) stwo-development-server...
+...............................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 136.114.148.215
+ssh up Sun 21 Jun 2026 13:07:32 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sun 21 Jun 2026 13:07:43 UTC
+=== build (target-cpu=native) Sun 21 Jun 2026 13:07:43 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling gate-air-leaf v0.1.0 (/home/anatg_starkware_co/workspace/grover-tax-v02/gate-air-leaf)
+    Finished `release` profile [optimized] target(s) in 6.62s
+=== run k4-n16 samples=16 Sun 21 Jun 2026 13:07:58 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=16 K=4 n_gates=2547 real_rows=163008 padded_rows=262144 log_rows=18 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.047s
+gate-air: trace generation (full witness build) in 0.256s
+{"schema":"gate-air-report/v1","samples":16,"repetitions":4,"n_gates":2547,"real_rows":163008,"padded_rows":262144,"log_rows":18,"trace_columns":191,"proved":true,"trace_gen_s":0.256,"prove_s":0.061,"verify_s":0.007}
+RUN=0
+=== run k1-n9024 samples=1024 Sun 21 Jun 2026 13:08:02 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1024 K=1 n_gates=2547 real_rows=2608128 padded_rows=4194304 log_rows=22 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 0.742s
+gate-air: trace generation (full witness build) in 3.369s
+{"schema":"gate-air-report/v1","samples":1024,"repetitions":1,"n_gates":2547,"real_rows":2608128,"padded_rows":4194304,"log_rows":22,"trace_columns":191,"proved":true,"trace_gen_s":3.369,"prove_s":1.013,"verify_s":0.022}
+RUN=0
+=== stopping VM Sun 21 Jun 2026 13:08:12 UTC ===
+Stopping instance(s) stwo-development-server...
+.............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 13:10:38 UTC ===

@@ -1,0 +1,81 @@
+=== leaf cost vs shard size (secure base) Mon 22 Jun 2026 08:52:31 UTC ===
+Starting instance(s) stwo-development-server...
+.........................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.68.30.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+>>> samples=1 (FOLD=2)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=1 K=1000 n_gates=2547 real_rows=2547000 padded_rows=4194304 log_rows=22 columns=191
+gate-air: config derived in 2.2s (target qm31_ops=2097152)
+gate-air: 2 leaves proved in 5.9s
+gate-air: folded to root in 4.3s (1 levels)
+gate-air: root verification OK in 1.9s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":1,"repetitions":1000,"n_gates":2547,"real_rows":2547000,"padded_rows":4194304,"log_rows":22,"trace_columns":191,"proved":true,"trace_gen_s":3.654,"prove_s":0.956,"verify_s":0.028}
+>>> samples=4 (FOLD=2)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=4 K=1000 n_gates=2547 real_rows=10188000 padded_rows=16777216 log_rows=24 columns=191
+gate-air: config derived in 2.6s (target qm31_ops=2097152)
+gate-air: 2 leaves proved in 5.6s
+gate-air: folded to root in 4.5s (1 levels)
+gate-air: root verification OK in 1.9s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":4,"repetitions":1000,"n_gates":2547,"real_rows":10188000,"padded_rows":16777216,"log_rows":24,"trace_columns":191,"proved":true,"trace_gen_s":18.505,"prove_s":4.083,"verify_s":0.033}
+>>> samples=8 (FOLD=2)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=8 K=1000 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: config derived in 2.7s (target qm31_ops=2097152)
+gate-air: 2 leaves proved in 5.6s
+gate-air: folded to root in 4.7s (1 levels)
+gate-air: root verification OK in 1.9s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":8,"repetitions":1000,"n_gates":2547,"real_rows":20376000,"padded_rows":33554432,"log_rows":25,"trace_columns":191,"proved":true,"trace_gen_s":30.228,"prove_s":7.931,"verify_s":0.032}
+>>> samples=32 (FOLD=2)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=32 K=1000 n_gates=2547 real_rows=81504000 padded_rows=134217728 log_rows=27 columns=191
+gate-air: config derived in 2.9s (target qm31_ops=2097152)
+gate-air: 2 leaves proved in 5.6s
+gate-air: folded to root in 4.9s (1 levels)
+gate-air: root verification OK in 1.9s (trace 2^20, 2 leaf outputs unpacked + zk-blinded)
+{"schema":"gate-air-report/v1","samples":32,"repetitions":1000,"n_gates":2547,"real_rows":81504000,"padded_rows":134217728,"log_rows":27,"trace_columns":191,"proved":true,"trace_gen_s":122.863,"prove_s":31.336,"verify_s":0.060}
+=== stopping VM Mon 22 Jun 2026 08:59:00 UTC ===
+Stopping instance(s) stwo-development-server...
+.............................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 09:00:01 UTC ===

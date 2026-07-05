@@ -1,0 +1,96 @@
+=== k2000 leaf measurement Sat 20 Jun 2026 20:58:49 UTC ===
+Starting instance(s) stwo-development-server...
+...........................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.63.252.186
+ssh up Sat 20 Jun 2026 21:00:05 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sat 20 Jun 2026 21:00:25 UTC
+=== build Sat 20 Jun 2026 21:00:25 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+PROVE_BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+HARNESS_BUILD=0
+=== gen k=2000 cairo proof (explicit lifting=28) Sat 20 Jun 2026 21:00:36 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+GEN_EXIT=0 CAIRO_GEN_SEC=287
+-rw-rw-r-- 1 anatg_starkware_co anatg_starkware_co 3272545 Jun 20 21:05 /home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim_k2000.proof.bin
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+2026-06-20T21:01:55.746494Z  INFO run:stwo_run_and_prove:adapt: stwo_cairo_adapter::adapter: Num steps: 394695197
+=== harness over k2000 leaf, POOL_THREADS=96, N=4 Sat 20 Jun 2026 21:05:31 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN_EXIT=101
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Pools: 1 x 96 threads (96 cores total)
+  config derived in 9.3s: leaf/node roots fixed, target_padding qm31_ops=8388608
+thread '<unnamed>' (3610) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+thread 'main' (3609) panicked at /home/anatg_starkware_co/workspace/proving-utils/crates/recursive_aggregate/src/lib.rs:184:40:
+pool job panicked: Any { .. }
+=== harness over k2000 leaf, POOL_THREADS=48, N=4 Sat 20 Jun 2026 21:06:00 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN_EXIT=101
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Pools: 2 x 48 threads (96 cores total)
+  config derived in 9.2s: leaf/node roots fixed, target_padding qm31_ops=8388608
+thread '<unnamed>' (3885) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+thread '<unnamed>' (3933) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuit_prover/src/prover.rs:177:5:
+thread 'main' (3884) panicked at /home/anatg_starkware_co/workspace/proving-utils/crates/recursive_aggregate/src/lib.rs:184:40:
+pool job panicked: Any { .. }
+=== stopping VM Sat 20 Jun 2026 21:06:33 UTC ===
+Stopping instance(s) stwo-development-server...
+...........................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sat 20 Jun 2026 21:07:34 UTC ===

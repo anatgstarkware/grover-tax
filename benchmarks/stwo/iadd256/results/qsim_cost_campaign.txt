@@ -1,0 +1,103 @@
+=== qsim cost campaign Sat 20 Jun 2026 20:27:15 UTC ===
+Starting instance(s) stwo-development-server...
+...............................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.173.195.96
+ssh up Sat 20 Jun 2026 20:28:33 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sat 20 Jun 2026 20:28:53 UTC
+=== build stwo-run-and-prove + harness Sat 20 Jun 2026 20:28:53 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+PROVE_BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+HARNESS_BUILD=0
+=== gen k=1000 cairo proof Sat 20 Jun 2026 20:29:03 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+GEN_EXIT=0 CAIRO_GEN_SEC=142
+-rw-rw-r-- 1 anatg_starkware_co anatg_starkware_co 3109701 Jun 20 20:31 /home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim_k1000.proof.bin
+--- k1000 gen: steps / prove-time / lifting ---
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+2026-06-20T20:29:44.628614Z  INFO run:stwo_run_and_prove:adapt: stwo_cairo_adapter::adapter: Num steps: 199294981
+2026-06-20T20:31:18.000750Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex:commit: stwo::prover::fri: close time.busy=1.72s time.idle=2.07µs
+2026-06-20T20:31:18.051598Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex:Grind{class="Queries POW"}: stwo::prover::pcs: close time.busy=50.8ms time.idle=1.35µs
+2026-06-20T20:31:22.795954Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover: close time.busy=21.3s time.idle=1.62µs
+2026-06-20T20:31:22.795973Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs: stwo_cairo_prover::prover: close time.busy=21.3s time.idle=1.47µs
+2026-06-20T20:31:27.735466Z  INFO run:stwo_run_and_prove:prove:prove_cairo: stwo_cairo_prover::prover: close time.busy=73.8s time.idle=2.24µs
+2026-06-20T20:31:11.740167Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 9: 21
+2026-06-20T20:31:11.740169Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 16: 11
+2026-06-20T20:31:11.740180Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 17: 108
+2026-06-20T20:31:11.740182Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 18: 62
+2026-06-20T20:31:11.740183Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 20: 1
+2026-06-20T20:31:11.740185Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 21: 76
+2026-06-20T20:31:11.740186Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 23: 124
+2026-06-20T20:31:11.740188Z  INFO run:stwo_run_and_prove:prove:prove_cairo:Prove STARKs:prove_ex: stwo::prover::pcs: Log size 25: 86
+=== recursion over k1000 leaf, POOL_THREADS=48, N=4 Sat 20 Jun 2026 20:31:33 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN_EXIT=101
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Pools: 2 x 48 threads (96 cores total)
+thread 'main' (3255) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/stark_verifier/src/proof.rs:282:13:
+=== recursion over k1000 leaf, POOL_THREADS=24, N=4 Sat 20 Jun 2026 20:31:41 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN_EXIT=101
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Pools: 4 x 24 threads (96 cores total)
+thread 'main' (3436) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/stark_verifier/src/proof.rs:282:13:
+=== stopping VM Sat 20 Jun 2026 20:31:49 UTC ===
+Stopping instance(s) stwo-development-server...
+.....................................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sat 20 Jun 2026 20:32:55 UTC ===

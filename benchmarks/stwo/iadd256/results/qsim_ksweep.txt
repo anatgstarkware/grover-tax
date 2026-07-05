@@ -1,0 +1,49 @@
+=== qsim N=1 K-sweep Thu 18 Jun 2026 11:20:30 UTC ===
+Starting instance(s) stwo-development-server...
+...................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 104.197.75.6
+ssh up Thu 18 Jun 2026 11:21:44 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+-rwxrwxr-x 2 anatg_starkware_co anatg_starkware_co 85325000 Jun 17 21:12 /home/anatg_starkware_co/workspace/proving-utils/target/release/stwo-run-and-prove
+=== qsim N=1 K-sweep (feasible range) ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+qsim K=1  Num steps: 2045444  prove_cairo=time.busy=5.21s  wall=0:12.33  verified=1
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+qsim K=10  Num steps: 4086575  prove_cairo=time.busy=5.81s  wall=0:13.55  verified=1
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+qsim K=50  Num steps: 11551053  prove_cairo=time.busy=7.33s  wall=0:18.03  verified=1
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+qsim K=100  Num steps: 21429425  prove_cairo=time.busy=10.0s  wall=0:24.18  verified=1
+=== stopping VM Thu 18 Jun 2026 11:23:15 UTC ===
+Stopping instance(s) stwo-development-server...
+..............................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Thu 18 Jun 2026 11:24:17 UTC ===

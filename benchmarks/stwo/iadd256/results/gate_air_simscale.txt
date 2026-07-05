@@ -1,0 +1,69 @@
+=== sim scaling vs shot count (~2^25 fixed) Mon 22 Jun 2026 10:13:00 UTC ===
+Starting instance(s) stwo-development-server...
+.........................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.68.30.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsync: [sender] change_dir "/home/anat/workspace/grover-tax/benchmarks/stwo/iadd256/results/$HOME/workspace/grover-tax/fixtures" failed: No such file or directory (2)
+rsync: [sender] change_dir "/home/anat/workspace/grover-tax/benchmarks/stwo/iadd256/results/$HOME/workspace/grover-tax/fixtures" failed: No such file or directory (2)
+rsync: [sender] change_dir "/home/anat/workspace/grover-tax/benchmarks/stwo/iadd256/results/$HOME/workspace/grover-tax/fixtures" failed: No such file or directory (2)
+rsync: [sender] change_dir "/home/anat/workspace/grover-tax/benchmarks/stwo/iadd256/results/$HOME/workspace/grover-tax/fixtures" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1356) [sender=3.2.7]
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+>>> 8 shots (fixture k=1000, samples=8)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=8 K=1000 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 5.591s
+gate-air: [phase] interaction witness gen+sumcheck 0.951s
+>>> 80 shots (fixture k=100, samples=80)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=80 K=100 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 5.443s
+gate-air: [phase] interaction witness gen+sumcheck 1.016s
+>>> 800 shots (fixture k=10, samples=800)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=800 K=10 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 5.426s
+gate-air: [phase] interaction witness gen+sumcheck 1.006s
+>>> 8000 shots (fixture k=1, samples=8000)
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+gate-air: samples=8000 K=1 n_gates=2547 real_rows=20376000 padded_rows=33554432 log_rows=25 columns=191
+gate-air: shots simulated and self-checked (final state == y) in 6.064s
+gate-air: [phase] interaction witness gen+sumcheck 0.973s
+=== stopping VM Mon 22 Jun 2026 10:16:18 UTC ===
+Stopping instance(s) stwo-development-server...
+.................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Mon 22 Jun 2026 10:17:20 UTC ===

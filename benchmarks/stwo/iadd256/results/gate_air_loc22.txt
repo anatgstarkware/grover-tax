@@ -1,0 +1,53 @@
+=== loc22: which eq fails at 2^22 Sun 21 Jun 2026 20:59:02 UTC ===
+Starting instance(s) stwo-development-server...
+...........................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.45.99.226
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+BUILD=0
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling gate-air-leaf v0.1.0 (/home/anatg_starkware_co/workspace/grover-tax-v02/gate-air-leaf)
+    Finished `release` profile [optimized] target(s) in 9.63s
+=== 2^22 (k1000 s=1) with backtrace Sun 21 Jun 2026 21:00:39 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+RUN=101
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+5:thread 'main' (2945) panicked at /home/anatg_starkware_co/.cargo/git/checkouts/stwo-circuits-acca305c7c7af9d7/0a6351e/crates/circuits/src/ops.rs:61:9:
+7:  left: (2034141501 + 1499915333i) + (177953192 + 1849105690i)u
+8: right: (1990508864 + 157177136i) + (698946784 + 1130124547i)u
+23:  13:     0x5b494ae16dfb - circuits_stark_verifier[abf74e1252dc0a1f]::merkle::verify_merkle_path::<stwo[5d81f2f2f7280366]::core::fields::qm31::QM31>
+24:  14:     0x5b494ae17f6b - circuits_stark_verifier[abf74e1252dc0a1f]::merkle::decommit_eval_domain_samples::<stwo[5d81f2f2f7280366]::core::fields::qm31::QM31>
+25:  15:     0x5b494ae26729 - circuits_stark_verifier[abf74e1252dc0a1f]::verify::verify::<stwo[5d81f2f2f7280366]::core::fields::qm31::QM31, gate_air_leaf[8ca1b997788381bf]::circuit_statement::GateAirStatement<stwo[5d81f2f2f7280366]::core::fields::qm31::QM31>>
+=== stopping VM Sun 21 Jun 2026 21:00:53 UTC ===
+Stopping instance(s) stwo-development-server...
+...............................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sun 21 Jun 2026 21:01:55 UTC ===

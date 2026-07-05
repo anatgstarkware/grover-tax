@@ -1,0 +1,72 @@
+=== qsim cairo proof gen Sat 20 Jun 2026 09:51:04 UTC ===
+Starting instance(s) stwo-development-server...
+.....................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+Instance internal IP is 10.220.0.3
+Instance external IP is 34.30.126.142
+ssh up Sat 20 Jun 2026 09:52:18 UTC
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rsynced Sat 20 Jun 2026 09:52:42 UTC
+=== build stwo-run-and-prove (target-cpu=native, release) Sat 20 Jun 2026 09:52:42 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+   Compiling cairo-program-runner-lib v1.2.2 (/home/anatg_starkware_co/workspace/proving-utils/crates/cairo-program-runner-lib)
+   Compiling stwo-run-and-prove v1.2.2 (/home/anatg_starkware_co/workspace/proving-utils/crates/stwo_run_and_prove)
+    Finished `release` profile [optimized] target(s) in 1m 27s
+=== run iadd-sim-prove (k1 fixture, N=1) Sat 20 Jun 2026 09:54:14 UTC ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+EXIT=0
+=== result ===
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+2:iadd-sim-prove: fixture=/home/anatg_starkware_co/workspace/grover-tax/fixtures/v0.3-iadd256-k1-n9024.json N=1
+3:iadd-sim-prove: executable=/home/anatg_starkware_co/workspace/grover-tax-v02/stwo-side/cairo/target/dev/iadd_sim_executable.executable.json
+24:2026-06-20T09:54:18.919477Z  INFO run:stwo_run_and_prove:adapt: stwo_cairo_adapter::adapter: Num steps: 2045444
+280:2026-06-20T09:54:39.632915Z  INFO run:stwo_run_and_prove:prove: stwo_run_and_prove: Proof generated and verified successfully.
+285:iadd-sim-prove: ✅ proved + verified; proof: 15465235 bytes
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+-rw-rw-r-- 1 anatg_starkware_co anatg_starkware_co 15465235 Jun 20 09:54 /home/anatg_starkware_co/workspace/grover-tax-v02/results/iadd_sim.proof.bin
+=== stopping VM Sat 20 Jun 2026 09:54:48 UTC ===
+Stopping instance(s) stwo-development-server...
+........................................................................................................................................................................................................................................................................................................done.
+Updated [https://compute.googleapis.com/compute/v1/projects/starkware-dev/zones/us-central1-a/instances/stwo-development-server].
+TERMINATED
+=== DONE Sat 20 Jun 2026 09:55:51 UTC ===
