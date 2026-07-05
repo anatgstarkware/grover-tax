@@ -150,6 +150,22 @@ stwo_constraint_framework::relation!(GateRel, 6);
 const TAG_QUBITMEM: u32 = 1;
 const TAG_RC: u32 = 2;
 const TAG_PROGRAM: u32 = 5;
+// H_P program-commitment binding (OPEN #3, Fork A). The program table emits its supply on TWO tags:
+//   - TAG_PROGRAM (internal): -mult / combine(TAG_PROGRAM, slot, op, t, a, b) — UNCHANGED, still
+//     cancels main's program DEMAND, so base program-consistency is fully preserved.
+//   - TAG_PROGRAM_PUB (public): +mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b) — a DANGLING
+//     public term P_pub that surfaces in the committed `program_sum`. The leaf's `public_logup_sum`
+//     supplies −P_pub over its GUESSED program Vars (slot preprocessed-pinned, mult pinned to the
+//     public shape value samples*k, op/addresses guessed), so the verifier balance forces the leaf's
+//     guessed program == the committed (LogUp-bound) program. The leaf then hashes those SAME guessed
+//     Vars into H_P = blake(program ‖ nonce). This mirrors the boundary re-key's two-term principle
+//     (an internal cancelling term + a public dangling term) using a distinguishing tag instead of a
+//     distinguishing ts. A distinct tag is required: reusing TAG_PROGRAM for the +mult term would make
+//     it cancel the −mult term (net 0, vacuous). SOUNDNESS CRUX: H_P is bound to the executed program,
+//     not free. NOTE: the program supply interaction is CPU-side (`gen_program_interaction`), NOT in
+//     the GPU K4 kernel (which only builds the MAIN component); so this change does NOT touch K4 /
+//     evaluate_gate_air.cu / the decline-guard (the MAIN component fingerprint is unchanged).
+const TAG_PROGRAM_PUB: u32 = 6;
 
 // Phase-3 x/y binding: the boundary's final value `y` is re-keyed to a FIXED public timestamp
 // `TS_FINAL` so it surfaces as an UNCONSUMED public LogUp term (see `BoundaryTableEval`). The leaf's
@@ -931,6 +947,35 @@ fn build_program_table(gates: &[Gate], samples: usize, k: usize) -> ProgramTable
     }
 }
 
+/// Convert a committed `ProgramTable` into the leaf's `ProgramRows` (H_P, Fork A). Same per-slot
+/// tuple the base commits + the leaf binds via TAG_PROGRAM_PUB and hashes into H_P.
+fn program_rows_from_table(prog: &ProgramTable) -> leaf::ProgramRows {
+    leaf::ProgramRows {
+        slot: prog.slot.clone(),
+        opcode_scalar: prog.opcode_scalar.clone(),
+        target: prog.target.clone(),
+        ctrl_a: prog.ctrl_a.clone(),
+        ctrl_b: prog.ctrl_b.clone(),
+        multiplicity: prog.multiplicity.clone(),
+    }
+}
+
+/// The ONE shared hiding nonce for H_P = blake(program ‖ nonce), identical across all leaves of a run.
+/// Overridable via GATE_AIR_HP_NONCE="w0,w1" for deterministic byte-identity / oracle runs; otherwise
+/// a fixed default (the final proof is zk-blinded at the wrapper, so H_P hiding rests on that blinding;
+/// a random nonce per RUN — not per leaf — can be wired later without changing the binding).
+fn hiding_nonce() -> [u32; 2] {
+    if let Ok(s) = std::env::var("GATE_AIR_HP_NONCE") {
+        let parts: Vec<u32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if parts.len() == 2 {
+            return [parts[0], parts[1]];
+        }
+    }
+    // Fixed default (deterministic). Distinct-per-run randomness is a future refinement; the nonce is
+    // binding-inert, so a fixed value does not affect soundness (only the strength of program hiding).
+    [0x1234_5678, 0x9abc_def0]
+}
+
 // ----------------------------------------------------------------------------
 // FrameworkEval
 // ----------------------------------------------------------------------------
@@ -1291,13 +1336,23 @@ impl FrameworkEval for ProgramTableEval {
         let ctrl_a = eval.next_trace_mask();
         let ctrl_b = eval.next_trace_mask();
         let multiplicity = eval.next_trace_mask();
+        // H_P binding (Fork A): two supply terms, paired into ONE batch (so the program interaction
+        // stays 4 columns — no tree2 layout shift, no GPU K4 change):
+        //   (internal, -mult) / combine(TAG_PROGRAM,     slot, op, t, a, b)  -> cancels main's demand
+        //   (public,   +mult) / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)  -> dangling P_pub
         let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_PROGRAM);
+        let tag_pub = E::F::one() * BaseField::from_u32_unchecked(TAG_PROGRAM_PUB);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
-            -E::EF::from(multiplicity),
-            &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b],
+            -E::EF::from(multiplicity.clone()),
+            &[tag, slot.clone(), opcode_scalar.clone(), target.clone(), ctrl_a.clone(), ctrl_b.clone()],
         ));
-        eval.finalize_logup();
+        eval.add_to_relation(RelationEntry::new(
+            &self.elements,
+            E::EF::from(multiplicity),
+            &[tag_pub, slot, opcode_scalar, target, ctrl_a, ctrl_b],
+        ));
+        eval.finalize_logup_in_pairs();
         eval
     }
 }
@@ -2164,6 +2219,86 @@ fn gen_boundary_interaction(
     (cols, sum)
 }
 
+/// Program-table interaction (H_P binding, Fork A). Mirrors `gen_boundary_interaction`'s two-term/
+/// one-batch shape so the program component stays 4 interaction columns. Per real slot row emits:
+///   (internal, -mult) / combine(TAG_PROGRAM,     slot, op, t, a, b)  — cancels main's demand,
+///   (public,   +mult) / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)  — the dangling P_pub.
+/// Padding rows carry multiplicity 0, so both fractions vanish (numerator 0). The returned claimed
+/// sum is `program_sum` = Σ_slot [ -mult/d_int + mult/d_pub ] = P_pub (the internal part is cancelled
+/// by main's demand only in the GLOBAL sum, not within this component; `program_sum` itself carries
+/// BOTH terms, and the global identity becomes main + program + boundary + rc == B + P_pub, where the
+/// `-mult/d_int` inside program_sum cancels main's `+enabler/d_int`, leaving net P_pub).
+fn gen_program_interaction(
+    prog: &ProgramTable,
+    el: &GateRel,
+) -> (
+    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
+    let mut gen = LogupTraceGenerator::new(prog.log_size);
+    let mut col = gen.new_col();
+    let n_vec = 1usize << (prog.log_size - LOG_N_LANES);
+    let tag = ptag(TAG_PROGRAM);
+    let tag_pub = ptag(TAG_PROGRAM_PUB);
+    for vec_row in 0..n_vec {
+        let slot = pack_seq(&prog.slot, vec_row);
+        let op = pack_seq(&prog.opcode_scalar, vec_row);
+        let t = pack_seq(&prog.target, vec_row);
+        let a = pack_seq(&prog.ctrl_a, vec_row);
+        let b = pack_seq(&prog.ctrl_b, vec_row);
+        let mult = PackedSecureField::from(pack_seq(&prog.multiplicity, vec_row));
+        let d_int: PackedSecureField = el.combine(&[tag, slot, op, t, a, b]);
+        let d_pub: PackedSecureField = el.combine(&[tag_pub, slot, op, t, a, b]);
+        // fraction = (-mult)/d_int + (+mult)/d_pub.
+        col.write_frac(vec_row, (-mult) * d_pub + mult * d_int, d_int * d_pub);
+    }
+    col.finalize_col();
+    let (cols, sum) = gen.finalize_last();
+    (cols, sum)
+}
+
+/// Program-table PUBLIC term P_pub = Σ_slot mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b) — the
+/// dangling public part the leaf's `public_logup_sum` supplies the negation of (binding the guessed
+/// program to the committed one). Recomputed from the committed program witness.
+fn program_public_term(prog: &ProgramTable, el: &GateRel) -> SecureField {
+    let mut sum = SecureField::zero();
+    let tag_pub = BaseField::from_u32_unchecked(TAG_PROGRAM_PUB);
+    for i in 0..prog.multiplicity.len() {
+        let count = prog.multiplicity[i];
+        if count == 0 {
+            continue;
+        }
+        let denom: SecureField = el.combine(&[
+            tag_pub,
+            BaseField::from_u32_unchecked(prog.slot[i]),
+            BaseField::from_u32_unchecked(prog.opcode_scalar[i]),
+            BaseField::from_u32_unchecked(prog.target[i]),
+            BaseField::from_u32_unchecked(prog.ctrl_a[i]),
+            BaseField::from_u32_unchecked(prog.ctrl_b[i]),
+        ]);
+        sum += SecureField::from(BaseField::from_u32_unchecked(count)) * denom.inverse();
+    }
+    sum
+}
+
+/// Program component claimed sum (H_P binding): Σ_slot [ -mult/combine(TAG_PROGRAM,...) +
+/// mult/combine(TAG_PROGRAM_PUB,...) ]. Must equal `program_sum`; recomputed from the committed
+/// program witness so a mistranscribed term is caught before FRI.
+fn program_claimed_sum(prog: &ProgramTable, el: &GateRel) -> SecureField {
+    let internal = table_public_sum(&prog.multiplicity, el, TAG_PROGRAM, |i| {
+        vec![
+            BaseField::from_u32_unchecked(prog.slot[i]),
+            BaseField::from_u32_unchecked(prog.opcode_scalar[i]),
+            BaseField::from_u32_unchecked(prog.target[i]),
+            BaseField::from_u32_unchecked(prog.ctrl_a[i]),
+            BaseField::from_u32_unchecked(prog.ctrl_b[i]),
+        ]
+    });
+    // `table_public_sum` returns the NEGATED supply (-Σ count/denom), i.e. exactly the -mult internal
+    // term. The public term adds +Σ mult/denom_pub = program_public_term.
+    internal + program_public_term(prog, el)
+}
+
 /// Boundary component claimed sum (supply side): Σ_rows [ +1/combine(ts_last,y) − 1/combine(TS_FINAL,y) ]
 /// — the re-keyed final terms (B)+(D). Must equal `boundary_sum`; recomputed from the committed
 /// boundary table (y/ts_last witness) so a mistranscribed term is caught before FRI.
@@ -2635,7 +2770,7 @@ fn main() -> Result<()> {
     // STRENGTHENING, not a correctness fix for sharding, and is left for the code owner.
     if fold_active {
         use circuit_statement::gate_air_components;
-        use circuits::blake::ReducedHashValue;
+        use circuits::blake::HashValue;
         use circuits::ivalue::NoValue;
         use circuits_stark_verifier::proof::ProofConfig;
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
@@ -2646,13 +2781,13 @@ fn main() -> Result<()> {
         };
         use stwo::core::proof::ExtendedStarkProof;
         use stwo::core::utils::MaybeOwned;
-        use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleHasher;
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
 
         // The base-proof tuple `prove_base_shard` returns. Named so the pipeline producer can send
         // it over a channel; `prove_ex` yields `ExtendedStarkProof<MC::H>` with
-        // `MC::H = Blake2sM31MerkleHasher`, so this is backend-independent (cuda vs simd).
+        // `MC::H = Blake2sMerkleHasher`, so this is backend-independent (cuda vs simd).
         type BaseShardOutput = (
-            ExtendedStarkProof<Blake2sM31MerkleHasher>,
+            ExtendedStarkProof<Blake2sMerkleHasher>,
             Vec<SecureField>,
             u64,
             u32,
@@ -2908,19 +3043,10 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "cuda"))]
             let (main_interaction, main_sum) =
                 gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-            let (program_interaction, program_sum) = {
-                let el = elements.program.clone();
-                gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
-                    el.combine(&[
-                        ptag(TAG_PROGRAM),
-                        pack_seq(&program.slot, vec_row),
-                        pack_seq(&program.opcode_scalar, vec_row),
-                        pack_seq(&program.target, vec_row),
-                        pack_seq(&program.ctrl_a, vec_row),
-                        pack_seq(&program.ctrl_b, vec_row),
-                    ])
-                })
-            };
+            // H_P binding (Fork A): program supply now carries an internal (-mult, TAG_PROGRAM) AND a
+            // public (+mult, TAG_PROGRAM_PUB) term, paired into one batch => still 4 interaction cols.
+            let (program_interaction, program_sum) =
+                gen_program_interaction(&program, &elements.program);
             let (boundary_interaction, boundary_sum) =
                 gen_boundary_interaction(&boundary, &elements.qubitmem);
             // rc supply: -multiplicity / combine(TAG_RC, pos, val).
@@ -2935,15 +3061,19 @@ fn main() -> Result<()> {
                 })
             };
 
-            // Phase-3 x/y binding: the base is NO LONGER internally balanced. The boundary re-keys y
-            // to TS_FINAL, leaving a PUBLIC dangling term B = Σ(+[0,x] − [TS_FINAL,y]); the base's
-            // claimed sums must net to B (not 0). The leaf's public_logup_sum supplies −B over its
-            // guessed x/y, so the verifier balance forces guessed == committed. The rc demand (main)
-            // and rc supply (rc_sum) cancel, so they contribute 0 to the net. (stwo's native verify
-            // does NOT require Σ claimed_sums == 0; this is a prover self-check.)
+            // Phase-3 x/y binding + H_P program binding (Fork A): the base is NOT internally balanced.
+            //   - boundary re-keys y to TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]);
+            //   - program supply adds a public P_pub = Σ mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
+            //     (its internal -mult/TAG_PROGRAM term cancels main's program demand).
+            // So the base's claimed sums net to B + P_pub (not 0). The leaf's public_logup_sum supplies
+            // −B (over guessed x/y) AND −P_pub (over guessed program Vars), so the verifier balance
+            // forces guessed x/y == committed AND guessed program == committed. rc demand (main) and rc
+            // supply (rc_sum) cancel, contributing 0. (stwo's native verify does NOT require
+            // Σ claimed_sums == 0; this is a prover self-check.)
             let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-            if main_sum + program_sum + boundary_sum + rc_sum != b_public {
-                bail!("shard claimed sums do not net to the public boundary term B");
+            let p_pub = program_public_term(&program, &elements.program);
+            if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+                bail!("shard claimed sums do not net to the public terms B + P_pub");
             }
 
             let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
@@ -3170,9 +3300,15 @@ fn main() -> Result<()> {
             &base0_config,
             INTERACTION_POW_BITS,
         );
-        let pp_root0: ReducedHashValue<SecureField> = base0_extended.proof.commitments[0].into();
+        let pp_root0: HashValue<SecureField> = base0_extended.proof.commitments[0].into();
         // Boundary table log-size is shard-invariant (n_shots_per_shard * 512 rows, padded).
         let boundary_log_size = BoundaryTable::new(shots_per_shard).log_size;
+
+        // H_P (OPEN #3, Fork A): the program table + hiding nonce the leaf hashes into H_P and binds
+        // to the base. The program is SHARD-INVARIANT (same gates, same mult = shots_per_shard*k), so
+        // build it once and clone into every leaf. ONE shared nonce across all leaves.
+        let leaf_program = program_rows_from_table(&build_program_table(&gates, shots_per_shard, k));
+        let leaf_nonce = hiding_nonce();
         let shape_params = GateAirLeafParams {
             main_log_size: base0_log_n_rows,
             program_log_size: base0_prog_log_size,
@@ -3180,15 +3316,19 @@ fn main() -> Result<()> {
             preprocessed_root: pp_root0,
             boundary: base0_boundary.clone(),
             total_pc: base0_total_pc,
+            program: leaf_program.clone(),
+            nonce: leaf_nonce,
         };
 
         eprintln!("gate-air: deriving aggregate config ...");
         let t = Instant::now();
         let agg = derive_aggregate_config(&cfg, &shape_params, LOG_BLOWUP_FACTOR);
         eprintln!(
-            "gate-air: config derived in {:.1}s (target qm31_ops={})",
+            "gate-air: config derived in {:.1}s (leaf target qm31_ops={}, node target qm31_ops={} \
+             — leaf pinned independent of FOLD_ARITY)",
             t.elapsed().as_secs_f64(),
-            agg.target_padding_sizes.qm31_ops
+            agg.leaf_target_padding_sizes.qm31_ops,
+            agg.node_target_padding_sizes.qm31_ops,
         );
 
         // Partition the machine so independent leaf proves run concurrently (POOL_THREADS sweet spot).
@@ -3228,7 +3368,7 @@ fn main() -> Result<()> {
         let wrap_leaf = |base: &BaseShardOutput| -> TreeProof {
             let (extended_i, claim_i, nonce_i, salt_i, log_n_rows_i, prog_log_i, boundary_i, total_pc_i) =
                 base;
-            let pp_root_i: ReducedHashValue<SecureField> = extended_i.proof.commitments[0].into();
+            let pp_root_i: HashValue<SecureField> = extended_i.proof.commitments[0].into();
             let params_i = GateAirLeafParams {
                 main_log_size: *log_n_rows_i,
                 program_log_size: *prog_log_i,
@@ -3236,6 +3376,9 @@ fn main() -> Result<()> {
                 preprocessed_root: pp_root_i,
                 boundary: boundary_i.clone(),
                 total_pc: *total_pc_i,
+                // Shard-invariant program + shared nonce (same for every leaf).
+                program: leaf_program.clone(),
+                nonce: leaf_nonce,
             };
             let p = proof_from_stark_proof(extended_i, cfg_ref, claim_i.clone(), *nonce_i, *salt_i);
             prove_gate_air_leaf(p, cfg_ref, &params_i, agg_ref)
@@ -3625,19 +3768,9 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-    let (program_interaction, program_sum) = {
-        let el = elements.program.clone();
-        gen_table_interaction(&program.multiplicity, program.log_size, |vec_row| {
-            el.combine(&[
-                ptag(TAG_PROGRAM),
-                pack_seq(&program.slot, vec_row),
-                pack_seq(&program.opcode_scalar, vec_row),
-                pack_seq(&program.target, vec_row),
-                pack_seq(&program.ctrl_a, vec_row),
-                pack_seq(&program.ctrl_b, vec_row),
-            ])
-        })
-    };
+    // H_P binding (Fork A): program supply carries internal (-mult, TAG_PROGRAM) + public (+mult,
+    // TAG_PROGRAM_PUB) terms, paired => 4 interaction cols (see gen_program_interaction).
+    let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
     let (boundary_interaction, boundary_sum) =
         gen_boundary_interaction(&boundary, &elements.qubitmem);
     // rc supply: -multiplicity / combine(TAG_RC, pos, val).
@@ -3719,46 +3852,41 @@ fn main() -> Result<()> {
         // GATE_AIR_ASSERT_ONLY.
         if std::env::var("GATE_AIR_ASSERT_ONLY").is_ok() {
             let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-            if main_sum + program_sum + boundary_sum + rc_sum != b_public {
-                bail!("ASSERT_ONLY: claimed sums do not net to the public boundary term B");
+            let p_pub = program_public_term(&program, &elements.program);
+            if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+                bail!("ASSERT_ONLY: claimed sums do not net to the public terms B + P_pub");
             }
             eprintln!("gate-air: GATE_AIR_ASSERT_ONLY cross-check OK (skipping FRI prove)");
             return Ok(());
         }
     }
 
-    // Cross-check the committed claimed sums. PHASE-3: the base is NO LONGER internally balanced — the
-    // boundary re-keys y to TS_FINAL, leaving a PUBLIC dangling term
-    //     B = Σ_{shot,addr} ( +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ),
+    // Cross-check the committed claimed sums. PHASE-3 + H_P (Fork A): the base is NOT internally
+    // balanced — two public dangling terms surface in the committed claimed sums:
+    //   B     = Σ_{shot,addr} ( +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) )  [x/y],
+    //   P_pub = Σ_slot mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)                         [program],
     // so the global identity is now
-    //     main_sum + program_sum + boundary_sum == B.
-    // The leaf's `public_logup_sum` equals −B over the guessed x/y, so the in-circuit verifier balance
-    // `public_logup_sum + Σ claimed_sums == 0` forces guessed == committed (the recursion x/y binding).
-    // We ALSO cross-check the supply sums independently (program, boundary) against a direct
-    // recomputation, so a mistranscribed supply term is caught before FRI.
+    //     main_sum + program_sum + boundary_sum + rc_sum == B + P_pub.
+    // The leaf's `public_logup_sum` equals −(B + P_pub) over the guessed x/y AND guessed program Vars,
+    // so the in-circuit verifier balance `public_logup_sum + Σ claimed_sums == 0` forces guessed ==
+    // committed (the recursion x/y binding AND the H_P program binding). We ALSO cross-check the supply
+    // sums independently (program, boundary) against a direct recomputation, so a mistranscribed supply
+    // term is caught before FRI.
     //
-    // SOUNDNESS: per-input binding (x_i -> y_i) — x is now bound via main's dangling init term at ts=0
-    // and y via the boundary's public TS_FINAL yield; the leaf pins BOTH to its guessed values through
-    // B. The preprocessed `shot_id` in every QubitMem tuple forbids cross-shot chain mixing. Chain
-    // acyclicity is the degree-1 equality `flag*(ts - prev_ts - 1) = 0` on the per-address +1 counter
-    // (a detached cycle would need Sum(1) == 0 mod p, i.e. loop length p ~ 2^31; load-bearing).
-    // Program-consistency forces the ONE shared hidden program.
-    // The rc range-check demand (in main) and supply (rc_sum) cancel exactly (each real limb lookup
-    // is matched by one table-supply unit), so they contribute 0 to the net; the global identity
-    // stays main + program + boundary + rc == B.
+    // SOUNDNESS: per-input binding (x_i -> y_i) — x via main's dangling init term at ts=0, y via the
+    // boundary's public TS_FINAL yield; the leaf pins BOTH through B. Program binding — the program
+    // table's public +mult/TAG_PROGRAM_PUB term surfaces as P_pub; the leaf reconstructs it over its
+    // guessed (slot, op, t, a, b, mult) and hashes those SAME Vars into H_P, so H_P commits to the
+    // LogUp-bound program (its internal -mult/TAG_PROGRAM term still cancels main's demand, so program
+    // consistency is unchanged). The preprocessed `shot_id` in every QubitMem tuple forbids cross-shot
+    // chain mixing. Chain acyclicity is the degree-1 equality on the ts range-check. The rc demand
+    // (main) and supply (rc_sum) cancel exactly, contributing 0 to the net.
     let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-    if main_sum + program_sum + boundary_sum + rc_sum != b_public {
-        bail!("claimed sums do not net to the public boundary term B");
+    let p_pub = program_public_term(&program, &elements.program);
+    if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+        bail!("claimed sums do not net to the public terms B + P_pub");
     }
-    let program_expected = table_public_sum(&program.multiplicity, &elements.program, TAG_PROGRAM, |i| {
-        vec![
-            BaseField::from_u32_unchecked(program.slot[i]),
-            BaseField::from_u32_unchecked(program.opcode_scalar[i]),
-            BaseField::from_u32_unchecked(program.target[i]),
-            BaseField::from_u32_unchecked(program.ctrl_a[i]),
-            BaseField::from_u32_unchecked(program.ctrl_b[i]),
-        ]
-    });
+    let program_expected = program_claimed_sum(&program, &elements.program);
     if program_sum != program_expected {
         bail!("program claimed sum mismatch");
     }
@@ -3863,7 +3991,7 @@ fn main() -> Result<()> {
     // ---- In-circuit verification (Design A, Milestone 2), gated by GATE_AIR_INCIRCUIT ----
     if std::env::var("GATE_AIR_INCIRCUIT").is_ok() {
         use circuit_statement::{GateAirStatement, gate_air_components};
-        use circuits::blake::ReducedHashValue;
+        use circuits::blake::HashValue;
         use circuits::context::{Context, TraceContext};
         use circuits::ivalue::NoValue;
         use circuits::ops::Guess;
@@ -3874,7 +4002,7 @@ fn main() -> Result<()> {
         let n_pp = N_PREPROCESSED_COLS;
         let cfg =
             ProofConfig::new(&gate_air_components::<NoValue>(), n_pp, &config, INTERACTION_POW_BITS);
-        let pp_root: ReducedHashValue<SecureField> = extended.proof.commitments[0].into();
+        let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
         let mut boundary_xy = Vec::with_capacity(cases.len());
         for case in cases {
             let x = state_to_limbs(&hex::decode(&case.x_hex)?);
@@ -3898,8 +4026,17 @@ fn main() -> Result<()> {
                 pp_root.clone(),
                 boundary_xy.clone(),
                 total_pc,
+                program_rows_from_table(&program),
+                hiding_nonce(),
             );
             circuit_verify(&mut nv, &pv, &cfg, &stmt);
+            // Mirror the real leaf: build H_P (consumes the nonce + program Vars) so the self-check
+            // exercises the H_P sub-circuit. Its terminal hash Vars are not re-hashed here (the real
+            // leaf feeds them into the output hash), so mark them used.
+            let h_p = stmt.compute_h_p(&mut nv);
+            for w in h_p.iter() {
+                nv.mark_as_unused(*w.get());
+            }
             nv.finalize(false).context.circuit
         };
         // Build the real assignment and check it against the NoValue shape.
@@ -3915,8 +4052,14 @@ fn main() -> Result<()> {
             pp_root,
             boundary_xy,
             total_pc,
+            program_rows_from_table(&program),
+            hiding_nonce(),
         );
         circuit_verify(&mut ctx, &pv, &cfg, &stmt);
+        let h_p = stmt.compute_h_p(&mut ctx);
+        for w in h_p.iter() {
+            ctx.mark_as_unused(*w.get());
+        }
         let ctx = ctx.finalize(true);
         novalue_circuit.check(ctx.values()).expect("gate-air: in-circuit verify FAILED");
         eprintln!("gate-air: in-circuit verify OK");
@@ -3942,15 +4085,9 @@ fn main() -> Result<()> {
     // — the global identity is main + program + boundary + rc == B (the public dangling boundary term),
     // so the main component's claimed sum is v_main = B − v_program − v_boundary − v_rc (the rc demand
     // in main cancels the rc supply).
-    let v_program = table_public_sum(&program.multiplicity, &v_elements.program, TAG_PROGRAM, |i| {
-        vec![
-            BaseField::from_u32_unchecked(program.slot[i]),
-            BaseField::from_u32_unchecked(program.opcode_scalar[i]),
-            BaseField::from_u32_unchecked(program.target[i]),
-            BaseField::from_u32_unchecked(program.ctrl_a[i]),
-            BaseField::from_u32_unchecked(program.ctrl_b[i]),
-        ]
-    });
+    // H_P (Fork A): the program claimed sum now carries the internal -mult/TAG_PROGRAM AND the public
+    // +mult/TAG_PROGRAM_PUB term (`program_claimed_sum`).
+    let v_program = program_claimed_sum(&program, &v_elements.program);
     let v_boundary = boundary_public_sum(&boundary, &v_elements.qubitmem);
     let v_rc = table_public_sum(&rc_table.multiplicity, &v_elements.rc, TAG_RC, |i| {
         vec![
@@ -3959,8 +4096,9 @@ fn main() -> Result<()> {
         ]
     });
     let v_b_public = boundary_public_term(&boundary, &v_elements.qubitmem);
-    // main_sum = B − program − boundary − rc. mix_felts ORDER must match the prover's exactly.
-    let v_main = v_b_public - v_program - v_boundary - v_rc;
+    let v_p_pub = program_public_term(&program, &v_elements.program);
+    // main_sum = (B + P_pub) − program − boundary − rc. mix_felts ORDER must match the prover's exactly.
+    let v_main = (v_b_public + v_p_pub) - v_program - v_boundary - v_rc;
     let v_claimed = vec![v_main, v_program, v_boundary, v_rc];
     verifier_channel.mix_felts(&v_claimed);
     let v_components = build_components(

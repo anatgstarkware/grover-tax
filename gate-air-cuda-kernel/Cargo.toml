@@ -8,12 +8,16 @@ edition = "2021"
 
 [features]
 default = []
+# Turns on the vendored stwo-cuda-backend's CudaBackend + gate_air constraint kernel. This crate is
+# pulled ONLY under gate-air-leaf's `cuda` feature (`gate-air-cuda-kernel/cuda`), so the default/CPU
+# leaf build never enables it. The stwo [patch] -> stwo-cuda-backend (in gate-air-leaf/Cargo.toml)
+# provides the `cuda` feature these forward to.
 cuda = ["stwo/cuda", "stwo-constraint-framework/cuda"]
 
 [dependencies]
-# Same git rev as gate-air-leaf so the workspace `[patch]` (-> stwo-cuda-backend) unifies the types.
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover", "parallel"] }
+# Bumped 74951f79 -> 5ea05973 (#1425) to match gate-air-leaf + the local stwo-circuits branch (CPU build).
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973", features = ["prover", "parallel"] }
 # No build script: the gate_air CUDA kernel (evaluate_gate_air.cu + gate_air_entry.cu) is co-compiled
 # into the generic libstwo_cuda (stwo-cuda-backend cmake), so its device code device-links with
 # fields/evaluate_common. The `evaluate_gate_air_entry` symbol resolves from libstwo_cuda (linked via

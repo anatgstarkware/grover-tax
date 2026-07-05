@@ -22,8 +22,9 @@ serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 # serde-serialized StarkProof.
 sha2 = "0.10"
 
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "74951f79", features = ["prover", "parallel"] }
+# stwo: bumped 74951f79 -> 5ea05973 (#1425) to match the local stwo-circuits branch for CPU build.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973", features = ["prover", "parallel"] }
 
 # Milestone 2: in-circuit verification of the gate_air STARK proof (stwo-circuits 041ec6101ba782aa00e325433929cda6ef15c1b9 — same
 # rev the recursion uses). Mirrors crates/stark_verifier_examples' deps.
@@ -54,6 +55,12 @@ diag = []
 # Device-resident CUDA prover backend: swaps ProverBackend -> CudaBackend (commit + prove_ex on the
 # device) and installs the gate_air constraint kernel. Pulls gpu-cuda for the K1/K4 trace-gen glue.
 cuda = [
+    # The vendored stwo-cuda-backend has ABSORBED #1425 (afba117d "adopt non-reduced 8-word Blake2s
+    # Merkle hasher (#1425)"), so its `cuda` feature (device-resident CudaBackend + the co-compiled
+    # gate_air constraint kernel) is what `--features cuda` turns on. These refs live INSIDE the
+    # `cuda` feature, so a default/CPU build (no --features cuda) never enables them and never needs
+    # an nvcc toolchain. Paired with the always-on stwo [patch] -> stwo-cuda-backend below, a plain
+    # `--features cuda` build now wires the GPU fast path with NO hand-uncommenting.
     "stwo/cuda",
     "stwo-constraint-framework/cuda",
     "gpu-cuda",
@@ -68,9 +75,32 @@ cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optio
 [target.'cfg(target_os = "macos")'.dependencies]
 cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
 
-# Redirect the git stwo (and constraint-framework) to the GENERIC device-resident CUDA backend
-# (same rev 74951f79 + the CudaBackend). circuits@041ec610 + recursive-aggregate share the same
-# stwo, so type identity holds. Without --features cuda this is byte-identical to upstream 74951f79.
+# stwo -> vendored stwo-cuda-backend, ALWAYS ON (both the CPU and the --features cuda build). The
+# vendored copy has ABSORBED #1425 (afba117d "adopt non-reduced 8-word Blake2s Merkle hasher
+# (#1425)"; post-#1425 Blake2sM31MerkleChannel::H = standard <false>), so it now agrees with the
+# 5ea05973 the local stwo-circuits branch pins and type-checks the CPU build too. The vendored
+# crate's `cuda` feature is OFF unless `--features cuda` turns it on (see the `cuda` feature above),
+# so the default/CPU build gets the SimdBackend stwo with no nvcc toolchain. Making this patch
+# unconditional is what removes the manual [patch]-uncommenting gymnastics for the GPU build.
+# (The `.cu` native compile only runs under `CARGO_FEATURE_CUDA`; a CPU `cargo build` never invokes
+# nvcc. `STWO_CUDA_SKIP_BUILD=1` type-checks a `--features cuda` build without nvcc.)
 [patch."https://github.com/starkware-libs/stwo"]
 stwo = { path = "../../stwo-cuda-backend/crates/stwo" }
 stwo-constraint-framework = { path = "../../stwo-cuda-backend/crates/constraint-framework" }
+
+# WIP dep-graph alignment (uncommitted, laptop-only): the circuits deps above pin 041ec61 (stwo
+# 74951f79), but the recursion now needs the LOCAL stwo-circuits checkout carrying the uncommitted
+# k-ary node circuit + the bumped stwo (5ea05973). Redirect every stwo-circuits git dep to that
+# local checkout. Because the [patch] on the stwo URL above replaces ALL revs (74951f79 AND the
+# 5ea05973 the local stwo-circuits pins) with the single vendored stwo, there is exactly one stwo.
+[patch."https://github.com/starkware-libs/stwo-circuits"]
+circuits = { path = "../../stwo-circuits/crates/circuits" }
+circuit-common = { path = "../../stwo-circuits/crates/circuit_common" }
+circuit-prover = { path = "../../stwo-circuits/crates/circuit_prover" }
+circuit-verifier = { path = "../../stwo-circuits/crates/circuit_verifier" }
+circuit-serialize = { path = "../../stwo-circuits/crates/circuit_serialize" }
+circuit-multiverifier = { path = "../../stwo-circuits/crates/circuit_multiverifier" }
+circuits-stark-verifier = { path = "../../stwo-circuits/crates/stark_verifier" }
+# transitively pulled by recursive-aggregate / circuits-stark-verifier; must ALSO be local, else
+# the old 041ec610 circuit-cairo-verifier compiles against the patched 5ea05973 stwo -> trait errors.
+circuit-cairo-verifier = { path = "../../stwo-circuits/crates/cairo_verifier" }

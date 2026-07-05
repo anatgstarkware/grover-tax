@@ -12,8 +12,9 @@
 //! degree-1 equality `flag*(ts - prev_ts - 1) = 0` on a per-address +1 counter (no rc_lo table).
 #![allow(dead_code)]
 
-use circuits::blake::ReducedHashValue;
+use circuits::blake::HashValue;
 use circuits::context::{Context, Var};
+use circuits::wrappers::U32Wrapper;
 use circuits::eval;
 use circuits::ivalue::{IValue, qm31_from_u32s};
 use circuits::ops::Guess;
@@ -28,9 +29,10 @@ use indexmap::IndexMap;
 use stwo::core::fields::qm31::QM31;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
+use crate::leaf::ProgramRows;
 use crate::{
     ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, RC_LOG_SIZE, RC_LO_BITS, RC_POS_HI, RC_POS_LO,
-    TAG_PROGRAM, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
+    TAG_PROGRAM, TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
     pp_id, preprocessed_column_ids,
 };
 
@@ -44,7 +46,10 @@ fn konst<Value: IValue>(context: &mut Context<Value>, v: u32) -> Var {
 const NO_RELATION_USES: [RelationUse; 0] = [];
 const ONE_TERM_INTERACTION_COLUMNS: usize = 4;
 
-/// Program-consistency table (supply): -mult / [TAG_PROGRAM, slot, opcode, target, ctrl_a, ctrl_b].
+/// Program-consistency table (supply). Mirrors main.rs `ProgramTableEval` (H_P binding, Fork A): emits
+/// TWO terms, paired into ONE batch (still 4 interaction cols):
+///   (internal, -mult) / [TAG_PROGRAM,     slot, op, t, a, b]  — cancels main's demand,
+///   (public,   +mult) / [TAG_PROGRAM_PUB, slot, op, t, a, b]  — the dangling P_pub.
 /// Variable log_size (set per proof), so no fixed size assert here.
 pub struct ProgramTable;
 impl<Value: IValue> CircuitEval<Value> for ProgramTable {
@@ -74,8 +79,11 @@ impl<Value: IValue> CircuitEval<Value> for ProgramTable {
         };
         let slot = acc.get_preprocessed_column(&pp_id("gate_prog_slot"));
         let tag = context.constant(qm31_from_u32s(TAG_PROGRAM, 0, 0, 0));
-        let num = eval!(context, -(mult));
-        acc.add_to_relation(context, num, &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b]);
+        let tag_pub = context.constant(qm31_from_u32s(TAG_PROGRAM_PUB, 0, 0, 0));
+        let neg = eval!(context, -(mult));
+        // internal (-mult) / TAG_PROGRAM ; public (+mult) / TAG_PROGRAM_PUB.
+        acc.add_to_relation(context, neg, &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b]);
+        acc.add_to_relation(context, mult, &[tag_pub, slot, opcode_scalar, target, ctrl_a, ctrl_b]);
     }
 }
 
@@ -372,8 +380,9 @@ pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn Ci
 pub struct GateAirStatement<Value: IValue> {
     components: IndexMap<&'static str, Box<dyn CircuitEval<Value>>>,
     component_log_sizes: Simd,
-    /// Base-proof preprocessed-trace Merkle root, GUESSED as a witness Var pair.
-    preprocessed_root: ReducedHashValue<Var>,
+    /// Base-proof preprocessed-trace Merkle root, GUESSED as eight witness digest words (#1425
+    /// full-digest form; was a reduced 2-QM31 pair).
+    preprocessed_root: HashValue<Var>,
     /// (x_limbs, y_limbs) per shot (shot_id = index) for the leaf's output-hash preimage, GUESSED as
     /// witness Vars.
     ///
@@ -387,10 +396,28 @@ pub struct GateAirStatement<Value: IValue> {
     /// `public_logup_sum` guesses from. For NoValue (shape) the bit values are irrelevant.
     boundary_u32: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     total_pc: u32,
+    /// H_P program commitment (OPEN #3, Fork A). Per-slot Vars used BOTH to bind the program to the
+    /// base (via `public_logup_sum`'s TAG_PROGRAM_PUB term) AND to form `H_P = blake(program ‖ nonce)`.
+    /// `slot` and `multiplicity` are PINNED constants (public: slot = row index, mult = samples*k), so
+    /// a prover cannot forge them; `opcode_scalar/target/ctrl_a/ctrl_b` are GUESSED (the hidden program).
+    program: ProgramVars,
+    /// Shared hiding nonce Vars (2 words), folded into H_P. Identical across all leaves.
+    nonce: [Var; 2],
     /// Log sizes needed to reproduce the DYNAMIC preprocessed column order.
     main_log_size: u32,
     program_log_size: u32,
     boundary_log_size: u32,
+}
+
+/// Per-slot program Vars (mirrors `ProgramRows`). `slot`/`multiplicity` are pinned constants;
+/// `opcode_scalar`/`target`/`ctrl_a`/`ctrl_b` are guessed (the secret program).
+struct ProgramVars {
+    slot: Vec<Var>,
+    opcode_scalar: Vec<Var>,
+    target: Vec<Var>,
+    ctrl_a: Vec<Var>,
+    ctrl_b: Vec<Var>,
+    multiplicity: Vec<Var>,
 }
 
 impl<Value: IValue> GateAirStatement<Value> {
@@ -400,9 +427,11 @@ impl<Value: IValue> GateAirStatement<Value> {
         main_log_size: u32,
         program_log_size: u32,
         boundary_log_size: u32,
-        preprocessed_root: ReducedHashValue<QM31>,
+        preprocessed_root: HashValue<QM31>,
         boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
         total_pc: u32,
+        program: ProgramRows,
+        nonce: [u32; 2],
     ) -> Self {
         // Component order: main, program, boundary, rc (rc fixed at RC_LOG_SIZE).
         let log_sizes = [main_log_size, program_log_size, boundary_log_size, RC_LOG_SIZE];
@@ -413,10 +442,13 @@ impl<Value: IValue> GateAirStatement<Value> {
             .collect::<Vec<_>>();
         let component_log_sizes = Simd::from_packed(packed, n_components);
 
-        let preprocessed_root = ReducedHashValue(
-            Value::from_qm31(preprocessed_root.0).guess(context),
-            Value::from_qm31(preprocessed_root.1).guess(context),
-        );
+        // Guess the eight base-proof preprocessed-root words, mirroring `CircuitStatement::new`. The
+        // guessed words feed both the in-circuit STARK verifier's transcript and the leaf's output
+        // hash; the honest final verifier reconstructs them (soundness of the recursive setup).
+        let preprocessed_root = HashValue(std::array::from_fn(|i| {
+            U32Wrapper::new_unsafe(Value::from_qm31(*preprocessed_root[i].get()))
+        }))
+        .guess(context);
         let boundary_vars = boundary
             .iter()
             .map(|(x_limbs, y_limbs)| {
@@ -425,6 +457,55 @@ impl<Value: IValue> GateAirStatement<Value> {
                 (x, y)
             })
             .collect::<Vec<_>>();
+
+        // H_P program Vars. slot + multiplicity are PINNED public constants (a prover cannot forge
+        // them: slot = row index, mult = samples*k shape value). op/addresses are GUESSED (the hidden
+        // program) — bound to the base via TAG_PROGRAM_PUB in `public_logup_sum`.
+        let konst_c = |context: &mut Context<Value>, v: u32| context.constant(qm31_from_u32s(v, 0, 0, 0));
+        let guess_c = |context: &mut Context<Value>, v: u32| {
+            Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context)
+        };
+        // Real slots (mult > 0) GUESS op/addr (the hidden program, bound via TAG_PROGRAM_PUB). Padding
+        // slots (mult == 0) are NOT LogUp-bound (zero numerator) but ARE hashed into H_P, so their
+        // op/addr must be PINNED to the base's canonical padding values (0) — otherwise a prover could
+        // vary padding op/addr to change H_P without breaking balance (same-program forgery). Pin them
+        // as constants matching `build_program_table` (padding op/addr all 0).
+        let field_var = |context: &mut Context<Value>, is_pad: bool, v: u32| {
+            if is_pad { konst_c(context, v) } else { guess_c(context, v) }
+        };
+        let is_pad: Vec<bool> = program.multiplicity.iter().map(|&m| m == 0).collect();
+        let program_vars = ProgramVars {
+            slot: program.slot.iter().map(|&v| konst_c(context, v)).collect(),
+            opcode_scalar: program
+                .opcode_scalar
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .collect(),
+            target: program
+                .target
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .collect(),
+            ctrl_a: program
+                .ctrl_a
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .collect(),
+            ctrl_b: program
+                .ctrl_b
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .collect(),
+            multiplicity: program.multiplicity.iter().map(|&v| konst_c(context, v)).collect(),
+        };
+        // Nonce is GUESSED (witness), not a constant: it is secret (hiding), so it must stay out of the
+        // leaf's public preprocessed trace. It is shard-invariant, so all leaves guess the same value.
+        let nonce_vars = [guess_c(context, nonce[0]), guess_c(context, nonce[1])];
+
         Self {
             components: gate_air_components(),
             component_log_sizes,
@@ -432,6 +513,8 @@ impl<Value: IValue> GateAirStatement<Value> {
             boundary: boundary_vars,
             boundary_u32: boundary,
             total_pc,
+            program: program_vars,
+            nonce: nonce_vars,
             main_log_size,
             program_log_size,
             boundary_log_size,
@@ -439,7 +522,7 @@ impl<Value: IValue> GateAirStatement<Value> {
     }
 
     /// The guessed base-proof preprocessed root Vars (for building the leaf's output-hash preimage).
-    pub fn preprocessed_root_vars(&self) -> &ReducedHashValue<Var> {
+    pub fn preprocessed_root_vars(&self) -> &HashValue<Var> {
         &self.preprocessed_root
     }
 
@@ -447,10 +530,36 @@ impl<Value: IValue> GateAirStatement<Value> {
     pub fn boundary_vars(&self) -> &[([Var; N_LIMBS], [Var; N_LIMBS])] {
         &self.boundary
     }
+
+    /// H_P = blake2s( program_table ‖ nonce ) over the SAME guessed program Vars that `public_logup_sum`
+    /// binds to the base's committed program (via TAG_PROGRAM_PUB). Because those Vars are LogUp-bound
+    /// to the executed program, H_P commits to the secret circuit (not a free guess). The nonce (2
+    /// words, shared across leaves) blinds the preimage for hiding. Preimage layout (per slot, in row
+    /// order): [slot, opcode_scalar, target, ctrl_a, ctrl_b, multiplicity], then [nonce0, nonce1].
+    pub fn compute_h_p(&self, context: &mut Context<Value>) -> HashValue<Var> {
+        use circuits::blake::blake2s;
+        let p = &self.program;
+        let n = p.slot.len();
+        let mut preimage = Vec::with_capacity(n * 6 + 2);
+        for i in 0..n {
+            preimage.push(p.slot[i]);
+            preimage.push(p.opcode_scalar[i]);
+            preimage.push(p.target[i]);
+            preimage.push(p.ctrl_a[i]);
+            preimage.push(p.ctrl_b[i]);
+            preimage.push(p.multiplicity[i]);
+        }
+        preimage.push(self.nonce[0]);
+        preimage.push(self.nonce[1]);
+        // #1425: emit the full unreduced eight-word digest (was reduced to 2 QM31 via `blake2s_m31`).
+        // The preimage `Var` ordering is unchanged, so the hashed bytes are identical; only the
+        // returned representation widens from 2 reduced words to 8 raw digest words.
+        blake2s(context, &preimage, 16 * preimage.len())
+    }
 }
 
 impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
-    fn claims_to_mix(&self, _context: &mut Context<Value>) -> Vec<Vec<Var>> {
+    fn claims_to_mix(&self, _context: &mut Context<Value>) -> Vec<Vec<U32Wrapper<Var>>> {
         vec![vec![]]
     }
     fn get_components(&self) -> &IndexMap<&'static str, Box<dyn CircuitEval<Value>>> {
@@ -462,8 +571,8 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
         preprocessed_column_ids(self.main_log_size, self.program_log_size, self.boundary_log_size)
     }
-    fn get_preprocessed_root(&self, _context: &mut Context<Value>) -> ReducedHashValue<Var> {
-        ReducedHashValue(self.preprocessed_root.0, self.preprocessed_root.1)
+    fn get_preprocessed_root(&self, _context: &mut Context<Value>) -> HashValue<Var> {
+        self.preprocessed_root.clone()
     }
     fn public_logup_sum(&self, context: &mut Context<Value>, interaction_elements: [Var; 2]) -> Var {
         // PHASE-3 x/y binding. The base is no longer internally balanced: its re-keyed boundary leaves
@@ -525,6 +634,31 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
                 eq(context, x_recon, x_limbs[limb]);
                 eq(context, y_recon, y_limbs[limb]);
             }
+        }
+
+        // H_P program binding (OPEN #3, Fork A). The base's program table emits a PUBLIC dangling term
+        //     P_pub = Σ_slot mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
+        // (its internal −mult/TAG_PROGRAM term cancels main's demand, so program-consistency is intact).
+        // `verify` enforces `public_logup_sum + Σ claimed_sums == 0` and the committed claimed sums net
+        // to B + P_pub, so this function must ALSO return −P_pub over the GUESSED program Vars:
+        //     Σ_slot ( − mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b) ).
+        // At random (z,α) the ONLY way the balance holds is that every guessed (op, t, a, b) equals the
+        // base's committed program at that slot (slot + mult are pinned constants), binding the guessed
+        // program — which ALSO feeds `compute_h_p` — to the executed program. So H_P commits to the
+        // LogUp-bound secret circuit, not a free guess. Padding slots have mult == 0 => zero numerator,
+        // contributing nothing (matches the base's `count == 0` skip).
+        let tag_prog_pub = konst(context, TAG_PROGRAM_PUB);
+        let p = &self.program;
+        for i in 0..p.slot.len() {
+            let denom = combine_term(
+                context,
+                &[tag_prog_pub, p.slot[i], p.opcode_scalar[i], p.target[i], p.ctrl_a[i], p.ctrl_b[i]],
+                interaction_elements,
+            );
+            let inv_d = inv(context, denom);
+            // − mult / denom.
+            let term = eval!(context, (p.multiplicity[i]) * (inv_d));
+            acc_sum = eval!(context, (acc_sum) - (term));
         }
         acc_sum
     }
