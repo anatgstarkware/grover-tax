@@ -11,10 +11,11 @@
 //! committed hidden circuit. The native verifier recomputes every `H_i` from the ONE published `H_P`,
 //! enforcing same-program across shards for free.
 
-use circuits::blake::{HashValue, blake2s};
-use circuits::context::{Context, FinalizedContext};
+use circuits::blake::{HashValue, blake2s, unpack_qm31s_to_u32_words};
+use circuits::context::{Context, FinalizedContext, Var};
 use circuits::ivalue::{IValue, NoValue};
 use circuits::ops::Guess;
+use circuits::wrappers::U32Wrapper;
 use circuits_stark_verifier::proof::{Proof, ProofConfig, empty_proof};
 use circuits_stark_verifier::verify::verify;
 
@@ -27,6 +28,7 @@ use circuit_prover::prover::{
 };
 use std::sync::Arc;
 
+use circuit_multiverifier::verify::{ChildVerifier, build_fanning_circuit};
 use recursive_aggregate::{
     AggregateConfig, CircuitPrecompute, FOLD_ARITY, TreeProof, multiverifier_node_preprocessed,
     node_preprocessed_from_shared, preprocessed_root, shared_config_for_leaf,
@@ -116,8 +118,28 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     params: &GateAirLeafParams,
 ) -> FinalizedContext<Value> {
     let mut context = Context::new(N_RESERVED);
+    let (_, h_i_vars) = emit_one_base(&mut context, proof, cfg, params);
+    context.set_outputs(&h_i_vars);
+    context.finalize(false)
+}
+
+/// Verifies ONE gate_air base proof in-circuit and emits its output digest `H_i`. This is the
+/// per-child body shared by the single-base leaf ([`build_gate_air_leaf_circuit`]) and the
+/// base-fanning node ([`build_gate_air_base_node_circuit`]) — the whole security-relevant binding
+/// lives here, so folding `b` bases is exactly `b` independent copies of this call (each its own
+/// statement / verify / channel).
+///
+/// Returns `(preprocessed_root_vars, h_i_vars)`: the eight guessed base-proof preprocessed-root words
+/// and the eight `H_i` digest words. The single-base leaf sets `h_i_vars` as its outputs; the
+/// base-node folds `[preprocessed_root_vars, unpack(h_i_vars)]` into the shared node hash.
+pub fn emit_one_base<Value: IValue>(
+    context: &mut Context<Value>,
+    proof: Proof<Value>,
+    cfg: &ProofConfig,
+    params: &GateAirLeafParams,
+) -> (HashValue<Var>, Vec<Var>) {
     let statement = GateAirStatement::<Value>::new(
-        &mut context,
+        context,
         params.main_log_size,
         params.program_log_size,
         params.boundary_log_size,
@@ -127,8 +149,8 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
         params.program.clone(),
         params.nonce,
     );
-    let proof_vars = proof.guess(&mut context);
-    verify(&mut context, &proof_vars, cfg, &statement);
+    let proof_vars = proof.guess(context);
+    verify(context, &proof_vars, cfg, &statement);
 
     // Leaf output (OPEN #3, Fork A): H_i = blake2s( H_P ‖ x ‖ y ), where
     //   H_P = blake2s( program_table ‖ nonce )   — the hiding program commitment.
@@ -145,16 +167,64 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     // leaf emits `H_i = blake2s( H_P ‖ x ‖ y )` as eight words. `H_P` is itself the eight-word digest
     // from `compute_h_p`; its words (each a QM31 `(lo, hi, 0, 0)` message word) lead the preimage,
     // followed by the guessed x/y limb Vars, unchanged.
-    let h_p = statement.compute_h_p(&mut context);
+    let h_p = statement.compute_h_p(context);
     let mut preimage: Vec<_> = h_p.iter().map(|w| *w.get()).collect();
     for (x, y) in statement.boundary_vars() {
         preimage.extend(x.iter().chain(y.iter()).copied());
     }
-    let output_hash: HashValue<_> = blake2s(&mut context, &preimage, 16 * preimage.len());
-    let output_words: Vec<_> = output_hash.iter().map(|w| *w.get()).collect();
-    context.set_outputs(&output_words);
+    let output_hash: HashValue<_> = blake2s(context, &preimage, 16 * preimage.len());
+    let h_i_vars: Vec<Var> = output_hash.iter().map(|w| *w.get()).collect();
+    (statement.preprocessed_root_vars().clone(), h_i_vars)
+}
 
-    context.finalize(false)
+/// Per-base input to a base-fanning node: one gate_air base proof + everything `emit_one_base` needs
+/// to verify it (its own [`ProofConfig`] and [`GateAirLeafParams`]). Each base carries its own params
+/// (its own preprocessed root, (x,y) boundary, program, nonce), so the `b` children are independent.
+pub struct GateAirBaseInput<Value: IValue> {
+    pub proof: Proof<Value>,
+    pub cfg: ProofConfig,
+    pub params: GateAirLeafParams,
+}
+
+/// [`ChildVerifier`] impl that verifies ONE gate_air base proof (via [`emit_one_base`]) and returns
+/// its fold-hash preimage chunk `[preprocessed_root (8 words), H_i unpacked words]` — byte-identical
+/// to what a level-1 multiverifier node emits for a leaf child (`preprocessed_root` words then
+/// `unpack_qm31s_to_u32_words(output_values)`), so a base-node's aggregate is consumable by an R2
+/// node + the unpacker unchanged.
+pub struct GateAirChildVerifier;
+
+impl<Value: IValue> ChildVerifier<Value> for GateAirChildVerifier {
+    type Input = GateAirBaseInput<Value>;
+
+    fn verify_child(
+        &self,
+        context: &mut Context<Value>,
+        input: Self::Input,
+    ) -> Vec<U32Wrapper<Var>> {
+        let GateAirBaseInput { proof, cfg, params } = input;
+        let (pp_root, h_i_vars) = emit_one_base(context, proof, &cfg, &params);
+        // Mirror the multiverifier per-child preimage: eight preprocessed-root words, then the output
+        // digest unpacked into u32 words. `H_i` (eight QM31 `(lo, hi, 0, 0)` words) unpacks the same
+        // way a leaf's `output_values` do, so the byte-identity contract with the unpacker holds.
+        let output_words = unpack_qm31s_to_u32_words(context, h_i_vars.into_iter());
+        pp_root.into_iter().chain(output_words).collect()
+    }
+}
+
+/// Builds a base-fanning node: verify `b` gate_air base proofs directly (each via [`emit_one_base`])
+/// and fold them with the shared multiverifier fold-hash. This does the work of `b` leaves + one
+/// level-1 (leaf-verifying) node in a SINGLE circuit — replacing the standalone leaf layer and the R1
+/// node layer.
+///
+/// Its aggregate output is byte-identical to what a level-1 multiverifier node over `b` leaves emits
+/// (per child `[preprocessed_root words, H_i words]`, children left-to-right, `blake2s_u32s`), so an
+/// R2 node and the out-of-circuit unpacker consume a base-node exactly as they consume an R1 node.
+/// Generic over `Value` so the same topology builds the NoValue shape (config derivation) and the
+/// real QM31 assignment (proving).
+pub fn build_gate_air_base_node_circuit<Value: IValue>(
+    bases: Vec<GateAirBaseInput<Value>>,
+) -> FinalizedContext<Value> {
+    build_fanning_circuit(bases, &GateAirChildVerifier)
 }
 
 /// Derives the multiverifier `AggregateConfig` for gate_air leaves of this proof's shape. Resolves

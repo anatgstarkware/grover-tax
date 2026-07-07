@@ -2404,6 +2404,28 @@ fn gpu_flat_inputs(
 // Base-proof precompute (shard-invariant work built once, reused across shards)
 // ----------------------------------------------------------------------------
 
+/// MULTI-SHARD RESIDENT OOM FIX (opt-in `GATE_AIR_POOL_TRIM`, default OFF). At a SHARD BOUNDARY —
+/// after shard N's base proof completes and its device buffers are dropped, before shard N+1
+/// allocates — trim the CALLING thread's device mem pool so shard N+1 starts from a clean pool and
+/// can run FULLY RESIDENT (the fastest path, the alternative to STREAM_MAIN/LOWMEM). `cuda_pool_trim`
+/// does `cudaStreamSynchronize(0)` (so shard N's stream-0-ordered `cudaFreeAsync`s have landed) then
+/// `cudaMemPoolTrimTo(pool, 0)` for the current device (the per-device `g_mem_pool` macro indexes
+/// `cudaGetDevice()`), releasing already-FREE cached segments back to the driver. It is init-guarded
+/// (no-op if this device's pool isn't up).
+///
+/// BYTE-IDENTITY: `cudaMemPoolTrimTo` only returns segments that are already FREE+drained to the OS;
+/// it never touches a LIVE allocation (the per-device precompute tree0/twiddles/N3 stay live and
+/// untouched), and it changes only WHERE/WHEN device memory is reused, never any committed value.
+/// Default OFF => not called => byte-identical to today. Composes with RESIDENT mode (no STREAM_MAIN
+/// required — that is the point).
+#[cfg(feature = "cuda")]
+fn pool_trim_at_shard_boundary_if_enabled() {
+    if std::env::var("GATE_AIR_POOL_TRIM").is_ok() {
+        // SAFETY: FFI. Sync (stream 0) + trim the current device's pool. No args, no pointers.
+        unsafe { stwo::stwo_cuda::bindings::cuda_pool_trim() };
+    }
+}
+
 /// Build the (size-sorted) preprocessed tree-0 columns for one shard shape. Shared by the
 /// per-shard rebuild path AND the precompute build, so the committed column order/sizes are
 /// IDENTICAL by construction. tree-0 is SHARD-INVARIANT: every column is POSITIONAL
@@ -2452,6 +2474,11 @@ fn build_tree0_columns(
 ///   4. (cuda) the N3 device-resident gate-list / RcIndex-offset buffers — uploaded ONCE.
 /// N4 (the GATE_SIM + INTERACTION PTX modules) is a process-level OnceLock cache in gpu_tracegen,
 /// not part of this struct.
+// `config`/`boundary`/`padded_rows`/`log_n_rows` are read by the cuda `build_device_parts` and by the
+// debug/test-only `assert_tree0_matches_rebuild`; in a NON-cuda RELEASE build (assert compiled out)
+// they are populated-but-unread, so allow dead_code in exactly that config (warning stays live
+// everywhere else to catch genuine dead fields).
+#[cfg_attr(not(any(debug_assertions, test, feature = "cuda")), allow(dead_code))]
 struct BaseProverPrecompute {
     config: stwo::core::pcs::PcsConfig,
     twiddles: stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
@@ -2464,13 +2491,53 @@ struct BaseProverPrecompute {
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
     padded_rows: usize,
     log_n_rows: u32,
-    /// (cuda) device-resident N3 inputs uploaded once: gate list + RcIndex lo/hi offsets. Only the
-    /// per-shard `x_states` upload remains in `prove_base_shard`.
+    /// (cuda) shape needed to REBUILD the device-resident parts on a producer's device (device != 0).
+    #[cfg(feature = "cuda")]
+    max_log_size: u32,
+    #[cfg(feature = "cuda")]
+    n_gates: usize,
+    /// (cuda) device-resident N3 inputs uploaded once ON DEVICE 0: gate list + RcIndex lo/hi offsets.
+    /// Only the per-shard `x_states` upload remains in `prove_base_shard`. For devices != 0 the
+    /// equivalent buffers live in `device_parts` (built lazily per device from the owned inputs).
     #[cfg(feature = "cuda")]
     d_gates: cudarc::driver::CudaSlice<u32>,
     #[cfg(feature = "cuda")]
     d_off_lo: cudarc::driver::CudaSlice<u32>,
     #[cfg(feature = "cuda")]
+    d_off_hi: cudarc::driver::CudaSlice<u32>,
+    // MULTI-GPU ("option A"): the device-resident precompute (tree0 + twiddles + N3 buffers) is bound
+    // to the device it was built on. Device 0's copy is the eager fields above (built + soundness-
+    // asserted in `new`). For a producer thread on device n != 0, `device_parts()` lazily REBUILDS
+    // the same device-resident parts on device n (from the owned host inputs below) and caches them
+    // in slot n. tree0 is shard-invariant, so a device-n rebuild is byte-identical to device 0's —
+    // this is just per-device REPLICATION of the same precompute, not different data. Slot 0 stays
+    // empty (device 0 uses the eager fields); slots 1..MAX filled on demand.
+    #[cfg(feature = "cuda")]
+    rows0: Vec<Row>,
+    #[cfg(feature = "cuda")]
+    gates_flat: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    off_lo: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    off_hi: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    device_parts: [std::sync::OnceLock<DevicePrecompute>; MAX_BASE_GPUS],
+}
+
+/// Number of base GPUs supported by the per-device precompute cache (matches gpu_tracegen's cap).
+#[cfg(feature = "cuda")]
+const MAX_BASE_GPUS: usize = 16;
+
+/// (cuda) The device-resident half of the base precompute, bound to ONE device. Built once per
+/// device (device 0 eagerly in `BaseProverPrecompute::new`, devices != 0 lazily in `device_parts`).
+/// tree0/twiddles are re-derived identically on each device (shard-invariant inputs), so replicating
+/// them per device does not change any committed value.
+#[cfg(feature = "cuda")]
+struct DevicePrecompute {
+    twiddles: stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
+    tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
+    d_gates: cudarc::driver::CudaSlice<u32>,
+    d_off_lo: cudarc::driver::CudaSlice<u32>,
     d_off_hi: cudarc::driver::CudaSlice<u32>,
 }
 
@@ -2549,13 +2616,119 @@ impl BaseProverPrecompute {
             padded_rows,
             log_n_rows,
             #[cfg(feature = "cuda")]
+            max_log_size,
+            #[cfg(feature = "cuda")]
+            n_gates,
+            #[cfg(feature = "cuda")]
             d_gates,
             #[cfg(feature = "cuda")]
             d_off_lo,
             #[cfg(feature = "cuda")]
             d_off_hi,
+            // Owned rebuild inputs so `device_parts` can replicate the device-resident parts on a
+            // producer thread's device (n != 0). Cheap: shard-0 rows + the small N3 flat arrays.
+            #[cfg(feature = "cuda")]
+            rows0: rows0.to_vec(),
+            #[cfg(feature = "cuda")]
+            gates_flat: gates_flat.to_vec(),
+            #[cfg(feature = "cuda")]
+            off_lo: off_lo.to_vec(),
+            #[cfg(feature = "cuda")]
+            off_hi: off_hi.to_vec(),
+            // Slot 0 stays empty (device 0 uses the eager `twiddles`/`tree0`/`d_*` fields above);
+            // slots 1..MAX are filled lazily by `device_parts` on first use from each device's thread.
+            #[cfg(feature = "cuda")]
+            device_parts: [const { std::sync::OnceLock::new() }; MAX_BASE_GPUS],
         })
     }
+
+    /// (cuda) Build the DEVICE-RESIDENT precompute parts (twiddles + tree0 + N3 buffers) on the
+    /// CALLING thread's current device, from the shard-invariant host inputs. Same construction as
+    /// `new` (byte-identical tree0), factored so device-0 (`new`) and device-n (`device_parts`) share
+    /// it. The caller must have already bound its device (via gpu_tracegen::set_base_gpu / cuda_device).
+    #[cfg(feature = "cuda")]
+    fn build_device_parts(&self) -> Result<DevicePrecompute> {
+        use stwo::prover::mempool::BaseColumnPool;
+        use stwo::prover::poly::circle::PolyOps;
+        use stwo::prover::CommitmentTreeProver;
+
+        let twiddles = ProverBackend::precompute_twiddles(
+            CanonicCoset::new(self.max_log_size + 1 + self.config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let pool = BaseColumnPool::<ProverBackend>::new();
+        let cols = build_tree0_columns(
+            &self.program, &self.rows0, self.padded_rows, self.log_n_rows, self.n_gates,
+            &self.boundary,
+        );
+        let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
+        let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
+            polys,
+            self.config.fri_config.log_blowup_factor,
+            &twiddles,
+            false,
+            self.config.lifting_log_size,
+            &pool,
+        );
+        let dev = gpu_tracegen::cuda_device().map_err(|e| anyhow::anyhow!(e))?;
+        let d_gates = dev
+            .htod_copy(self.gates_flat.clone())
+            .map_err(|e| anyhow::anyhow!("htod gates (device precompute): {e}"))?;
+        let d_off_lo = dev
+            .htod_copy(self.off_lo.clone())
+            .map_err(|e| anyhow::anyhow!("htod off_lo (device precompute): {e}"))?;
+        let d_off_hi = dev
+            .htod_copy(self.off_hi.clone())
+            .map_err(|e| anyhow::anyhow!("htod off_hi (device precompute): {e}"))?;
+        Ok(DevicePrecompute { twiddles, tree0, d_gates, d_off_lo, d_off_hi })
+    }
+
+    /// (cuda) The device-resident precompute for the CALLING thread's base GPU ordinal. Device 0
+    /// returns the eager fields built in `new` (byte-identical to the single-GPU path). Devices != 0
+    /// lazily build + cache their own replica on FIRST use from that device's producer thread. tree0
+    /// is shard-invariant, so every device's replica commits the identical root.
+    #[cfg(feature = "cuda")]
+    fn device_parts(&self) -> DevicePartsRef<'_> {
+        let ord = gpu_tracegen::base_gpu_ordinal();
+        if ord == 0 {
+            return DevicePartsRef {
+                twiddles: &self.twiddles,
+                tree0: &self.tree0,
+                d_gates: &self.d_gates,
+                d_off_lo: &self.d_off_lo,
+                d_off_hi: &self.d_off_hi,
+            };
+        }
+        let slot = self
+            .device_parts
+            .get(ord)
+            .unwrap_or_else(|| panic!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"));
+        // Build once per device; the build runs on THIS producer thread (already bound to device
+        // `ord`). Fatal on failure (matches `new`'s `?` — a broken precompute cannot proceed).
+        let parts = slot.get_or_init(|| {
+            self.build_device_parts()
+                .unwrap_or_else(|e| panic!("device {ord} precompute build failed: {e}"))
+        });
+        DevicePartsRef {
+            twiddles: &parts.twiddles,
+            tree0: &parts.tree0,
+            d_gates: &parts.d_gates,
+            d_off_lo: &parts.d_off_lo,
+            d_off_hi: &parts.d_off_hi,
+        }
+    }
+}
+
+/// (cuda) Borrowed view of the device-resident precompute parts (device 0's eager fields or a
+/// device-n cached replica), so `prove_base_shard` reads them uniformly regardless of ordinal.
+#[cfg(feature = "cuda")]
+struct DevicePartsRef<'a> {
+    twiddles: &'a stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
+    tree0: &'a stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
+    d_gates: &'a cudarc::driver::CudaSlice<u32>,
+    d_off_lo: &'a cudarc::driver::CudaSlice<u32>,
+    d_off_hi: &'a cudarc::driver::CudaSlice<u32>,
 }
 
 /// LOAD-BEARING SOUNDNESS CHECK for the base precompute. Independently rebuilds shard 0's tree-0 the
@@ -2566,6 +2739,11 @@ impl BaseProverPrecompute {
 /// A mismatch (wrong column order / blowup / lifting / sort) aborts before any reused proof is built.
 /// Run on shard 0 only (all shards share the shape). `GATE_AIR_NO_BASE_PRECOMPUTE` skips reuse, so
 /// this check is a no-op there (the rebuild path is exercised directly per shard).
+///
+/// Compiled ONLY in debug or test builds: the runtime caller is `#[cfg(debug_assertions)]` and the CI
+/// coverage is `tests::tree0_precompute_matches_rebuild`. Absent from the release binary (its cost is
+/// a full duplicate tree0 build), so `--release` pays nothing and stays byte-identical.
+#[cfg(any(debug_assertions, test))]
 fn assert_tree0_matches_rebuild(
     pc: &BaseProverPrecompute,
     rows0: &[Row],
@@ -2861,6 +3039,18 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            // MULTI-GPU: the device-resident precompute parts (twiddles/tree0/N3) for THIS thread's
+            // device. On device 0 these are the eager fields (byte-identical to before); on device
+            // n != 0 they are the lazily-built per-device replica. `None` (no-precompute fallback)
+            // leaves `dp` None and uses `owned_twiddles` / the per-shard rebuild, unchanged.
+            #[cfg(feature = "cuda")]
+            let dp = precompute.map(|pc| pc.device_parts());
+            #[cfg(feature = "cuda")]
+            let twiddles = match &dp {
+                Some(dp) => dp.twiddles,
+                None => owned_twiddles.as_ref().unwrap(),
+            };
+            #[cfg(not(feature = "cuda"))]
             let twiddles = match precompute {
                 Some(pc) => &pc.twiddles,
                 None => owned_twiddles.as_ref().unwrap(),
@@ -2888,7 +3078,24 @@ fn main() -> Result<()> {
             // commitment_scheme.set_store_polynomials_coefficients();  // disabled: barycentric OODS path
 
             // Tree 0: reuse the precomputed commitment (re-mix the SAME root into THIS shard's
-            // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way.
+            // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way. Under
+            // multi-GPU the reused tree0 is THIS device's replica (`dp.tree0`); its root is identical
+            // to device 0's (shard-invariant), so the transcript mix is unchanged.
+            #[cfg(feature = "cuda")]
+            match &dp {
+                Some(dp) => {
+                    commitment_scheme.commit_tree(MaybeOwned::Borrowed(dp.tree0), prover_channel);
+                }
+                None => {
+                    let pp = build_tree0_columns(
+                        program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
+                    );
+                    let mut tree_builder = commitment_scheme.tree_builder();
+                    tree_builder.extend_evals(to_prover(pp));
+                    tree_builder.commit(prover_channel);
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
             match precompute {
                 Some(pc) => {
                     commitment_scheme
@@ -2938,9 +3145,12 @@ fn main() -> Result<()> {
                         .context("decoding x_hex for GPU trace-gen")?;
                     x_states.extend_from_slice(&state_to_limbs(&bytes));
                 }
-                let (main_dev, _qd, _lo, _hi, d_cols) = match precompute {
-                    Some(pc) => gpu_tracegen::gpu_gen_main_trace_device_d(
-                        &pc.d_gates, &x_states, &pc.d_off_lo, &pc.d_off_hi,
+                let (main_dev, _qd, _lo, _hi, d_cols) = match &dp {
+                    // Multi-GPU: use THIS device's N3 buffers (device 0's eager d_*, or the per-device
+                    // replica) — feeding device-0 buffers to a device-n kernel would be an illegal
+                    // cross-device access.
+                    Some(dp) => gpu_tracegen::gpu_gen_main_trace_device_d(
+                        dp.d_gates, &x_states, dp.d_off_lo, dp.d_off_hi,
                         k as u32, n_gates as u32, shard_samples as u32, padded_rows, log_n_rows,
                     ),
                     None => {
@@ -3070,10 +3280,19 @@ fn main() -> Result<()> {
             // forces guessed x/y == committed AND guessed program == committed. rc demand (main) and rc
             // supply (rc_sum) cancel, contributing 0. (stwo's native verify does NOT require
             // Σ claimed_sums == 0; this is a prover self-check.)
-            let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-            let p_pub = program_public_term(&program, &elements.program);
-            if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
-                bail!("shard claimed sums do not net to the public terms B + P_pub");
+            // Prover self-check (DEBUG-ONLY, compiled out in --release): the base's claimed LogUp sums
+            // must net to the public terms B + P_pub. Pure tripwire — `b_public`/`p_pub` feed nothing
+            // downstream (only `claimed_sums` below is mixed), so gating changes no committed value
+            // (release byte-identical). Per-shard cost (two small-table scans) is thus paid only in
+            // debug. CI coverage: `tests::shard_claimed_sums_net_to_public` (CPU/Simd fixture); this
+            // runtime check additionally guards each run's real secret shot data in debug builds.
+            #[cfg(debug_assertions)]
+            {
+                let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+                let p_pub = program_public_term(&program, &elements.program);
+                if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+                    bail!("shard claimed sums do not net to the public terms B + P_pub");
+                }
             }
 
             let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
@@ -3191,6 +3410,13 @@ fn main() -> Result<()> {
                 &off_hi0,
             )?;
             // Load-bearing soundness gate: cached tree0 root == independent shard-0 rebuild.
+            // DEBUG-ONLY (compiled out in --release): this rebuilds tree0 (interpolate + Merkle), a
+            // costly once-per-run duplicate. Gated so the release hot path pays nothing — the release
+            // proof is byte-identical (the check computes nothing that feeds the proof). The invariant
+            // has CI coverage via `tests::tree0_precompute_matches_rebuild` (CPU/Simd fixture); this
+            // runtime call additionally guards the REAL per-run data (and, in a cuda debug build, the
+            // cuda tree0 path the test cannot exercise).
+            #[cfg(debug_assertions)]
             assert_tree0_matches_rebuild(&pc, &rows0, n_gates);
             eprintln!(
                 "gate-air: base precompute built (tree0+twiddles+N1{}) in {:.3}s",
@@ -3213,6 +3439,53 @@ fn main() -> Result<()> {
         // one-flag diff is the trust gate before this path is used in anger.
         let pipeline = std::env::var("GATE_AIR_PIPELINE").is_ok() && n_shards > 1;
 
+        // MULTI-GPU base proving ("option A"): the number of GPUs to prove base shards on
+        // concurrently, in ONE process. Default 1 = today's single-producer, single-GPU path (device
+        // 0 throughout) — byte-identical. With GATE_AIR_BASE_GPUS=G>1 (and the pipeline active) the
+        // producer side spawns up to G threads, thread n does cuda_set_device(n) once and proves its
+        // assigned shards on GPU n, all feeding the SAME ordered consumer channel. Clamped to the
+        // visible device count (fail-loud if the box has fewer than requested) and to the number of
+        // producer shards. Only meaningful with the CUDA backend; on non-cuda builds it stays 1.
+        let base_gpus: usize = {
+            let requested = std::env::var("GATE_AIR_BASE_GPUS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&g| g >= 1)
+                .unwrap_or(1);
+            #[cfg(feature = "cuda")]
+            {
+                if requested > 1 {
+                    let visible = gpu_tracegen::backend_device_count();
+                    assert!(
+                        visible >= requested,
+                        "GATE_AIR_BASE_GPUS={requested} but only {visible} CUDA device(s) visible \
+                         (set CUDA_VISIBLE_DEVICES or lower the knob) — no silent fallback"
+                    );
+                }
+                requested
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                if requested > 1 {
+                    eprintln!("gate-air: GATE_AIR_BASE_GPUS>1 ignored on non-cuda build (using 1)");
+                }
+                1
+            }
+        };
+        if base_gpus > 1 && !pipeline {
+            // Multi-GPU base proving distributes producer shards across GPUs inside the PIPELINE
+            // consumer; without GATE_AIR_PIPELINE there are no producer threads to distribute. Fail
+            // loud rather than silently prove everything on device 0.
+            bail!(
+                "GATE_AIR_BASE_GPUS={base_gpus} requires GATE_AIR_PIPELINE (multi-GPU base proving \
+                 runs on the pipeline producer threads); set GATE_AIR_PIPELINE or GATE_AIR_BASE_GPUS=1"
+            );
+        }
+        // (Per-device base precompute is now implemented — see `BaseProverPrecompute::device_parts`:
+        // each producer thread lazily rebuilds tree0/twiddles/N3 on ITS device, so the shared
+        // precompute is multi-GPU-safe and NO_BASE_PRECOMPUTE is NOT required. Device 0 keeps the
+        // eager fields => single-GPU byte-identical.)
+
         // Prove the per-shard base proof(s) (each is itself heavy / GPU-bound). In the sequential
         // path, prove all up front. In the pipeline path, prove ONLY shard 0 here (the rest are
         // produced concurrently by the producer thread, below).
@@ -3230,6 +3503,10 @@ fn main() -> Result<()> {
                 let tb = Instant::now();
                 shard_bases.push(prove_base_shard(base_precompute_ref, shard_cases)?);
                 eprintln!("gate-air: MEASURE t_base[shard {s}]={:.3}s", tb.elapsed().as_secs_f64());
+                // RESIDENT multi-shard OOM fix (GATE_AIR_POOL_TRIM): shard `s`'s device buffers are
+                // dropped now; trim the pool so shard s+1 starts clean and fits fully resident.
+                #[cfg(feature = "cuda")]
+                pool_trim_at_shard_boundary_if_enabled();
             }
         }
         eprintln!(
@@ -3385,38 +3662,86 @@ fn main() -> Result<()> {
         };
 
         let (leaves, out) = if pipeline {
-            // PIPELINE: producer thread proves shards 1.. (GPU) and sends each base over a bounded
-            // sync_channel (depth 1, so the producer doesn't race far ahead of the consumer / blow
-            // memory). The consumer (this thread) wraps each base into a leaf in shard order
-            // (starting with shard 0, already proved) and streams the leaves into
-            // `recursive_aggregate_prove_streaming` via a second channel. So GPU base-proving of
-            // shard i+1 overlaps CPU leaf-wrap + fold of shard i. The leaves Vec is collected in
-            // shard order (0..N) for the unchanged prove_root_verification + fingerprint below.
-            eprintln!("gate-air: PIPELINED base||recursion (streaming frontier fold)");
+            // PIPELINE: producer thread(s) prove shards 1.. (GPU) and send each base — TAGGED WITH ITS
+            // SHARD INDEX — over a channel. With GATE_AIR_BASE_GPUS>1, up to `base_gpus` producer
+            // threads run concurrently (one per GPU, round-robin over shards 1..n_shards): thread `g`
+            // binds device `g` (cuda_set_device(g) via set_base_gpu) and proves the shards assigned to
+            // it. The consumer (this thread) REORDERS the tagged bases back into shard order (0,1,2,…)
+            // via a small buffer, wraps each into a leaf, and streams the leaves in shard order into
+            // `recursive_aggregate_prove_streaming`. Shard 0 is proved eagerly above (on device 0, the
+            // main thread) since `agg` needs it. So base-proving overlaps CPU leaf-wrap + fold, AND —
+            // with G>1 — base proofs run G-wide across GPUs (base_wall ≈ ⌈(N-1)/G⌉·t_base).
+            //
+            // BYTE-IDENTITY (leaf ordering): the streaming fold binds the i-th leaf RECEIVED on
+            // `leaf_tx` to shard-tree-position i, so leaves MUST be sent in strict shard-index order.
+            // With concurrent producers bases arrive out of order; the consumer's `pending` buffer +
+            // `next_wrap` cursor guarantee we only ever wrap+send shard `next_wrap`, so `leaves_vec`
+            // and the `leaf_tx` stream are identical to the single-producer order. The GPU ordinal
+            // never enters the transcript/claim/nonce (proof bytes are shard-content-only), so
+            // distributing shards across GPUs does not change any proof. For base_gpus == 1 this is
+            // exactly the previous single-producer flow (one producer, shards ascending, no reorder
+            // needed — the buffer just passes each through).
+            eprintln!(
+                "gate-air: PIPELINED base||recursion (streaming frontier fold), base_gpus={base_gpus}"
+            );
             let t = Instant::now();
-            let mut leaves_vec: Vec<TreeProof> = Vec::with_capacity(n_leaves);
-            let (base_tx, base_rx) = std::sync::mpsc::sync_channel::<Result<BaseShardOutput>>(1);
+            // Shard-indexed leaf slots (filled in order by the consumer); unwrapped to a dense Vec
+            // after the fold. `Option` lets us place each leaf at its shard position regardless of
+            // producer arrival order without requiring `TreeProof: Default`.
+            let mut leaves_vec: Vec<Option<TreeProof>> = (0..n_leaves).map(|_| None).collect();
+            // Tagged bases: (shard_index, result). Unbounded so no producer blocks a peer; the
+            // consumer drains eagerly and memory is bounded by base_gpus in-flight bases + the
+            // reorder buffer (at most one slow shard's worth ahead).
+            let (base_tx, base_rx) =
+                std::sync::mpsc::channel::<(usize, Result<BaseShardOutput>)>();
             let (leaf_tx, leaf_rx) = std::sync::mpsc::channel::<TreeProof>();
             let shard0_base = shard_bases.into_iter().next().unwrap();
+            let n_producer_shards = n_shards - 1; // shards 1..n_shards
+            let g = base_gpus.min(n_producer_shards.max(1));
 
             let out = std::thread::scope(|scope| -> Result<AggregateOutput> {
-                // PRODUCER: prove shards 1..n_shards on the GPU (single producer — one GPU).
-                let producer = scope.spawn(|| {
-                    for (i, shard_cases) in shard_case_sets[1..].iter().enumerate() {
-                        let tb = Instant::now();
-                        let r = prove_base_shard(base_precompute_ref, shard_cases);
-                        eprintln!(
-                            "gate-air: MEASURE t_base[shard {}]={:.3}s",
-                            i + 1,
-                            tb.elapsed().as_secs_f64()
-                        );
-                        let is_err = r.is_err();
-                        // Stop on send failure (consumer gone) or after forwarding an error.
-                        if base_tx.send(r).is_err() || is_err {
-                            break;
-                        }
-                    }
-                });
+                // PRODUCERS: `g` threads, one per GPU. Thread `gpu` proves producer-shards whose
+                // (shard_index-1) % g == gpu, i.e. round-robin over 1..n_shards. Each binds its device
+                // ONCE via set_base_gpu(gpu) (records the tracegen ordinal + cuda_set_device), then
+                // proves sequentially on that device. For g == 1 this is the single producer on gpu 0.
+                // Shared borrows moved (by-ref) into every producer closure. `prove_base_shard` is a
+                // closure over `&gates`/`k`/env — shared immutably across producers; `shard_case_sets`
+                // is read-only. `base_precompute_ref` is `Option<&_>` (Copy).
+                let prove_base_shard_ref = &prove_base_shard;
+                let shard_case_sets_ref = &shard_case_sets;
+                let producers: Vec<_> = (0..g)
+                    .map(|gpu| {
+                        let base_tx = base_tx.clone();
+                        scope.spawn(move || {
+                            #[cfg(feature = "cuda")]
+                            gpu_tracegen::set_base_gpu(gpu);
+                            // Shards 1..n_shards assigned to this gpu (round-robin).
+                            for shard_idx in (1..n_shards).skip(gpu).step_by(g) {
+                                let tb = Instant::now();
+                                let r = prove_base_shard_ref(
+                                    base_precompute_ref,
+                                    &shard_case_sets_ref[shard_idx],
+                                );
+                                eprintln!(
+                                    "gate-air: MEASURE t_base[shard {shard_idx}] (gpu {gpu})={:.3}s",
+                                    tb.elapsed().as_secs_f64()
+                                );
+                                let is_err = r.is_err();
+                                if base_tx.send((shard_idx, r)).is_err() || is_err {
+                                    break;
+                                }
+                                // RESIDENT multi-shard OOM fix (GATE_AIR_POOL_TRIM): this shard's
+                                // device buffers dropped when `prove_base_shard_ref` returned (the sent
+                                // base is host-side). Trim THIS producer's own device pool (bound via
+                                // set_base_gpu(gpu)) so its NEXT round-robin shard starts clean.
+                                #[cfg(feature = "cuda")]
+                                pool_trim_at_shard_boundary_if_enabled();
+                            }
+                        })
+                    })
+                    .collect();
+                // Drop the parent's tx clone so `base_rx` disconnects once all producers finish.
+                drop(base_tx);
 
                 // FOLD: run the streaming fold on a worker thread driven by `leaf_rx`, so the
                 // consumer (this thread) can keep wrapping the next leaf while a fold proceeds.
@@ -3424,24 +3749,51 @@ fn main() -> Result<()> {
                     recursive_aggregate_prove_streaming(leaf_rx, n_leaves, agg_ref, &pools)
                 });
 
-                // CONSUMER (this thread): wrap shard 0 first, then each received base in order.
+                // CONSUMER (this thread): wrap shard 0 first (eager, in-order), then drain tagged
+                // bases, REORDERING to strict ascending shard index before wrap+send.
                 let tl0 = Instant::now();
                 let leaf0 = wrap_leaf(&shard0_base);
                 eprintln!("gate-air: MEASURE t_leaf[0]={:.3}s", tl0.elapsed().as_secs_f64());
-                leaves_vec.push(leaf0.clone());
+                leaves_vec[0] = Some(leaf0.clone());
                 leaf_tx.send(leaf0).expect("fold thread dropped early");
-                for i in 1..n_shards {
-                    let base = base_rx.recv().expect("producer hung up early")?;
-                    let tl = Instant::now();
-                    let leaf = wrap_leaf(&base);
-                    eprintln!("gate-air: MEASURE t_leaf[{i}]={:.3}s", tl.elapsed().as_secs_f64());
-                    leaves_vec.push(leaf.clone());
-                    leaf_tx.send(leaf).expect("fold thread dropped early");
+
+                // Reorder buffer: out-of-order arrivals held here until their turn (next_wrap).
+                let mut pending: std::collections::HashMap<usize, BaseShardOutput> =
+                    std::collections::HashMap::new();
+                let mut next_wrap = 1usize; // shard 0 already wrapped
+                // A helper closure would borrow leaves_vec/leaf_tx mutably+immutably awkwardly, so
+                // inline the "wrap + send in order as far as possible" drain.
+                for _ in 1..n_shards {
+                    let (shard_idx, base) = base_rx.recv().expect("producer hung up early");
+                    let base = base?;
+                    pending.insert(shard_idx, base);
+                    // Emit every now-contiguous shard starting at next_wrap.
+                    while let Some(b) = pending.remove(&next_wrap) {
+                        let tl = Instant::now();
+                        let leaf = wrap_leaf(&b);
+                        eprintln!(
+                            "gate-air: MEASURE t_leaf[{next_wrap}]={:.3}s",
+                            tl.elapsed().as_secs_f64()
+                        );
+                        leaves_vec[next_wrap] = Some(leaf.clone());
+                        leaf_tx.send(leaf).expect("fold thread dropped early");
+                        next_wrap += 1;
+                    }
                 }
+                debug_assert!(pending.is_empty(), "all producer shards must be drained in order");
                 drop(leaf_tx);
-                producer.join().expect("base producer thread panicked");
+                for (gpu, p) in producers.into_iter().enumerate() {
+                    p.join()
+                        .unwrap_or_else(|_| panic!("base producer thread (gpu {gpu}) panicked"));
+                }
                 Ok(folder.join().expect("fold thread panicked"))
             })?;
+            // Unwrap the shard-ordered leaves (every slot filled by the in-order drain above).
+            let leaves_vec: Vec<TreeProof> = leaves_vec
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| l.unwrap_or_else(|| panic!("leaf {i} missing after pipelined fold")))
+                .collect();
             eprintln!(
                 "gate-air: pipelined {n_leaves} leaves + fold in {:.1}s ({} levels)",
                 t.elapsed().as_secs_f64(),
@@ -4198,5 +4550,124 @@ fn normalize(path: PathBuf) -> PathBuf {
         path
     } else {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+    }
+}
+
+// ============================================================================
+// CI coverage for the two prover self-checks that were moved off the release hot path
+// (`assert_tree0_matches_rebuild` and the per-shard claimed-sums balance). These run on the CPU
+// (`ProverBackend == SimdBackend`) over a tiny self-consistent fixture, so they exercise the same
+// invariants `cargo test` while the release binary compiles the runtime checks out. NOTE: the CPU
+// path is exercised here — the debug-gated runtime calls additionally guard the cuda path and each
+// run's real secret data.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tiny self-consistent fixture: an all-NOP circuit (every gate leaves the state unchanged, so
+    /// `y == x`), `k` reps, `n_shots` shots. NOP gates still ACCESS their target qubit, so the
+    /// memory-chain / rc-table / boundary / program machinery is fully exercised. Distinct targets
+    /// per gate keep the per-address ts chains simple. Returns (gates, cases, k).
+    fn nop_fixture(n_gates: usize, n_shots: usize, k: usize) -> (Vec<Gate>, Vec<TestCase>, usize) {
+        assert!(n_gates <= N_QUBITS, "one distinct target qubit per gate");
+        let gates: Vec<Gate> = (0..n_gates)
+            .map(|i| Gate { opcode: OP_NOP, target: i as u16, ctrl_a: NO_CTRL, ctrl_b: NO_CTRL })
+            .collect();
+        // Deterministic but non-trivial 64-byte states; y == x since NOP is the identity.
+        let cases: Vec<TestCase> = (0..n_shots)
+            .map(|s| {
+                let mut st = [0u8; STATE_BYTES];
+                for (b, byte) in st.iter_mut().enumerate() {
+                    *byte = ((s * 31 + b * 7 + 1) & 0xff) as u8;
+                }
+                let hex = hex::encode(st);
+                TestCase { x_hex: hex.clone(), y_hex: hex }
+            })
+            .collect();
+        (gates, cases, k)
+    }
+
+    /// Shape params shared by both tests: build shard-0 rows/boundary/program + pcs config for the
+    /// fixture, matching `main`'s precompute setup.
+    fn shard0_shape(
+        gates: &[Gate],
+        cases: &[TestCase],
+        k: usize,
+    ) -> (Vec<Row>, BoundaryTable, ProgramTable, usize, u32, u32, stwo::core::pcs::PcsConfig) {
+        let (rows, boundary) = build_rows(gates, cases, k).expect("build_rows");
+        let real_rows = rows.len();
+        let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
+        let log_n_rows = padded_rows.ilog2();
+        let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+        let program = build_program_table(gates, cases.len(), k);
+        let config = leaf::leaf_pcs_config(max_log_size, BASE_LOG_BLOWUP_FACTOR);
+        (rows, boundary, program, padded_rows, log_n_rows, max_log_size, config)
+    }
+
+    /// (#1a) The precompute's cached tree-0 must match an independent rebuild (root + column count +
+    /// per-column committed sizes). This is the CI net for `assert_tree0_matches_rebuild`, which is
+    /// now debug-gated off the release hot path.
+    #[test]
+    fn tree0_precompute_matches_rebuild() {
+        let (gates, cases, k) = nop_fixture(4, 2, 1);
+        let n_gates = gates.len();
+        let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
+            shard0_shape(&gates, &cases, k);
+        let pc = BaseProverPrecompute::new(
+            config,
+            max_log_size,
+            program0,
+            &rows0,
+            boundary0,
+            padded_rows,
+            log_n_rows,
+            n_gates,
+        )
+        .expect("precompute new");
+        // Panics on any mismatch (root / column count / sizes) — the invariant under test.
+        assert_tree0_matches_rebuild(&pc, &rows0, n_gates);
+    }
+
+    /// (#2a) The base shard's claimed LogUp sums must net to the public terms B + P_pub. This is the
+    /// CI net for the per-shard self-check, which is now debug-gated off the release hot path. Mirrors
+    /// the exact sum computation in `prove_base_shard`.
+    #[test]
+    fn shard_claimed_sums_net_to_public() {
+        let (gates, cases, k) = nop_fixture(4, 2, 1);
+        let n_gates = gates.len();
+        let (rows, boundary, program, padded_rows, log_n_rows, _max_log_size, _config) =
+            shard0_shape(&gates, &cases, k);
+        let rc_table = build_rc_table(&rows);
+
+        // Draw the LogUp relation exactly as the prover does (salt=0, then config is mixed in the
+        // real path; for a self-contained balance check the challenge just needs to be consistent
+        // across all four sums + the public terms, which one draw guarantees).
+        let mut channel = Blake2sM31Channel::default();
+        channel.mix_felts(&[BaseField::from_u32_unchecked(0).into()]);
+        let elements = LookupElements::draw(&mut channel);
+
+        let (_mi, main_sum) =
+            gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
+        let (_pi, program_sum) = gen_program_interaction(&program, &elements.program);
+        let (_bi, boundary_sum) = gen_boundary_interaction(&boundary, &elements.qubitmem);
+        let (_ri, rc_sum) = {
+            let el = elements.rc.clone();
+            gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
+                el.combine(&[
+                    ptag(TAG_RC),
+                    pack_seq(&rc_table.pos, vec_row),
+                    pack_seq(&rc_table.val, vec_row),
+                ])
+            })
+        };
+
+        let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+        let p_pub = program_public_term(&program, &elements.program);
+        assert_eq!(
+            main_sum + program_sum + boundary_sum + rc_sum,
+            b_public + p_pub,
+            "base claimed sums must net to B + P_pub"
+        );
     }
 }

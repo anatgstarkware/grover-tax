@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# iadd-sim-prove — run the lean qubit-circuit simulator (qsim) through the
+# simple bootloader + stwo-cairo, for the iadd benchmark.
+#
+# Usage: iadd-sim-prove <fixture.json> <K>
+#
+# The fixture's `circuit_byte_serialisation_hex` is the single-repetition
+# GTV1 circuit (same in every iadd fixture); K is passed to the simulator,
+# which runs that circuit K times. Feeds the program input as the flat
+# array the qsim executable expects: [n_cb, b0..b{n_cb-1}, K].
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
+
+FIXTURE="${1:?usage: iadd-sim-prove <fixture.json> <N>}"
+N="${2:-1}"   # number of input states to simulate (K = fixture repetitions)
+PROOF_OUT="${REPO_ROOT}/results/iadd_sim.proof.bin"
+PROOF_FORMAT="${PROOF_FORMAT:-json}"        # override via env (e.g. binary)
+PROVER_PARAMS="${PROVER_PARAMS:-}"          # optional --prover_params_json path
+
+# Use the standalone proving-utils checkout (origin/main), NOT the vendored
+# third_party snapshot. Override with PROVING_UTILS_ROOT if needed.
+PROVING_UTILS_ROOT="${PROVING_UTILS_ROOT:-/home/anat/workspace/proving-utils}"
+PROVING_UTILS_BIN="${PROVING_UTILS_ROOT}/target/release/stwo-run-and-prove"
+EXECUTABLE_JSON="${REPO_ROOT}/stwo-side/cairo/target/dev/iadd_sim_executable.executable.json"
+SIMPLE_BOOTLOADER="${PROVING_UTILS_ROOT}/crates/cairo-program-runner-lib/resources/compiled_programs/bootloaders/simple_bootloader_compiled.json"
+
+for f in "${PROVING_UTILS_BIN}" "${EXECUTABLE_JSON}" "${SIMPLE_BOOTLOADER}" "${FIXTURE}"; do
+  [[ -e "$f" ]] || { echo "missing: $f" >&2; exit 2; }
+done
+
+BL_INPUT="$(mktemp)"
+trap 'rm -f "$BL_INPUT"' EXIT
+
+python3 - "$FIXTURE" "$N" <<'PYEOF' > "$BL_INPUT"
+import json, sys, struct, hashlib
+fixture, n = sys.argv[1], int(sys.argv[2])
+with open(fixture) as f:
+    fix = json.load(f)
+cb = bytes.fromhex(fix["circuit_byte_serialisation_hex"])
+n_cb = len(cb)
+k = int(fix["repetitions"])               # K is baked into the fixture's y_hex
+tcs = fix["test_cases"][:n]
+n = len(tcs)
+
+# Blake2s commitment, split exactly as digest_to_u256_be expects
+# (high = digest[0:16] big-endian, low = digest[16:32] big-endian).
+dg = hashlib.blake2s(cb).digest()
+comm_hi = int.from_bytes(dg[:16],  "big")
+comm_lo = int.from_bytes(dg[16:32], "big")
+
+# Per input: 64 x-bytes then 64 y-bytes.
+state_felts = []
+for tc in tcs:
+    xb = bytes.fromhex(tc["x_hex"]); yb = bytes.fromhex(tc["y_hex"])
+    assert len(xb) == 64 and len(yb) == 64, (len(xb), len(yb))
+    state_felts += list(xb) + list(yb)
+
+# qsim input layout: [n_cb, *cb, comm_lo, comm_hi, K, N, (x,y)*N]
+inner = [n_cb, *list(cb), comm_lo, comm_hi, k, n, *state_felts]
+user_args = [len(inner), *inner]          # Cairo Array<felt> serializes as [len, ...]
+data = {
+    "fact_topologies_path": None,
+    "single_page": True,
+    "tasks": [{
+        "type": "Cairo1Executable",
+        "program_hash_function": "Pedersen",
+        "path": "__EXECUTABLE_JSON__",
+        "user_args_list": user_args,
+    }],
+}
+print(json.dumps(data))
+n_gates = struct.unpack('<I', cb[4:8])[0]
+print(f"# bytes={n_cb} gates/rep={n_gates} K={k} N={n} total_gate_sims={n_gates*k*n}", file=sys.stderr)
+PYEOF
+
+# substitute the executable path (kept out of the heredoc to avoid quoting issues)
+sed -i "s|__EXECUTABLE_JSON__|${EXECUTABLE_JSON}|" "$BL_INPUT"
+
+mkdir -p "$(dirname -- "$PROOF_OUT")"
+
+echo "iadd-sim-prove: fixture=$FIXTURE N=$N"
+echo "iadd-sim-prove: executable=$EXECUTABLE_JSON"
+
+"$PROVING_UTILS_BIN" \
+    --program "$SIMPLE_BOOTLOADER" \
+    --program_input "$BL_INPUT" \
+    --proof_path "$PROOF_OUT" \
+    --proof-format "$PROOF_FORMAT" \
+    ${PROVER_PARAMS:+--prover_params_json "$PROVER_PARAMS"} \
+    --verify
+
+echo "iadd-sim-prove: ✅ proved + verified; proof: $(ls -la "$PROOF_OUT" | awk '{print $5}') bytes"
