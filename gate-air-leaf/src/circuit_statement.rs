@@ -603,6 +603,9 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
                 // limb Var (so the bits are pinned to the SAME limbs that feed the output hash).
                 let mut x_recon = context.zero();
                 let mut y_recon = context.zero();
+                // `p` is the bit position: it indexes `pow2[p]` AND drives `addr` / the `>> p` shift,
+                // so the range loop is intentional (no slice to iterate).
+                #[allow(clippy::needless_range_loop)]
                 for p in 0..LIMB_BITS {
                     let addr = (limb * LIMB_BITS + p) as u32;
                     let addr_c = konst(context, addr);

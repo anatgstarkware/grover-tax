@@ -11,9 +11,11 @@
 //! always routes constraint eval through the audited host delegate — see
 //! `stwo-gpu-port/crates/constraint-framework/src/prover/cuda_component_prover.rs`). This module
 //! therefore provides:
-//!   1. The comparison PRIMITIVE that operates on the two host-side results (works today).
-//!   2. A precise, line-cited plan for WHERE the CPU oracle column and the GPU kernel column are
-//!      produced and HOW they are brought to host for the diff.
+//!
+//! 1. The comparison PRIMITIVE that operates on the two host-side results (works today).
+//! 2. A precise, line-cited plan for WHERE the CPU oracle column and the GPU kernel column are
+//!    produced and HOW they are brought to host for the diff.
+//!
 //! It does NOT modify any CPU constraint-eval / prover / verifier math (HARD CONSTRAINT): the diff
 //! is a pure read of two already-computed `SecureColumnByCoords` results.
 //!

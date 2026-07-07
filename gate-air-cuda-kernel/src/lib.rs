@@ -18,7 +18,6 @@
 //! installed via [`set_gate_air_relation`].
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -142,16 +141,30 @@ impl GateAirEvalFfi {
     }
 }
 
-/// gate_air's drawn LogUp challenges (z, alpha_powers[0..6]), each an M31x4 (QM31 coord) value.
-/// Set by the leaf prover AFTER drawing the LogUp relation and BEFORE `prove_ex` — the challenges
-/// live inside the opaque `GateEval`, so this gate_air-specific hook threads them to the kernel.
-/// `None` until set → [`run_gate_air_kernel`] returns `false` (host-delegate fallback).
-static GATE_AIR_RELATION: Mutex<Option<([u32; 4], [[u32; 4]; GATE_AIR_REL_WIDTH])>> =
-    Mutex::new(None);
+// gate_air's drawn LogUp challenges (z, alpha_powers[0..6]), each an M31x4 (QM31 coord) value.
+// Set by the leaf prover AFTER drawing the LogUp relation and BEFORE `prove_ex` — the challenges
+// live inside the opaque `GateEval`, so this gate_air-specific hook threads them to the kernel.
+// `None` until set → [`run_gate_air_kernel`] returns `false` (host-delegate fallback).
+//
+// THREAD_LOCAL for in-process multi-GPU base proving ("option A"). `set_gate_air_relation` is called
+// PER SHARD, on that shard's producer thread, right before that shard's `prove_ex`; the value is
+// then READ during the composition kernel launch on the SAME thread. A single process-global (the
+// old `Mutex<Option<..>>`) is a genuine SET-then-READ RACE under concurrent producers: producer B's
+// `set` (its own z/alpha, drawn from B's transcript) could overwrite the relation between producer
+// A's `set` and A's kernel read → A commits the WRONG composition polynomial = a soundness bug (the
+// same race class as `g_should_accumulate_host`, and squarely on the CUDA_GPU_CONSTRAINTS critical
+// path). thread_local gives each producer thread its own relation; the set→read pair stays
+// same-thread, so single-GPU behavior is byte-identical (one thread only ever sees its own value).
+thread_local! {
+    static GATE_AIR_RELATION: std::cell::Cell<Option<([u32; 4], [[u32; 4]; GATE_AIR_REL_WIDTH])>> =
+        const { std::cell::Cell::new(None) };
+}
 
-/// Install gate_air's drawn LogUp relation challenges for the GPU constraint kernel. `alpha_powers`
-/// must contain GATE_AIR_REL_WIDTH (6) entries (alpha^0..alpha^5), each as M31x4 coords. No effect
-/// unless the kernel gate (`CUDA_GPU_CONSTRAINTS=1` + gate_air main) fires.
+/// Install gate_air's drawn LogUp relation challenges for the GPU constraint kernel, FOR THE CALLING
+/// THREAD. `alpha_powers` must contain GATE_AIR_REL_WIDTH (6) entries (alpha^0..alpha^5), each as
+/// M31x4 coords. No effect unless the kernel gate (`CUDA_GPU_CONSTRAINTS=1` + gate_air main) fires.
+/// Must be called on the SAME thread that then drives `prove_ex` for this shard (it is — the
+/// producer thread calls this then proves).
 pub fn set_gate_air_relation(z: [u32; 4], alpha_powers: Vec<[u32; 4]>) {
     assert_eq!(
         alpha_powers.len(),
@@ -160,7 +173,7 @@ pub fn set_gate_air_relation(z: [u32; 4], alpha_powers: Vec<[u32; 4]>) {
     );
     let mut ap = [[0u32; 4]; GATE_AIR_REL_WIDTH];
     ap.copy_from_slice(&alpha_powers[..GATE_AIR_REL_WIDTH]);
-    *GATE_AIR_RELATION.lock().unwrap() = Some((z, ap));
+    GATE_AIR_RELATION.with(|r| r.set(Some((z, ap))));
 }
 
 /// Inputs to the gate_air GPU constraint kernel; trace columns are device-resident `BaseFieldVec`s.
@@ -238,7 +251,9 @@ fn run_gate_air_kernel(inputs: GateAirKernelInputs<'_>, accum_cols: [&BaseFieldV
 
     // Fall back to the host delegate (rather than emit a zeroed-relation proof) if the leaf prover
     // did not install the drawn (z, alpha_powers).
-    let mut gate_eval = match GATE_AIR_RELATION.lock().unwrap().clone() {
+    // Read THIS thread's installed relation (thread_local — see the definition). `Cell::get` needs
+    // `Copy`; the payload is `([u32;4], [[u32;4];6])` which is `Copy`, so this is a cheap copy-out.
+    let mut gate_eval = match GATE_AIR_RELATION.with(|r| r.get()) {
         Some((z, ap)) => GateAirEvalFfi::new_with_relation(inputs.log_n_rows, z, ap),
         None => return false,
     };

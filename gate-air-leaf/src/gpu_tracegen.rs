@@ -75,17 +75,105 @@ extern "C" {
     fn cuda_mem_pool_free_uint32(ptr: *mut u32);
 }
 
-/// Shared cudarc handle on device-0's PRIMARY CUDA context, cached process-wide. The NitrooZK
-/// `CudaBackend` (stwo_cuda) also targets device-0's primary context (CUDA runtime-API default), so
-/// device pointers produced by these cudarc K1/K4 kernels interoperate with the backend's commit
-/// (the device-to-device bridge). Replaces the obelyzk `get_cuda_executor`. [box-verified]
+// MULTI-GPU ("option A"): the base GPU ORDINAL this host thread proves on. A producer thread proving
+// shard set S on GPU n calls `set_base_gpu(n)` once at its start; every `cuda_device()` /
+// module-cache access below then keys off THIS thread's ordinal, so the harness tracegen lands on
+// the SAME device (n) as the backend commit for that shard. DEFAULT 0 for every un-set thread, so
+// the single-GPU path (one producer, ordinal 0) is byte-identical to before (device 0 throughout).
+thread_local! {
+    static BASE_GPU_ORDINAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the current host thread's base GPU ordinal (multi-GPU producer setup). Idempotent per thread.
+/// Records the ordinal for the harness tracegen (`cuda_device`) AND, under the device-resident
+/// backend, binds the backend's CUDA runtime current-device for this thread so its pool/commit calls
+/// target the same device. Call ONCE at the top of each producer thread, before any GPU work.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn set_base_gpu(ordinal: usize) {
+    BASE_GPU_ORDINAL.with(|c| c.set(ordinal));
+    // Bind the backend (stwo_cuda) runtime current-device on THIS thread. cudarc's cuda_device()
+    // also binds the primary context (== runtime device) on first use, but the backend may issue a
+    // runtime-API call before that; setting it explicitly here removes the ordering dependency.
+    // Only under the device-resident backend (feature = "cuda"); no-op on the K1/K4-only build.
+    #[cfg(feature = "cuda")]
+    {
+        let rc = unsafe { stwo::stwo_cuda::bindings::cuda_set_device(ordinal as i32) };
+        assert_eq!(rc, 0, "cuda_set_device({ordinal}) failed on producer thread");
+    }
+}
+
+/// Visible CUDA device count (0 on error / no backend). Used to clamp the GATE_AIR_BASE_GPUS knob.
+#[cfg(all(feature = "gpu-cuda", feature = "cuda"))]
+pub(crate) fn backend_device_count() -> usize {
+    let n = unsafe { stwo::stwo_cuda::bindings::cuda_device_count() };
+    n.max(0) as usize
+}
+
+/// The current host thread's base GPU ordinal (0 unless a producer set it).
+pub(crate) fn base_gpu_ordinal() -> usize {
+    BASE_GPU_ORDINAL.with(|c| c.get())
+}
+
+/// Build a PRIVATE rayon `ThreadPool` whose every worker is bound to CUDA device `gpu` (multi-GPU
+/// SIGSEGV fix, Class-1). The producer thread proves its shard INSIDE this pool via `pool.install(..)`,
+/// so the OODS-phase rayon fan-outs (`build_weights_hash_map`'s `par_iter`, OODS `par_map_cols` in
+/// `pcs/mod.rs`) dispatch to THESE workers instead of rayon's GLOBAL pool. The global pool's workers
+/// were never device-bound (default device 0), so on device N != 0 they dereferenced device-N pointers
+/// while current-device-0 => illegal address => SIGSEGV. Binding each worker via `set_base_gpu(gpu)`
+/// (which sets BOTH the driver `cudaSetDevice` AND the cudarc thread_local ordinal, exactly like the
+/// producer) makes the fan-out run on device N, matching the pointers.
+///
+/// `num_threads` (mechanical choice): the fan-out is light CPU glue that only LAUNCHES kernels — the
+/// heavy compute is on-GPU and serializes on device N's stream regardless — so a small pool suffices
+/// and avoids over-subscribing cores across the G concurrent producers. Default 4, overridable via
+/// `GATE_AIR_OODS_POOL_THREADS` for box tuning. (Correctness is independent of the count; it only
+/// affects fan-out parallelism.)
+///
+/// BYTE-IDENTITY: a private pool changes only WHICH threads run the fan-out and WHICH device they are
+/// bound to — never the work, the order of commits, or any Fiat-Shamir draw. rayon's `par_iter`/
+/// `par_map_cols` are already order-independent reductions/maps; running them on a 4-thread private
+/// pool vs. the global pool yields identical results. At N=1 (device 0) the workers bind device 0,
+/// identical to today's global-pool-on-device-0 behavior.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn build_device_bound_pool(gpu: usize) -> rayon::ThreadPool {
+    let num_threads = std::env::var("GATE_AIR_OODS_POOL_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(move |i| format!("gate-air-oods-gpu{gpu}-{i}"))
+        .start_handler(move |_| set_base_gpu(gpu))
+        .build()
+        .unwrap_or_else(|e| panic!("failed to build device-bound OODS pool for gpu {gpu}: {e}"))
+}
+
+/// Shared cudarc handle on the CURRENT THREAD's target device primary CUDA context, cached
+/// process-wide PER ORDINAL. The NitrooZK `CudaBackend` (stwo_cuda) targets the same device's
+/// primary context via the CUDA runtime API, and cudarc `CudaDevice::new(n)` retains + binds that
+/// SAME primary context (`ctx::set_current`), so once a thread has used this handle its runtime
+/// current-device is also `n` — device pointers produced by these cudarc K1/K4 kernels interoperate
+/// with the backend's commit on the same device. For the single-GPU path the ordinal is 0 and this
+/// is byte-identical to the previous single-`OnceLock` behavior. Replaces the obelyzk
+/// `get_cuda_executor`. [box-verified for n=0]
 pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
-    static DEV: OnceLock<Arc<cudarc::driver::CudaDevice>> = OnceLock::new();
-    if let Some(d) = DEV.get() {
+    // One cached device handle per ordinal. `MAX_BASE_GPUS` slots is plenty (GPUs 0..7 on the box).
+    const MAX_BASE_GPUS: usize = 16;
+    static DEVS: [OnceLock<Arc<cudarc::driver::CudaDevice>>; MAX_BASE_GPUS] =
+        [const { OnceLock::new() }; MAX_BASE_GPUS];
+    let ord = base_gpu_ordinal();
+    let slot = DEVS.get(ord).ok_or_else(|| format!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"))?;
+    if let Some(d) = slot.get() {
+        // Ensure THIS thread has the device's primary context current (cheap; needed when the same
+        // cached handle is first touched from a new thread — see cudarc bind_to_thread contract).
+        d.bind_to_thread()
+            .map_err(|e| format!("bind_to_thread(dev {ord}): {e}"))?;
         return Ok(d.clone());
     }
-    let d = cudarc::driver::CudaDevice::new(0).map_err(|e| format!("CudaDevice::new(0): {e}"))?;
-    let _ = DEV.set(d.clone());
+    let d = cudarc::driver::CudaDevice::new(ord)
+        .map_err(|e| format!("CudaDevice::new({ord}): {e}"))?;
+    let _ = slot.set(d.clone());
     Ok(d)
 }
 
@@ -101,9 +189,19 @@ fn gate_sim_module(
     dev: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<(&'static str, bool), String> {
     use cudarc::nvrtc::compile_ptx;
-    static LOADED: OnceLock<Result<(), String>> = OnceLock::new();
+    // PER-ORDINAL load guard: cudarc registers a loaded module on the SPECIFIC CudaDevice (its
+    // CUcontext), so each device must load the PTX once. A single shared guard would load only on
+    // the first device and leave the others' `get_func` unresolved. Keyed by the caller's ordinal
+    // (== dev.ordinal()); slot [0] for the single-GPU path => same one-load behavior as before.
+    const MAX_BASE_GPUS: usize = 16;
+    static LOADED: [OnceLock<Result<(), String>>; MAX_BASE_GPUS] =
+        [const { OnceLock::new() }; MAX_BASE_GPUS];
+    let ord = dev.ordinal();
+    let guard = LOADED
+        .get(ord)
+        .ok_or_else(|| format!("gate_sim_module: ordinal {ord} >= {MAX_BASE_GPUS}"))?;
     let mut first = false;
-    let res = LOADED.get_or_init(|| {
+    let res = guard.get_or_init(|| {
         first = true;
         let ptx = compile_ptx(GATE_SIM_KERNEL).map_err(|e| format!("nvrtc compile: {e}"))?;
         // Qubit-memory encoding, thread-per-EXECUTION (recovered): `prog_slot_meta` precomputes the
@@ -126,7 +224,14 @@ fn interaction_module(
     dev: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<(&'static str, bool), String> {
     use cudarc::nvrtc::compile_ptx;
-    static LOADED: OnceLock<Result<(), String>> = OnceLock::new();
+    // PER-ORDINAL load guard (see gate_sim_module): the K4 module must load once per device.
+    const MAX_BASE_GPUS: usize = 16;
+    static LOADED: [OnceLock<Result<(), String>>; MAX_BASE_GPUS] =
+        [const { OnceLock::new() }; MAX_BASE_GPUS];
+    let ord = dev.ordinal();
+    let guard = LOADED
+        .get(ord)
+        .ok_or_else(|| format!("interaction_module: ordinal {ord} >= {MAX_BASE_GPUS}"))?;
     let names = [
         "logup_col_gen",
         "logup_finalize_col",
@@ -139,7 +244,7 @@ fn interaction_module(
         "ps_add_offsets",
     ];
     let mut first = false;
-    let res = LOADED.get_or_init(|| {
+    let res = guard.get_or_init(|| {
         first = true;
         let ptx =
             compile_ptx(INTERACTION_KERNEL).map_err(|e| format!("nvrtc compile (K4): {e}"))?;
