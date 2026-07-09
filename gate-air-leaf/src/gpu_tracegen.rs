@@ -1,30 +1,30 @@
 //! P3.1 — K1: CUDA gate-sim + main-trace kernel for gate_air (on-device "model B").
 //!
 //! ============================================================================================
-//! RE-SYNCED to the CURRENT (sound, final) CPU design: ts = pc+1 (inlined) + rc-table range-check, 22-col.
+//! RE-SYNCED to the CURRENT (sound, final) CPU design: ts = pc+1 (inlined) + single-`d` rc-table
+//! range-check, 19-col.
 //! --------------------------------------------------------------------------------------------
 //! This file mirrors the FINAL CPU encoding (`main.rs` `GateEval` / `cell_at` / `gen_main_interaction`
 //! / `build_rc_table`): the access timestamp is the affine `ts = pc + 1` of the preprocessed `pc`
-//! (NOT a witness column — inlined in K4 and the AIR), plus a range-check on `d = ts - prev_ts - 1 =
-//! pc - prev_ts` via two limbs looked up into an rc supply table. The target's `v_after` is likewise
-//! NOT a column (= v_before + delta, inlined). This dropped the 3 per-access `ts` columns + the target
-//! `v_after` column: 26 -> 22.
+//! (NOT a witness column — inlined in K4 and the AIR), plus a range-check on the SINGLE diff
+//! `d = ts - prev_ts - 1 = pc - prev_ts` looked up into a dynamic rc supply table. The target's
+//! `v_after` is likewise NOT a column (= v_before + delta, inlined). This dropped the 3 per-access
+//! `ts` columns + the target `v_after` column, and (this change) collapsed the two rc limbs to a
+//! single `d` column: 22 -> 19.
 //!   * ts closed form (thread-per-execution SURVIVES): `ts = pc + 1`, `pc = rep*n_gates + gate_idx` —
 //!     known per execution, shared by all accesses of the step (no per-gate slot).
 //!     `prev_ts` is the ts of the previous access to this addr (0 = init), so it is NO LONGER
 //!     `ts-1` in general; K1 reconstructs it from `prog_slot_meta`'s cyclic-predecessor constants
 //!     (predecessor pc + 1; see `prev_ts_of`).
-//!   * rc LIMBS: two range-check limb columns per access — `rc_lo = d & (2^RC_LO_BITS - 1)`,
-//!     `rc_hi = d >> RC_LO_BITS` with `d = pc - prev_ts`. Layout is now ACCESS_BLOCK = 5
-//!     (addr,prev_ts,v,rc_lo,rc_hi), TRACE_COLUMNS = 22 (see `cell_at`/`ACCESS_BLOCK` in main.rs).
-//!   * rc HISTOGRAM: a single 2^RC_LOG_SIZE multiplicity histogram over `row_of(pos,limb)` —
-//!     RC_POS_LO block rows [0, 2^RC_LO_BITS) hold the lo-limb counts, RC_POS_HI block rows
-//!     [2^RC_LO_BITS, 2^RC_LO_BITS + 2^RC_HI_BITS) hold the hi-limb counts (main.rs `RcTable::row_of`).
-//!     Each ACTIVE access bumps `hist[rc_lo] += 1` and `hist[2^RC_LO_BITS + rc_hi] += 1`. Emitted into
-//!     the (formerly unused) `rc_lo` device arg (`rc_hi` arg stays inert). NOTE: on the PRODUCTION
-//!     path the rc multiplicity WITNESS column is built ON THE HOST from the always-present CPU `rows`
-//!     (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is used ONLY
-//!     by the `k1_byte_identity` diagnostic to cross-check the device histogram against the CPU one.
+//!   * rc DIFF: a SINGLE range-check column per access — `d = pc - prev_ts` (25-bit, no limb split).
+//!     Layout is now ACCESS_BLOCK = 4 (addr,prev_ts,v,d), TRACE_COLUMNS = 19 (see `cell_at`/
+//!     `ACCESS_BLOCK` in main.rs).
+//!   * rc HISTOGRAM: a single `2^rc_log` multiplicity histogram over `d` (rc_log = rc_log_size(
+//!     k*n_gates), DYNAMIC per run). Each ACTIVE access bumps `hist[d] += 1` (one bump/access).
+//!     Emitted into the (formerly unused) `rc_lo` device arg (`rc_hi` arg stays inert). NOTE: on the
+//!     PRODUCTION path the rc multiplicity WITNESS column is built ON THE HOST from the always-present
+//!     CPU `rows` (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is
+//!     used ONLY by the `k1_byte_identity` diagnostic to cross-check the device histogram against CPU.
 //!   * boundary: nothing on the MAIN kernel (the `gate_bnd_enabler`-gated (B)/(D) is host-only).
 //!
 //! QUBIT-MEMORY ENCODING (branch anatg/gate-air-qubit-mem).
@@ -52,8 +52,8 @@
 //! block; only how ts/prev_ts/rc are produced changed.
 //!
 //! SOUNDNESS / BYTE-IDENTITY: K1's per-gate body mirrors `simulate_shot` (the ctrl_a/ctrl_b/target
-//! access order, the value gate-apply, delta_to_m31), the `cell_at` 22-column layout, the closed-form
-//! `ts = pc*TS_STRIDE + slot`, `prev_ts` (per-address chain), and the two rc limbs + histogram.
+//! access order, the value gate-apply, delta_to_m31), the `cell_at` 19-column layout, the closed-form
+//! `ts = pc + 1`, `prev_ts` (per-address chain), and the single rc diff `d` + histogram.
 //! Validated by GATE_AIR_GPU_TEST=k1 / k4 column-by-column (+ histogram) vs CPU.
 
 use std::sync::{Arc, OnceLock};
@@ -62,11 +62,11 @@ use std::sync::{Arc, OnceLock};
 //
 // These are NitrooZK's `size_t`-based pool wrappers (crates/stwo/.../cuda_mem_pool.cu), NOT the
 // u32-based `BaseFieldVec::new_zeroes` path. CRITICAL: at 2^25 the buffer is
-// `TRACE_COLUMNS * padded_rows = 188 * 2^25 = 6,308,233,216` u32s, which OVERFLOWS the `u32`/`int`
-// argument of `cuda_alloc_zeroes_uint32_t` (BaseFieldVec::new_zeroes) — that truncation allocated an
-// ~8 GB buffer and the K1 kernel then wrote 24 GB into it → out-of-bounds device write → SIGABRT at
-// the K1 sync (exit=134, box-confirmed). `cuda_mem_pool_allocate_zeroes_uint32` takes `size_t`, so
-// the full 6.3e9-element (24 GB) request is passed intact. Both alloc + free route through
+// `TRACE_COLUMNS * padded_rows` u32s can OVERFLOW the `u32`/`int` argument of
+// `cuda_alloc_zeroes_uint32_t` (BaseFieldVec::new_zeroes) at large sizes — that truncation allocated
+// a too-small buffer and the K1 kernel then wrote the full buffer into it → out-of-bounds device
+// write → SIGABRT at the K1 sync (exit=134, box-confirmed on the historical 188-col encoding).
+// `cuda_mem_pool_allocate_zeroes_uint32` takes `size_t`, so the full request is passed intact. Both alloc + free route through
 // NitrooZK's `g_mem_pool` (`cudaMallocFromPoolAsync` / `cudaFreeAsync`) — the same pool tree2 draws
 // from — so the freed buffer is directly reusable by tree2. Linked from the stwo cuda static lib.
 #[cfg(feature = "gpu-cuda")]
@@ -326,9 +326,9 @@ fn launch_k0_states(
 }
 
 /// NVRTC-compiled CUDA source for the gate-sim kernels. Layout/constants mirror gate_air `main.rs`:
-/// N_QUBITS=512, N_LIMBS=32, LIMB_BITS=16, TRACE_COLUMNS=22, M31 modulus 2^31-1,
-/// opcodes NOP=0/NOT=1/CNOT=2/TOFFOLI=3, ts = pc+1 (TS_STRIDE=1, no slot),
-/// RC_LO_BITS=15 (rc histogram: lo block rows [0,2^15), hi block rows [2^15, 2^15+2^10)).
+/// N_QUBITS=512, N_LIMBS=32, LIMB_BITS=16, TRACE_COLUMNS=19, M31 modulus 2^31-1,
+/// opcodes NOP=0/NOT=1/CNOT=2/TOFFOLI=3, ts = pc+1 (no slot); the ts-ordering diff is the SINGLE
+/// column `d = pc - prev_ts` (rc histogram: one bump per active access at row `d ∈ [0,2^rc_log)`).
 ///
 /// Buffers (all device):
 /// - `gates`:   n_gates * 4  (opcode, target_q, ctrl_a_q, ctrl_b_q), u32
@@ -341,10 +341,11 @@ fn launch_k0_states(
 ///   program order, and wrap = 1 iff that predecessor is in the PREVIOUS rep (0 iff the same rep). K1
 ///   turns them into `prev_ts` (the predecessor's closed-form ts, or 0 at the program-wide first access).
 /// - `cols`:    TRACE_COLUMNS * padded_rows, column-major (col c at cols[c*padded_rows + row]), u32
-/// - `rc_lo` (repurposed): the 2^RC_LOG_SIZE rc-table MULTIPLICITY HISTOGRAM over row_of(pos,limb)
-///   (K1 atomically bumps hist[rc_lo] and hist[(1<<RC_LO_BITS)+rc_hi] per active access). Caller must
-///   zero it. `rc_hi` (repurposed) is INERT (kept for arg-list compatibility). NB: production uses the
-///   HOST-built rc multiplicity witness (main.rs build_rc_table); this histogram feeds only k1 tests.
+/// - `rc_lo` (repurposed): the 2^rc_log rc-table MULTIPLICITY HISTOGRAM over `d` (K1 atomically bumps
+///   hist[d] once per active access). Caller must zero it and size it to at least `1 << rc_log`
+///   (rc_log = rc_log_size(k*n_gates)). `rc_hi` (repurposed) is INERT (kept for arg-list
+///   compatibility). NB: production uses the HOST-built rc multiplicity witness (main.rs
+///   build_rc_table); this histogram feeds only the k1 diagnostic.
 /// Scalars: k, n_gates, n_shots, padded_rows (shot_rows = k*n_gates computed in-kernel).
 /// NOTE: caller must zero `cols` first; padding rows [n_shots*shot_rows, padded_rows) stay 0
 /// (`Row::padding()` is all-zero — `fill_padding` is a no-op stub).
@@ -363,26 +364,23 @@ pub const GATE_SIM_KERNEL: &str = r#"
 #define SLOT_CTRL_A 1u
 #define SLOT_CTRL_B 2u
 #define SLOT_TARGET 3u
-#define RC_LO_BITS 15u
-#define RC_LO_MASK 0x7FFFu
-#define RC_LO_LEN 0x8000u   /* 1u << RC_LO_BITS */
 
 // QUBIT-MEMORY ENCODING (branch anatg/gate-air-qubit-mem) — THREAD-PER-EXECUTION, pc-pinned ts.
 // -------------------------------------------------------------------------------------------
 // The old whole-state (TAG_STATE, 188/191-col) chain is replaced by a per-qubit chain-lookup
-// qubit-memory (TAG_QUBITMEM, 22-col). Each row is ONE gate execution. Per row the CPU
+// qubit-memory (TAG_QUBITMEM, 19-col). Each row is ONE gate execution. Per row the CPU
 // `simulate_shot` (main.rs) maintains, PER SHOT (reset each shot, threaded across ALL k reps):
 //   last_ts[addr], last_val[addr]  — the (ts, value) of the most recent access at each qubit
 // An access reads (prev_ts = last_ts[addr], v_before = last_val[addr]), sets the PROGRAM-ORDER
-// timestamp ts = pc*TS_STRIDE + slot (slot ctrl_a=1/ctrl_b=2/target=3; pc = rep*n_gates + gate), then
+// timestamp ts = pc + 1 (pc = rep*n_gates + gate; SHARED by all accesses of a step, no slot), then
 // writes last_ts[addr] = ts (and last_val[addr] = v_after for the target, unchanged for controls). The
-// diff d = ts - prev_ts - 1 (>= 0) is split into rc_lo = d & (2^RC_LO_BITS-1), rc_hi = d >> RC_LO_BITS.
+// diff d = ts - prev_ts - 1 = pc - prev_ts (>= 0) is a SINGLE 25-bit column (no limb split).
 //
-// TIMESTAMP-ORDERING (pc-pinned ts + rc-table range-check, the FINAL sound design):
-//   * ts is PINNED to the preprocessed pc: ts == pc*TS_STRIDE + slot (AIR constraint). Closed form in
-//     (rep, gate, slot) — no running counter.
-//   * prev_ts < ts is proved by range-checking d = ts - prev_ts - 1 via its two limbs (rc_lo, rc_hi)
-//     looked up into the rc supply table.
+// TIMESTAMP-ORDERING (pc-pinned ts + single-`d` rc-table range-check, the FINAL sound design):
+//   * ts is PINNED to the preprocessed pc: ts == pc + 1 (AIR constraint). Closed form in (rep, gate) —
+//     no running counter.
+//   * prev_ts < ts is proved by range-checking the single diff `d = ts - prev_ts - 1` looked up as
+//     (TAG_RC, d) into the DYNAMIC rc supply table (d ∈ [0, 2^rc_log_size(k*n_gates))).
 //
 // CLOSED-FORM ts + prev_ts (thread-per-EXECUTION survives): ts is closed form in the pc. prev_ts is
 // the closed-form ts of the PREVIOUS access to the same addr in cyclic program order. `prog_slot_meta`
@@ -398,16 +396,16 @@ pub const GATE_SIM_KERNEL: &str = r#"
 //     limbs) at the START of every (shot, rep) into rep_states. Seeds K1's per-execution value chain.
 //   K1 `gate_sim` — thread-per-EXECUTION. Thread `exec = shot*k + rep` seeds a local 512-state from
 //     rep_states[exec], processes the rep's n_gates gates updating that local state for v_before/
-//     v_after, fills ts (closed form) + prev_ts + rc_lo/rc_hi from `slot_meta`+`rep`, and atomically
-//     bumps the rc histogram. Grid = n_shots*k (full parallelism).
+//     v_after, fills ts (closed form) + prev_ts + the single diff `d` from `slot_meta`+`rep`, and
+//     atomically bumps the rc histogram (one bump per active access, over `d`). Grid = n_shots*k.
 //
-// 22-col cell_at layout (main.rs cell_at, all WITNESS; enabler/shot_id/pc/pc_in_prog are tree0;
+// 19-col cell_at layout (main.rs cell_at, all WITNESS; enabler/shot_id/pc/pc_in_prog are tree0;
 // ts = pc+1 and the target's v_after = v_before+delta are INLINED, not columns):
 //   [0..4)   is_nop, is_not, is_cnot, is_toffoli
-//   [4..9)   target:  addr, prev_ts, v_before, rc_lo, rc_hi   (ACCESS_BLOCK = 5)
-//   [9..14)  ctrl_a:  addr, prev_ts, v, rc_lo, rc_hi
-//   [14..19) ctrl_b:  addr, prev_ts, v, rc_lo, rc_hi
-//   [19..22) ab, fire, delta
+//   [4..8)   target:  addr, prev_ts, v_before, d   (ACCESS_BLOCK = 4)
+//   [8..12)  ctrl_a:  addr, prev_ts, v, d
+//   [12..16) ctrl_b:  addr, prev_ts, v, d
+//   [16..19) ab, fire, delta
 //
 // Boundary init/final is a SEPARATE CPU-built component (BoundaryTable); the GPU main-trace kernel
 // does not emit it.
@@ -558,7 +556,7 @@ extern "C" __global__ void gate_sim_states(
 // pc*TS_STRIDE+slot), prev_ts (from slot_meta's cyclic-predecessor constants), and the two rc limbs.
 // `off_lo` is repurposed to carry rep_states and `off_hi` to carry slot_meta (both formerly-unused arg
 // slots — keeps the launch tuple at 8 pointers + 4 scalars, cudarc's cap). `qdecode` stays UNUSED;
-// `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM (atomic bumps); `rc_hi` stays INERT.
+// `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM over `d` (atomic bumps); `rc_hi` INERT.
 extern "C" __global__ void gate_sim(
     const unsigned* __restrict__ gates,
     const unsigned* __restrict__ x_states,      // UNUSED by K1 (state comes from rep_states); compat
@@ -566,7 +564,7 @@ extern "C" __global__ void gate_sim(
     const unsigned* __restrict__ slot_meta,     // (was off_hi) n_gates*9 predecessor constants
     unsigned* __restrict__ cols,
     unsigned* __restrict__ qdecode,             // UNUSED (kept for arg-list compatibility)
-    unsigned* __restrict__ rc_hist,             // (was rc_lo) 2^RC_LOG_SIZE rc multiplicity histogram
+    unsigned* __restrict__ rc_hist,             // (was rc_lo) 2^rc_log rc multiplicity histogram over d
     unsigned* __restrict__ rc_hi,               // INERT (kept for arg-list compatibility)
     unsigned k,
     unsigned n_gates,
@@ -620,35 +618,29 @@ extern "C" __global__ void gate_sim(
         // gates in this rep read the new value. d = ts - prev_ts - 1 = pc - prev_ts.
         unsigned ts = pc + 1u;
         // ctrl_a (active iff a_active): read propagates value (v unchanged).
-        unsigned a_addr = 0u, a_prev = 0u, a_v = 0u, a_lo = 0u, a_hi = 0u;
+        unsigned a_addr = 0u, a_prev = 0u, a_v = 0u, a_d = 0u;
         if (a_active) {
             a_addr = aq;
             a_v    = QVAL(aq);
             a_prev = PREVTS(0u);
-            unsigned d = ts - a_prev - 1u;   // >= 0 (prev_ts is an earlier program-order ts or 0)
-            a_lo = d & RC_LO_MASK; a_hi = d >> RC_LO_BITS;
-            atomicAdd(&rc_hist[a_lo], 1u);
-            atomicAdd(&rc_hist[RC_LO_LEN + a_hi], 1u);
+            a_d    = ts - a_prev - 1u;   // = pc - prev_ts, >= 0 (prev_ts is an earlier program-order ts or 0)
+            atomicAdd(&rc_hist[a_d], 1u);
         }
         // ctrl_b (active iff b_active).
-        unsigned b_addr = 0u, b_prev = 0u, b_v = 0u, b_lo = 0u, b_hi = 0u;
+        unsigned b_addr = 0u, b_prev = 0u, b_v = 0u, b_d = 0u;
         if (b_active) {
             b_addr = bq;
             b_v    = QVAL(bq);
             b_prev = PREVTS(3u);
-            unsigned d = ts - b_prev - 1u;
-            b_lo = d & RC_LO_MASK; b_hi = d >> RC_LO_BITS;
-            atomicAdd(&rc_hist[b_lo], 1u);
-            atomicAdd(&rc_hist[RC_LO_LEN + b_hi], 1u);
+            b_d    = ts - b_prev - 1u;
+            atomicAdd(&rc_hist[b_d], 1u);
         }
         // target (always active): read+write.
         unsigned t_addr = tq;
         unsigned t_v    = QVAL(tq);     // v_before
         unsigned t_prev = PREVTS(6u);
         unsigned t_d    = ts - t_prev - 1u;
-        unsigned t_lo   = t_d & RC_LO_MASK, t_hi = t_d >> RC_LO_BITS;
-        atomicAdd(&rc_hist[t_lo], 1u);
-        atomicAdd(&rc_hist[RC_LO_LEN + t_hi], 1u);
+        atomicAdd(&rc_hist[t_d], 1u);
 
         unsigned ab = a_v * b_v;
         unsigned fire = is_not + is_cnot * a_v + is_tof * ab;   // in {0,1}
@@ -664,18 +656,18 @@ extern "C" __global__ void gate_sim(
         #undef QVAL
         #undef PREVTS
 
-        // Emit the 22 cells in cell_at order (ACCESS_BLOCK = 5: addr,prev_ts,v,rc_lo,rc_hi). ts (=pc+1)
-        // and the target's v_after (=v_before+delta) are NOT emitted — they are inlined in the AIR /
-        // K4 interaction kernel. (void v_after / delta arithmetic still updates the local state above.)
+        // Emit the 19 cells in cell_at order (ACCESS_BLOCK = 4: addr,prev_ts,v,d). ts (=pc+1) and the
+        // target's v_after (=v_before+delta) are NOT emitted — they are inlined in the AIR / K4
+        // interaction kernel. (void v_after / delta arithmetic still updates the local state above.)
         unsigned cc = 0u;
         #define EMIT(v) cols[(unsigned long)(cc++) * padded_rows + row] = (v)
         EMIT(is_nop); EMIT(is_not); EMIT(is_cnot); EMIT(is_tof);              // 0..4
-        EMIT(t_addr); EMIT(t_prev); EMIT(t_v); EMIT(t_lo); EMIT(t_hi);        // 4..9  target
-        EMIT(a_addr); EMIT(a_prev); EMIT(a_v); EMIT(a_lo); EMIT(a_hi);        // 9..14 ctrl_a
-        EMIT(b_addr); EMIT(b_prev); EMIT(b_v); EMIT(b_lo); EMIT(b_hi);        // 14..19 ctrl_b
-        EMIT(ab); EMIT(fire);                                                 // 19..21
+        EMIT(t_addr); EMIT(t_prev); EMIT(t_v); EMIT(t_d);                     // 4..8  target
+        EMIT(a_addr); EMIT(a_prev); EMIT(a_v); EMIT(a_d);                     // 8..12 ctrl_a
+        EMIT(b_addr); EMIT(b_prev); EMIT(b_v); EMIT(b_d);                     // 12..16 ctrl_b
+        EMIT(ab); EMIT(fire);                                                 // 16..18
         EMIT(delta_signed >= 0 ? (unsigned)delta_signed
-                               : (unsigned)((int)M31_MOD + delta_signed));    // 21 delta_to_m31
+                               : (unsigned)((int)M31_MOD + delta_signed));    // 18 delta_to_m31
         #undef EMIT
 
         row += 1u;
@@ -696,7 +688,7 @@ extern "C" __global__ void fill_padding(
 }
 "#;
 
-pub const TRACE_COLUMNS: usize = 22;
+pub const TRACE_COLUMNS: usize = 19;
 
 /// Run K1 on the GPU and copy the trace + histograms back to the host (for the P3.1 byte-identity
 /// test). The production GPU-resident path (return BaseColumns, no D2H) is P3.4.
@@ -706,7 +698,7 @@ pub const TRACE_COLUMNS: usize = 22;
 ///   (kernel guards on a_active/b_active).
 /// - `x_states`: n_shots*32 initial limbs (state_to_limbs of each shot's x_hex).
 /// - `off_lo`/`off_hi`: 16 each (RcIndex offsets).
-/// Returns (cols [column-major, TRACE_COLUMNS*padded_rows], qdecode[512], rc_lo[2^16], rc_hi[2^16]).
+/// Returns (cols [column-major, TRACE_COLUMNS*padded_rows], qdecode[512], rc_hist[2^rc_log], rc_hi[inert,1]).
 /// NOTE (padding): real rows [0, n_shots*k*n_gates) are written by the kernel; padding rows stay
 /// zero here — the caller must set the 3 read-block `mask` columns = 1 for padding rows to match
 /// `Row::padding` (TODO; the byte-identity test compares real rows + histograms first).
@@ -738,8 +730,12 @@ pub fn gpu_gen_main_trace(
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
-    let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
-    let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
+    // rc multiplicity histogram over the single diff `d ∈ [0, 2^rc_log)`. Sized DYNAMICALLY to
+    // `1 << rc_log_size(k*n_gates)` (NOT a fixed 2^16) — the kernel bumps `rc_hist[d]` with d up to
+    // total_pc-1, so the buffer must cover [0,2^rc_log). `d_hi` stays inert (arg-list compat).
+    let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
+    let mut d_lo = dev.alloc_zeros::<u32>(rc_hist_len).map_err(|e| format!("alloc rc_hist: {e}"))?;
+    let mut d_hi = dev.alloc_zeros::<u32>(1).map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
     let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, &d_gates, k, n_gates, n_shots)?;
@@ -792,20 +788,20 @@ pub fn gpu_gen_main_trace(
 
     let mut cols = vec![0u32; TRACE_COLUMNS * padded_rows];
     let mut qd = vec![0u32; 512];
-    let mut lo = vec![0u32; 1 << 16];
-    let mut hi = vec![0u32; 1 << 16];
+    let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
+    let mut hi = vec![0u32; 1];           // inert
     dev.dtoh_sync_copy_into(&d_cols, &mut cols).map_err(|e| format!("dtoh cols: {e}"))?;
     dev.dtoh_sync_copy_into(&d_qd, &mut qd).map_err(|e| format!("dtoh qdecode: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_lo: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_hist: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     Ok((cols, qd, lo, hi))
 }
 
 /// P3.1 soundness gate: assert the GPU K1 trace (real rows + rc multiplicity histogram) is
 /// BYTE-IDENTICAL to the CPU reference (`build_rows` + `cell_at` + `build_rc_table`). Run on a small
-/// fixture (k1-n4) via `GATE_AIR_GPU_TEST=k1` (hooked in main). Compares the 22 main columns
-/// cell-by-cell over the real rows AND the rc-table multiplicity histogram (2^RC_LOG_SIZE rows over
-/// `row_of(pos,limb)`) against `build_rc_table(&rows).multiplicity`; padding rows are all-zero.
+/// fixture (k1-n4) via `GATE_AIR_GPU_TEST=k1` (hooked in main). Compares the 19 main columns
+/// cell-by-cell over the real rows AND the rc-table multiplicity histogram (2^rc_log rows over the
+/// single diff `d`, val[i]=i) against `build_rc_table(&rows, rc_log).multiplicity`; padding rows are all-zero.
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn k1_byte_identity(
     gates: &[crate::Gate],
@@ -829,7 +825,9 @@ pub fn k1_byte_identity(
     if rows.len() != real_rows {
         return Err(format!("rows.len()={} != real_rows={}", rows.len(), real_rows));
     }
-    let cpu_rc = crate::build_rc_table(&rows);
+    // Dynamic rc supply-table log-size: rc_log_size(total_pc) with total_pc = k*n_gates.
+    let rc_log = crate::rc_log_size(k * n_gates);
+    let cpu_rc = crate::build_rc_table(&rows, rc_log);
 
     // Host-prep the flat GPU inputs (mirror state_to_limbs / the gate fields / RcIndex offsets).
     let mut gates_flat = Vec::with_capacity(n_gates * 4);
@@ -860,7 +858,7 @@ pub fn k1_byte_identity(
         padded_rows,
     )?;
 
-    // Compare the 22 main columns over the real rows.
+    // Compare the 19 main columns over the real rows.
     let mut mismatches = 0usize;
     let mut samples = Vec::new();
     for r in 0..real_rows {
@@ -877,8 +875,8 @@ pub fn k1_byte_identity(
     }
 
     // Compare the rc multiplicity histogram (GPU device histogram vs CPU build_rc_table). The device
-    // histogram is indexed by row_of(pos,limb): lo block rows [0,2^RC_LO_BITS), hi block rows
-    // [2^RC_LO_BITS, 2^RC_LO_BITS+2^RC_HI_BITS) — exactly RcTable's flattened (pos,val) row order.
+    // histogram is indexed directly by the single diff `d` (row [0,2^rc_log), val[i]=i) — exactly
+    // RcTable's flattened row order (row_of(d) == d).
     let mut hist_mismatches = 0usize;
     for i in 0..cpu_rc.multiplicity.len() {
         if hist[i] != cpu_rc.multiplicity[i] {
@@ -898,7 +896,7 @@ pub fn k1_byte_identity(
     }
 
     if mismatches == 0 && hist_mismatches == 0 {
-        eprintln!("[K1 byte-identity] PASS — GPU trace == CPU trace (22 main columns + rc histogram)");
+        eprintln!("[K1 byte-identity] PASS — GPU trace == CPU trace (19 main columns + rc histogram)");
         Ok(())
     } else {
         Err(format!(
@@ -911,17 +909,17 @@ pub fn k1_byte_identity(
 // P3.2 — K4: CUDA LogUp interaction trace (full on-device).
 // ============================================================================
 //
-// Generates gate_air's main-component interaction M31 columns (N_LOGUP_COLS=7 LogUp columns ×
-// 4 coords = 28) + claimed_sum on the GPU, byte-identical to the CPU `gen_main_interaction` /
+// Generates gate_air's main-component interaction M31 columns (N_LOGUP_COLS=5 LogUp columns ×
+// 4 coords = 20) + claimed_sum on the GPU, byte-identical to the CPU `gen_main_interaction` /
 // `LogupTraceGenerator`. Consumes K1's main-trace columns (no re-simulation). The last LogUp column
-// (k = N_LOGUP_COLS-1 = 6) is the program SINGLETON batch and carries the cumsum_shift.
+// (k = N_LOGUP_COLS-1 = 4) is the (rc ctrl_b d + program) PAIR batch and carries the cumsum_shift.
 //
 // Pipeline (per LogUp column k=0..N_LOGUP_COLS, sequential — col k accumulates onto col k-1):
 //   1. logup_col_gen[batch k]: per row, combine the batch's relation tuple(s) -> (num, denom)
 //      where d = (Σ_i alpha^i · values[i]) − z   (QM31), num = m0·d1 + m1·d0, denom = d0·d1.
 //   2. logup_finalize_col: value = num · denom^{-1} (per-element QM31 inverse — byte-identical
 //      to the CPU batch inverse, since the field inverse is unique); running sum across columns.
-// Then once, on the last column (k = N_LOGUP_COLS-1 = 6):
+// Then once, on the last column (k = N_LOGUP_COLS-1 = 4):
 //   3. logup_cumsum_reduce  -> coordinate_sums = claimed_sum (Σ rows of last col, per coord).
 //   4. logup_cumsum_shift   -> subtract cumsum_shift = claimed_sum / 2^log_size.
 //   5. inclusive_prefix_sum (per coord): bit-reverse -> circle→coset -> scan -> coset→circle ->
@@ -932,7 +930,7 @@ pub fn k1_byte_identity(
 // (mul = (a.r·b.r − a.i·b.i, a.r·b.i + a.i·b.r)); QM31 = CM31[j]/(j^2 − (2+i)), R = (2,1).
 // (NB: obelyzk fft.rs uses a different u^2=2 convention — NOT used here.)
 //
-// SOUNDNESS: validated by `k4_byte_identity` (28 cols + claimed_sum) vs the CPU reference
+// SOUNDNESS: validated by `k4_byte_identity` (20 cols + claimed_sum) vs the CPU reference
 // using a FIXED `GateRel::dummy()` (z,alpha) before it is trusted.
 //
 // OCCUPANCY: K4 is ALREADY thread-per-EXECUTION-instance — every per-row kernel here
@@ -945,13 +943,13 @@ pub fn k1_byte_identity(
 // fully occupied.) The K4 column writes are coordinate-major (4 coords × padded_rows); each thread
 // writes its row's 4 coords at stride padded_rows, the same layout K1 uses.
 
-/// Number of LogUp columns (batches) gate_air's main component emits. The pc-pinned ts + rc-table
-/// range-check encoding emits 13 relation entries — 3 qubitmem pairs (target/ctrl_a/ctrl_b Use+Yield),
-/// 3 rc-limb pairs (target/ctrl_a/ctrl_b lo+hi), and 1 program singleton — folded by
-/// `finalize_logup_in_pairs` into 7 batches (6 pairs + 1 singleton tail). Each batch is a
-/// SecureColumnByCoords (4 M31). Order MUST match `gen_main_interaction` (main.rs) exactly.
-pub const N_LOGUP_COLS: usize = 7;
-/// Number of M31 interaction columns committed = 7 × 4 = 28.
+/// Number of LogUp columns (batches) gate_air's main component emits. The pc-pinned ts + single-`d`
+/// rc-table range-check encoding emits 10 relation entries — 3 qubitmem pairs (target/ctrl_a/ctrl_b
+/// Use+Yield), 3 rc single-`d` terms (target/ctrl_a/ctrl_b), and 1 program singleton — folded by
+/// `finalize_logup_in_pairs` into 5 batches (all pairs). Each batch is a SecureColumnByCoords (4 M31).
+/// Order MUST match `gen_main_interaction` (main.rs) exactly.
+pub const N_LOGUP_COLS: usize = 5;
+/// Number of M31 interaction columns committed = 5 × 4 = 20.
 pub const N_INTERACTION_COLS: usize = N_LOGUP_COLS * 4;
 /// GateRel width (= `relation!(GateRel, 6)`): number of alpha powers uploaded (widest tuple =
 /// program = tag + 5 payload = 6).
@@ -1045,23 +1043,24 @@ __device__ __forceinline__ qm31 logup_combine(
     return qm31_sub(acc, z);
 }
 
-// K4a: per-row (num, denom) for one of the 7 batches (3 qubitmem pairs + 3 rc-limb pairs + 1 program
-// singleton). Reads K1's 22 main-trace columns (column-major in `cols`). Outputs interleaved per row:
+// K4a: per-row (num, denom) for one of the 5 batches (3 qubitmem pairs + 2 rc/program pairs). Reads
+// K1's 19 main-trace columns (column-major in `cols`). Outputs interleaved per row:
 // num[row*4+j], denom[row*4+j].
 //
-// Column layout (cell_at, 22 cols, ACCESS_BLOCK=5): 0..4 opcode one-hots;
-//   target addr=4,prev_ts=5,v=6,rc_lo=7,rc_hi=8;
-//   ctrl_a addr=9,prev_ts=10,v=11,rc_lo=12,rc_hi=13;
-//   ctrl_b addr=14,prev_ts=15,v=16,rc_lo=17,rc_hi=18; ab=19,fire=20,delta=21.
+// Column layout (cell_at, 19 cols, ACCESS_BLOCK=4): 0..4 opcode one-hots;
+//   target addr=4,prev_ts=5,v=6,d=7;
+//   ctrl_a addr=8,prev_ts=9,v=10,d=11;
+//   ctrl_b addr=12,prev_ts=13,v=14,d=15; ab=16,fire=17,delta=18.
 // ts (= pc+1) and the target's v_after (= v_before+delta) are INLINED here (recomputed from pc / the
 // v+delta columns), NOT read as columns.
-// Relation tags: QUBITMEM=1, RC=2, PROGRAM=5; rc pos: RC_POS_LO=0, RC_POS_HI=1. Widths: qubitmem
-// tuple=5, rc tuple=3, program tuple=6 (rel width = GATE_REL_WIDTH = 6). Batch order MUST match
-// gen_main_interaction / circuit_statement EXACTLY:
+// Relation tags: QUBITMEM=1, RC=2, PROGRAM=5. Widths: qubitmem tuple=5, rc tuple=2 (TAG_RC, d),
+// program tuple=6 (rel width = GATE_REL_WIDTH = 6). Batch order MUST match gen_main_interaction /
+// circuit_statement EXACTLY (the 10-entry stream folded into 5 pairs by finalize_logup_in_pairs):
 //   case 0..2 : 3 qubitmem pairs   (target / ctrl_a / ctrl_b : Use[+active] / Yield[-active])
-//   case 3..5 : 3 rc-limb pairs    (target / ctrl_a / ctrl_b : lo[+active] / hi[+active])
-//   case 6    : program SINGLETON  (+enabler)
-// A batch is a SINGLETON when n1 == 0 (only v0/m0 contribute: num = m0, den = d0); else a pair.
+//   case 3    : rc target d [+enabler]   / rc ctrl_a d [+a_active]
+//   case 4    : rc ctrl_b d [+b_active]  / program SINGLETON [+enabler]
+// A batch is a SINGLETON when n1 == 0 (only v0/m0 contribute: num = m0, den = d0); else a pair. (No
+// singleton batches remain in this layout — the program now pairs with rc ctrl_b d in case 4.)
 extern "C" __global__ void logup_col_gen(
     const unsigned* __restrict__ cols,
     unsigned long padded_rows,
@@ -1093,8 +1092,8 @@ extern "C" __global__ void logup_col_gen(
     unsigned b_active = COL(3);                     // is_toffoli
     // ts = pc + 1 (INLINED, shared by all accesses of the step; not a column).
     unsigned ts = m31_add(pc, 1u);
-    // v_after = v_before + delta = t.v(col6) + delta(col21) (INLINED target write value; not a column).
-    unsigned v_after = m31_add(COL(6), COL(21));
+    // v_after = v_before + delta = t.v(col6) + delta(col18) (INLINED target write value; not a column).
+    unsigned v_after = m31_add(COL(6), COL(18));
 
     switch (pair_id) {
     case 0: // qubitmem target Use (+enabler): [1, shot, t.addr, t.prev_ts, t.v_before]
@@ -1104,31 +1103,24 @@ extern "C" __global__ void logup_col_gen(
         m0=enabler; s0=1; m1=enabler; s1=-1; break;
     case 1: // qubitmem ctrl_a Use (+a_active): [1, shot, a.addr, a.prev_ts, a.v]
             //          ctrl_a Yield (-a_active): [1, shot, a.addr, ts=pc+1,  a.v]  (read propagates)
-        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(9); v0[3]=COL(10); v0[4]=COL(11); n0=5; // a.addr,a.prev_ts,a.v
-        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(9); v1[3]=ts;      v1[4]=COL(11); n1=5;
+        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(8); v0[3]=COL(9);  v0[4]=COL(10); n0=5; // a.addr,a.prev_ts,a.v
+        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(8); v1[3]=ts;      v1[4]=COL(10); n1=5;
         m0=a_active; s0=1; m1=a_active; s1=-1; break;
     case 2: // qubitmem ctrl_b Use (+b_active): [1, shot, b.addr, b.prev_ts, b.v]
             //          ctrl_b Yield (-b_active): [1, shot, b.addr, ts=pc+1,  b.v]
-        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(14); v0[3]=COL(15); v0[4]=COL(16); n0=5; // b.addr,b.prev_ts,b.v
-        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(14); v1[3]=ts;      v1[4]=COL(16); n1=5;
+        v0[0]=1u; v0[1]=shot_id; v0[2]=COL(12); v0[3]=COL(13); v0[4]=COL(14); n0=5; // b.addr,b.prev_ts,b.v
+        v1[0]=1u; v1[1]=shot_id; v1[2]=COL(12); v1[3]=ts;      v1[4]=COL(14); n1=5;
         m0=b_active; s0=1; m1=b_active; s1=-1; break;
-    case 3: // rc target: lo (+enabler): [2, 0, t.rc_lo] / hi (+enabler): [2, 1, t.rc_hi]
-        v0[0]=2u; v0[1]=0u; v0[2]=COL(7);  n0=3;                                   // t.rc_lo=col7
-        v1[0]=2u; v1[1]=1u; v1[2]=COL(8);  n1=3;                                   // t.rc_hi=col8
-        m0=enabler; s0=1; m1=enabler; s1=1; break;
-    case 4: // rc ctrl_a: lo (+a_active): [2, 0, a.rc_lo] / hi (+a_active): [2, 1, a.rc_hi]
-        v0[0]=2u; v0[1]=0u; v0[2]=COL(12); n0=3;                                   // a.rc_lo=col12
-        v1[0]=2u; v1[1]=1u; v1[2]=COL(13); n1=3;                                   // a.rc_hi=col13
-        m0=a_active; s0=1; m1=a_active; s1=1; break;
-    case 5: // rc ctrl_b: lo (+b_active): [2, 0, b.rc_lo] / hi (+b_active): [2, 1, b.rc_hi]
-        v0[0]=2u; v0[1]=0u; v0[2]=COL(17); n0=3;                                   // b.rc_lo=col17
-        v1[0]=2u; v1[1]=1u; v1[2]=COL(18); n1=3;                                   // b.rc_hi=col18
-        m0=b_active; s0=1; m1=b_active; s1=1; break;
-    case 6: // program SINGLETON (+enabler): [5, pc%n_gates, opcode_scalar, t.addr, a.addr, b.addr]
-        v0[0]=5u; v0[1]=(unsigned)((unsigned long)pc % (unsigned long)n_gates);
-        v0[2]=m31_add(m31_add(COL(1), m31_mul(2u,COL(2))), m31_mul(3u,COL(3))); // opcode_scalar
-        v0[3]=COL(4); v0[4]=COL(9); v0[5]=COL(14); n0=6;                        // t/a/b addr
-        m0=enabler; s0=1; n1=0; break;                                             // n1=0 => singleton
+    case 3: // rc target d (+enabler): [2, t.d] / rc ctrl_a d (+a_active): [2, a.d]
+        v0[0]=2u; v0[1]=COL(7);  n0=2;                                             // t.d=col7
+        v1[0]=2u; v1[1]=COL(11); n1=2;                                             // a.d=col11
+        m0=enabler; s0=1; m1=a_active; s1=1; break;
+    case 4: // rc ctrl_b d (+b_active): [2, b.d] / program (+enabler): [5, pc%ng, opcode_scalar, t/a/b addr]
+        v0[0]=2u; v0[1]=COL(15); n0=2;                                             // b.d=col15
+        v1[0]=5u; v1[1]=(unsigned)((unsigned long)pc % (unsigned long)n_gates);
+        v1[2]=m31_add(m31_add(COL(1), m31_mul(2u,COL(2))), m31_mul(3u,COL(3))); // opcode_scalar
+        v1[3]=COL(4); v1[4]=COL(8); v1[5]=COL(12); n1=6;                        // t/a/b addr
+        m0=b_active; s0=1; m1=enabler; s1=1; break;
     }
 
     // SINGLETON (n1 == 0): num = m0, den = d0. PAIR: num = m0*d1 + m1*d0, den = d0*d1.
@@ -1153,7 +1145,7 @@ extern "C" __global__ void logup_col_gen(
 }
 
 // K4b: value = num · denom^{-1}; running sum onto previous logup column.
-// `inter` holds the N_INTERACTION_COLS (28) interaction columns, column-major (logup col k coord j = (k*4+j)).
+// `inter` holds the N_INTERACTION_COLS (20) interaction columns, column-major (logup col k coord j = (k*4+j)).
 extern "C" __global__ void logup_finalize_col(
     unsigned rep_index,
     unsigned long padded_rows,
@@ -1301,7 +1293,7 @@ extern "C" __global__ void ps_add_offsets(unsigned* out, const unsigned* scanned
 }
 "#;
 
-/// Run the full K4 interaction pipeline on the GPU and copy the N_INTERACTION_COLS (16) interaction columns +
+/// Run the full K4 interaction pipeline on the GPU and copy the N_INTERACTION_COLS (20) interaction columns +
 /// claimed_sum back to the host. Inputs: the host-side main trace `cols` (column-major,
 /// TRACE_COLUMNS × padded_rows), the drawn `z` and `alpha_powers` (each QM31 → 4 M31, length
 /// GATE_REL_WIDTH), and dims. Returns (interaction_cols [N_INTERACTION_COLS × padded_rows,
@@ -1522,7 +1514,7 @@ where
     Ok(())
 }
 
-/// P3.2 soundness gate: assert the GPU K4 interaction trace (N_INTERACTION_COLS=28 M31 columns + claimed_sum) is
+/// P3.2 soundness gate: assert the GPU K4 interaction trace (N_INTERACTION_COLS=20 M31 columns + claimed_sum) is
 /// byte-identical to the CPU `gen_main_interaction` / `LogupTraceGenerator`, using a FIXED
 /// `GateRel::dummy()` (z, alpha) so both sides see the same challenges. Run via
 /// `GATE_AIR_GPU_TEST=k4` on a small fixture (k1-n4).
@@ -1531,8 +1523,8 @@ pub fn k4_byte_identity(
     gates: &[crate::Gate],
     cases: &[crate::TestCase],
     k: usize,
-    _rc_lo: &crate::RcIndex, // UNUSED (arg-compat); rc limbs come from the K1 main trace columns.
-    _rc_hi: &crate::RcIndex, // UNUSED (qubit-memory encoding); kept for call-site compat.
+    _rc_lo: &crate::RcIndex, // UNUSED (arg-compat); the rc diff `d` comes from the K1 main trace columns.
+    _rc_hi: &crate::RcIndex, // UNUSED (single-`d` rc encoding); kept for call-site compat.
 ) -> Result<(), String> {
     use stwo::prover::backend::Column;
 
@@ -1591,7 +1583,7 @@ pub fn k4_byte_identity(
         (k * n_gates) as u64,
     )?;
 
-    // Compare the N_INTERACTION_COLS (16) interaction columns over ALL padded rows (prefix sum spans them).
+    // Compare the N_INTERACTION_COLS (20) interaction columns over ALL padded rows (prefix sum spans them).
     let mut mismatches = 0usize;
     let mut samples: Vec<String> = Vec::new();
     for c in 0..N_INTERACTION_COLS {
@@ -1619,7 +1611,7 @@ pub fn k4_byte_identity(
     }
 
     if mismatches == 0 && sum_ok {
-        eprintln!("[K4 byte-identity] PASS — GPU interaction == CPU interaction (28 cols + claimed_sum)");
+        eprintln!("[K4 byte-identity] PASS — GPU interaction == CPU interaction (20 cols + claimed_sum)");
         Ok(())
     } else {
         Err(format!(
@@ -1768,13 +1760,13 @@ fn borrowed_column(
     CircleEvaluation::<_, _, BitReversedOrder>::new(domain, view)
 }
 
-/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 22 main
+/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 19 main
 /// columns as `CircleEvaluation<CudaBackend>` (device-resident, no host upload),
-/// plus the qdecode/rc_lo/rc_hi histograms copied to the host (tiny; the
+/// plus the qdecode/rc histogram copied to the host (tiny; the
 /// multiplicity columns are still built + uploaded on the CPU path in main.rs),
 /// plus the raw column-major main-trace device buffer `d_cols` so the interaction
 /// path (K4) can REUSE it instead of re-running K0/K1 (no re-simulation, no
-/// re-upload). The 22 returned `CircleEvaluation`s are independent D2D copies of
+/// re-upload). The 19 returned `CircleEvaluation`s are independent D2D copies of
 /// `d_cols`'s columns (see `d2d_column`), so handing `d_cols` back to the caller
 /// does not alias or mutate them.
 ///
@@ -1920,8 +1912,14 @@ pub fn gpu_gen_main_trace_device_d(
     };
     let mut d_cols = std::mem::ManuallyDrop::new(d_cols);
     let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
-    let mut d_lo = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_lo: {e}"))?;
-    let mut d_hi = dev.alloc_zeros::<u32>(1 << 16).map_err(|e| format!("alloc rc_hi: {e}"))?;
+    // rc multiplicity histogram over the single diff `d`. Sized DYNAMICALLY to `1 << rc_log_size(
+    // k*n_gates)` — the K1 kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must
+    // cover [0,2^rc_log) or the kernel writes out of bounds on real (large-k) runs. Production ignores
+    // the returned histogram (the multiplicity witness is host-built), but the device buffer must
+    // still be correctly sized so the atomic bumps stay in bounds. `d_hi` stays inert (arg compat).
+    let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
+    let mut d_lo = dev.alloc_zeros::<u32>(rc_hist_len).map_err(|e| format!("alloc rc_hist: {e}"))?;
+    let mut d_hi = dev.alloc_zeros::<u32>(1).map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
     let _ = (d_off_lo, d_off_hi); // RcIndex offsets unused (arg slots repurposed for rep_states/slot_meta).
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
@@ -1971,11 +1969,11 @@ pub fn gpu_gen_main_trace_device_d(
     }
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
-    // Device handoff: build the 22 CudaBackend columns from `d_cols` (column-major; column c at
+    // Device handoff: build the 19 CudaBackend columns from `d_cols` (column-major; column c at
     // element offset c*padded_rows). No host copy.
     //
     // Fix (b) (`GATE_AIR_FUSED_INTERP`): when set, build BORROWED views into `d_cols` (zero extra
-    // device memory) instead of 26 D2D copies. This drops the second full main-trace resident copy
+    // device memory) instead of 19 D2D copies. This drops the second full main-trace resident copy
     // so a 2^25 base proof fits a 40 GB A100. The views hold UN-interpolated base-domain evals; the
     // CudaBackend commit's fused per-column-interpolate path (poly.rs) interpolates each into a
     // reused temp (never touching `d_cols`), so K4's reuse of `d_cols` stays correct. When unset,
@@ -1995,11 +1993,11 @@ pub fn gpu_gen_main_trace_device_d(
     // Histograms are tiny → keep them on host (the multiplicity columns are built
     // + uploaded on the existing CPU path in main.rs).
     let mut qd = vec![0u32; 512];
-    let mut lo = vec![0u32; 1 << 16];
-    let mut hi = vec![0u32; 1 << 16];
+    let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
+    let mut hi = vec![0u32; 1];           // inert
     dev.dtoh_sync_copy_into(&d_qd, &mut qd).map_err(|e| format!("dtoh qdecode: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_lo: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_hist: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     dev.synchronize().map_err(|e| format!("sync hist: {e}"))?;
     // SUCCESS handoff. `d_cols` is `ManuallyDrop`, so we must extract the inner `CudaSlice` to return
     // it (otherwise the buffer would leak). K4 reads it directly (no K0/K1 re-run); it is no longer
@@ -2025,8 +2023,8 @@ pub fn gpu_gen_main_trace_device_d(
 }
 
 /// Reads `GATE_AIR_STREAM_MAIN` (main-trace DEVICE-capacity fix, opt-in, DEFAULT OFF). When set, the
-/// gate_air driver DEHYDRATES K1's column-major main-trace device buffer (`d_cols`, 188 columns ×
-/// `padded_rows` — ~24 GB at 2^25) to the HOST right after the tree1 commit and FREES the device
+/// gate_air driver DEHYDRATES K1's column-major main-trace device buffer (`d_cols`, 19 columns ×
+/// `padded_rows`) to the HOST right after the tree1 commit and FREES the device
 /// buffer, so it is no longer resident during the K4 interaction-scratch allocations (`d_inter` etc.)
 /// or the tree2 commit — the two phases that OOM at 2^25 on a 40 GB A100 with the buffer pinned.
 /// `gpu_gen_interaction_device` then REHYDRATES the buffer (H2D) only for the duration of its kernel
@@ -2047,7 +2045,7 @@ pub fn stream_main_enabled() -> bool {
 /// Reads `GATE_AIR_STREAM_MAIN_LOWMEM` (HOST-memory peak fix, opt-in, DEFAULT OFF). Attacks the
 /// ~72 GB host high-water at 2^25 that OOM-kills the leaf on the ~85 GB box, which is the SUM of two
 /// full-size host copies of the main trace that coexist through K4:
-///   * the ~48 GB tree1 EVAL STASH (188 LDE columns on the 2^26 domain, held on host from tree1
+///   * the tree1 EVAL STASH (19 LDE columns on the 2^26 domain, held on host from tree1
 ///     commit through FRI decommit — needed by OODS/quotient/build_leaves/decommit), and
 ///   * the ~24 GB DEHYDRATED d_main host `Vec` that plain `GATE_AIR_STREAM_MAIN` creates (a SECOND
 ///     host copy of the base-domain main trace, made at the tree1->K4 boundary and consumed by K4).

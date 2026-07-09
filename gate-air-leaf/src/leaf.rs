@@ -503,8 +503,17 @@ pub fn derive_base_fanning_config(
     b: usize,
     fold_arity: usize,
     log_blowup_factor: u32,
+    canonical_base_preprocessed_root: HashValue<QM31>,
 ) -> BaseFanConfig {
-    derive_base_fanning_config_ex(cfg, params, b, fold_arity, log_blowup_factor, false)
+    derive_base_fanning_config_ex(
+        cfg,
+        params,
+        b,
+        fold_arity,
+        log_blowup_factor,
+        false,
+        canonical_base_preprocessed_root,
+    )
 }
 
 /// Derives the base-fanning config for gate_air bases of `params`' shape and base-fan arity `b`.
@@ -532,12 +541,17 @@ pub fn derive_base_fanning_config_ex(
     fold_arity: usize,
     log_blowup_factor: u32,
     single_base_node: bool,
+    canonical_base_preprocessed_root: HashValue<QM31>,
 ) -> BaseFanConfig {
     assert!(b >= 1, "base_fan_arity b must be >= 1");
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
-    // Base tree0 root: shard-invariant, the single trusted base preprocessed root every base guesses
-    // (== `params.preprocessed_root`, the base STARK's committed preprocessed root).
-    let base_preprocessed_root = params.preprocessed_root.clone();
+    // Base tree0 root: shard-invariant, the single trusted base preprocessed root the unpacker BAKES
+    // as a constant for EVERY base. SOUNDNESS (step 1): this MUST be the CANONICAL value recomputed at
+    // build time from the trusted PUBLIC config (caller's `canonical_base_preprocessed_root`, via
+    // `canonical_base_preprocessed_root(..)` — the tree0-root recompute), NOT `params.preprocessed_root`
+    // (which is the prover's own `commitments[0]`, a forgeable value). Baking a non-canonical root
+    // would leave the base preprocessed trace (positional pc, in-range rc table) unpinned.
+    let base_preprocessed_root = canonical_base_preprocessed_root;
 
     let (node_target, node_pp_for_r2) = if single_base_node {
         // Pad the base-node to its OWN natural size — no R2, so no common fixed point. The base-node

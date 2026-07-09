@@ -73,12 +73,54 @@ const LIMB_BITS: usize = 16;
 const N_LIMBS: usize = N_QUBITS / LIMB_BITS; // 32
 const STATE_BYTES: usize = N_QUBITS / 8; // 64
 
-// Log-size of the ts-ordering range-check (rc) supply table (2^16 rows). The table holds the two
-// value ranges [0,2^RC_LO_BITS) and [0,2^RC_HI_BITS) keyed by a `pos` selector (pos=0 => lo range,
-// pos=1 => hi range); its membership count is 2^RC_LO_BITS + 2^RC_HI_BITS = 33792 <= 2^16, so it
-// fits one 2^16 table. Also doubles as the twiddle/FRI domain floor (the committed domain must
-// cover the largest committed column) and as the GPU histogram size.
-const RC_LOG_SIZE: u32 = 16;
+// Log-size of the ts-ordering range-check (rc) supply table. The table is a SINGLE block enumerating
+// EXACTLY [0, 2^RC_LOG_SIZE) with `val[i] = i` — one lookup per access checks `d ∈ [0, 2^RC_LOG_SIZE)`.
+// RC_LOG_SIZE is DYNAMIC (not a fixed const): `RC_LOG_SIZE = ceil(log2(k*n_gates)) = ceil(log2(total_pc))`
+// (`rc_log_size(total_pc)` below). This is the smallest power-of-two bound that still contains every
+// honest `d`: `d_max = k*n_gates - 1 < 2^RC_LOG_SIZE` (completeness, NO slack) and `2^RC_LOG_SIZE < p`
+// (RC_LOG_SIZE <= 25 for k <= 2000, n_gates ~2547, so the field subtraction cannot wrap). Because
+// rc_log <= log_n_rows (`k*n_gates <= samples*k*n_gates`), the rc column is never the largest committed
+// column, so it does NOT raise the twiddle/FRI domain floor (the `.max(rc_log)` sites reduce to
+// log_n_rows). It also sizes the GPU rc-multiplicity histogram.
+
+/// Dynamic rc-table log-size: `ceil(log2(total_pc))` where `total_pc = k*n_gates`. The rc table
+/// enumerates exactly `[0, 2^rc_log_size)`, which contains every honest `d = pc - prev_ts` since
+/// `d_max = total_pc - 1 < 2^ceil(log2(total_pc))`.
+///
+/// FLOORED AT `LOG_N_LANES` (the SIMD lane log-count): the rc table is a committed SIMD column and is
+/// range-summed by a `LogupTraceGenerator`, both of which require at least one full SIMD lane
+/// (`>= 2^LOG_N_LANES` rows). A raw `ceil(log2(total_pc))` below `LOG_N_LANES` (only possible for TINY
+/// fixtures with `total_pc < 2^LOG_N_LANES = 16`) underflows those SIMD ops. For ANY real run
+/// (`total_pc = k*n_gates >= 2547 >> 16`) `ceil(log2(total_pc)) >= LOG_N_LANES` already, so the floor
+/// is a NO-OP — the dynamic-rc_log property (rc_log = ceil(log2(k*n_gates)) <= log_n_rows, no eval-
+/// domain inflation) is fully preserved. Widening the range to `[0, 2^LOG_N_LANES)` for a tiny fixture
+/// stays SOUND: honest `d <= total_pc - 1` is still contained, and `2^LOG_N_LANES = 16 << p` so the
+/// field subtraction still cannot wrap (the forward-DAG / no-stale-read argument holds). The floor
+/// lives in this ONE function so the prover and the in-circuit verifier (both call `rc_log_size`)
+/// derive the identical R with no separate constant.
+pub(crate) fn rc_log_size(total_pc: usize) -> u32 {
+    (total_pc as u32).next_power_of_two().ilog2().max(LOG_N_LANES as u32)
+}
+
+/// Log-size of the tree-0 twiddle / eval (committed) domain: the MAX over every committed column's
+/// log-size (`main` = `log_n_rows`, the `rc` membership table = `rc_log`, the `program` table, the
+/// `boundary` table). The tree-0 columns are interpolated on twiddles of this size, so the twiddle
+/// tree MUST cover the LARGEST committed column — not just `log_n_rows.max(rc_log)`. For a REAL large
+/// shard (`k*n_gates >= 512`, so `main >> boundary = shots*512` and `program = n_gates` are tiny) this
+/// reduces to `log_n_rows` (dynamic-rc_log property preserved: NO domain inflation). It only differs
+/// for TINY fixtures where `k*n_gates < 512`, so `boundary` / `program` outsize the main trace and the
+/// old fixed `RC_LOG_SIZE=16` floor used to (incidentally) cover them.
+pub(crate) fn tree0_max_log_size(
+    log_n_rows: u32,
+    rc_log: u32,
+    program_log_size: u32,
+    boundary_log_size: u32,
+) -> u32 {
+    log_n_rows
+        .max(rc_log)
+        .max(program_log_size)
+        .max(boundary_log_size)
+}
 
 // Interaction-trace proof-of-work bits (canonical transcript; matches the in-circuit verifier's
 // ProofConfig). Tiny grind (~2^8), present so the in-circuit verifier can replay the transcript.
@@ -106,25 +148,17 @@ const NO_CTRL: u16 = 0xFFFF;
 // shot = (k*n_gates-1) + 1 = k*n_gates; at k=2000, n_gates=2547 this is ~5.1e6 < 2^23, far below
 // TS_FINAL = 2^30 and p = 2^31-1 (no aliasing, no wraparound).
 
-// Range-check width for the ts-ordering diff `d = ts - prev_ts - 1`. We prove `d ∈ [0, 2^TS_RC_BITS)`
-// by a LogUp rc-table lookup (below): `d` is split into two limbs `d = rc_lo + 2^RC_LO_BITS * rc_hi`
-// (RC_LO_BITS + RC_HI_BITS == TS_RC_BITS) and each limb is looked up into the rc supply table's
-// matching exact range block — `rc_lo` into [0,2^RC_LO_BITS), `rc_hi` into [0,2^RC_HI_BITS). Because
-// the table blocks are the EXACT ranges (not a padded power-of-two bound), the two lookups pin
-// rc_lo < 2^RC_LO_BITS and rc_hi < 2^RC_HI_BITS with NO slack, so the reconstructed d ranges over
-// exactly [0, 2^TS_RC_BITS) = [0, 2^25) and nothing larger. Honest `d = pc - prev_ts <= pc <= ts_max
-// - 1 < 2^23 (k<=2000), so 25 bits is complete with margin; the absolute bound 2^25 - 1 < p = 2^31-1
-// guarantees the field subtraction cannot wrap, so a cyclic (stale-read) chain — which would need
-// Σ(ts_i - prev_ts_i) ≡ 0 mod p with each term >= 1 — is impossible. See the soundness argument:
-// pc-pinned ts gives program order, the range-check `prev_ts < ts` on EVERY access forces the chain
-// to be a forward DAG, and both together defeat the reorder.
+// The ts-ordering diff `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts` is a SINGLE 25-bit
+// column (no limb split). We prove `d ∈ [0, 2^RC_LOG_SIZE)` by a SINGLE LogUp lookup into the dynamic
+// rc supply table (which enumerates exactly that range). Because the table is the EXACT range (not a
+// padded power-of-two over-bound), the lookup pins `d < 2^RC_LOG_SIZE` with NO slack. Honest
+// `d = pc - prev_ts <= pc <= k*n_gates - 1 < 2^RC_LOG_SIZE` (completeness). The absolute bound
+// 2^RC_LOG_SIZE - 1 < p = 2^31-1 (RC_LOG_SIZE <= 25) guarantees the field subtraction cannot wrap, so
+// a cyclic (stale-read) chain — which would need Σ(ts_i - prev_ts_i) ≡ 0 mod p with each term >= 1 — is
+// impossible. See the soundness argument: pc-pinned ts gives program order, the range-check
+// `prev_ts < ts` on EVERY access forces the chain to be a forward DAG, and both together defeat the
+// reorder. TS_RC_BITS is the hard upper bound on RC_LOG_SIZE (RC_LOG_SIZE = ceil(log2(k*n_gates)) <= 25).
 const TS_RC_BITS: usize = 25;
-// Limb split of `d` for the rc-table lookup. RC_LO_BITS + RC_HI_BITS == TS_RC_BITS. The split is
-// chosen so the two exact-range blocks fit ONE 2^RC_LOG_SIZE table: 2^15 + 2^10 = 33792 <= 2^16.
-const RC_LO_BITS: usize = 15;
-const RC_HI_BITS: usize = 10;
-const _: () = assert!(RC_LO_BITS + RC_HI_BITS == TS_RC_BITS);
-const _: () = assert!((1usize << RC_LO_BITS) + (1usize << RC_HI_BITS) <= (1usize << RC_LOG_SIZE));
 
 const M31_MODULUS_U32: u32 = (1 << 31) - 1;
 const LANE_COUNT: usize = 1 << LOG_N_LANES;
@@ -145,8 +179,8 @@ stwo_constraint_framework::relation!(GateRel, 6);
 // Relation id tags (distinct constants; the prover and the in-circuit verifier must agree).
 // Qubit-memory encoding: TAG_QUBITMEM is the per-qubit chain-lookup relation (replaces the
 // old whole-state TAG_STATE). TAG_RC is the ts-ordering range-check relation: the main component
-// looks up each limb of `d = ts - prev_ts - 1` as (TAG_RC, pos, limb) and the rc supply table
-// supplies (TAG_RC, pos, value) for every value in the pos-block's exact range.
+// looks up `d = ts - prev_ts - 1` as (TAG_RC, d) and the rc supply table supplies (TAG_RC, value)
+// for every value in [0, 2^RC_LOG_SIZE).
 const TAG_QUBITMEM: u32 = 1;
 const TAG_RC: u32 = 2;
 const TAG_PROGRAM: u32 = 5;
@@ -342,18 +376,16 @@ fn qubit_decode(q: u16) -> (u32, u32, u32) {
 /// One qubit-memory access (chain lookup) for target / ctrl_a / ctrl_b.
 /// The access timestamp is NOT a witness column: it is the affine function `ts = pc + 1` of the
 /// verifier-pinned preprocessed `pc`, inlined at every use site. `prev_ts` is the ts of the previous
-/// access to this addr (0 = the init boundary node). `rc_lo`/`rc_hi` are the two limbs of the
-/// ordering diff `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts = rc_lo + 2^RC_LO_BITS *
-/// rc_hi`, each range-checked by a LogUp lookup into the rc supply table (rc_lo into [0,2^RC_LO_BITS),
-/// rc_hi into [0,2^RC_HI_BITS)), proving `prev_ts < ts` (forward-DAG / no-stale-read). `active` gates
-/// the terms.
+/// access to this addr (0 = the init boundary node). `d` is the ordering diff
+/// `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts`, range-checked by a SINGLE LogUp
+/// lookup into the dynamic rc supply table (`d ∈ [0, 2^RC_LOG_SIZE)`), proving `prev_ts < ts`
+/// (forward-DAG / no-stale-read). `active` gates the terms.
 #[derive(Clone, Copy)]
 struct AccessCols {
     addr: u32,    // qubit index 0..511 (0 when inactive, matches program canon)
     prev_ts: u32, // predecessor's ts at this addr (0 if this is the first access)
     v: u32,       // v_before (the value read); for a control this is also v_after
-    rc_lo: u32,   // low limb of d = ts - prev_ts - 1 = pc - prev_ts  (d & (2^RC_LO_BITS - 1))
-    rc_hi: u32,   // high limb of d                                   (d >> RC_LO_BITS)
+    d: u32,       // ts-ordering diff d = ts - prev_ts - 1 = pc - prev_ts (range-checked into [0,2^RC_LOG_SIZE))
 }
 
 impl AccessCols {
@@ -362,8 +394,7 @@ impl AccessCols {
             addr: 0,
             prev_ts: 0,
             v: 0,
-            rc_lo: 0,
-            rc_hi: 0,
+            d: 0,
         }
     }
 }
@@ -411,11 +442,11 @@ impl Row {
 // Column layout
 // ----------------------------------------------------------------------------
 //
-// Per row (qubit-memory encoding), one access block = ACCESS_COLS core + RC_N_LIMBS rc limbs:
+// Per row (qubit-memory encoding), one access block = ACCESS_COLS core + 1 rc diff col:
 //   is_nop,is_not,is_cnot,is_toffoli                                 (4)
-//   target access: addr,prev_ts,v_before, rc_lo,rc_hi                (ACCESS_BLOCK)
-//   ctrl_a access: addr,prev_ts,v, rc_lo,rc_hi                       (ACCESS_BLOCK)
-//   ctrl_b access: addr,prev_ts,v, rc_lo,rc_hi                       (ACCESS_BLOCK)
+//   target access: addr,prev_ts,v_before, d                         (ACCESS_BLOCK)
+//   ctrl_a access: addr,prev_ts,v, d                                 (ACCESS_BLOCK)
+//   ctrl_b access: addr,prev_ts,v, d                                 (ACCESS_BLOCK)
 //   ab, fire, delta                                                  (3)
 //
 // `enabler`, `shot_id`, `pc` are SHARD-INVARIANT POSITIONAL values (enabler = real/padding
@@ -427,18 +458,16 @@ impl Row {
 // preprocessed `pc`, inlined at every use site (Yield tuple + range-check reconstruction). The old
 // PIN constraint is gone (vacuous). Timestamp ordering is now ONE algebraic constraint + a LogUp
 // lookup per active access (soundness-critical):
-//   RANGE: active*((pc+1) - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 reconstructs
-//          d = ts-prev_ts-1 = pc-prev_ts from its two limbs, and each limb is range-checked by a
-//          LogUp lookup into the rc supply table (rc_lo ∈ [0,2^RC_LO_BITS), rc_hi ∈ [0,2^RC_HI_BITS)).
-//          The exact-range table blocks pin d ∈ [0, 2^TS_RC_BITS) with NO slack, so prev_ts < ts,
+//   RANGE: active*((pc+1) - prev_ts - 1 - d) = 0 pins the witness `d` column to ts-prev_ts-1 =
+//          pc-prev_ts, and `d` is range-checked by a SINGLE LogUp lookup into the dynamic rc supply
+//          table (d ∈ [0, 2^RC_LOG_SIZE)). The exact-range table pins d with NO slack, so prev_ts < ts,
 //          forcing the chain to be a forward DAG (no stale-read cycle).
 // The target's `v_after` is likewise NOT a witness column: it equals `v_before + delta`, inlined at
 // its Yield tuple and booleanity constraint. The two controls' written value equals `v` (reads
 // propagate the value).
 const ACCESS_COLS: usize = 3; // addr, prev_ts, v (the core access cols read by AccessMasks; ts inlined = pc+1)
-const RC_N_LIMBS: usize = 2; // rc_lo, rc_hi
-const ACCESS_BLOCK: usize = ACCESS_COLS + RC_N_LIMBS; // core cols + range-check limbs
-const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS_BLOCK + 3;
+const ACCESS_BLOCK: usize = ACCESS_COLS + 1; // core cols + the single rc diff col `d`
+const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS_BLOCK + 3; // 4 + 3*4 + 3 = 19
 
 fn delta_to_m31(delta: i64) -> u32 {
     // new_t - t_bit in {-1,0,1}; represent in M31.
@@ -549,9 +578,9 @@ fn simulate_shot(
     let mut row_idx = 0usize;
 
     // One access: read predecessor (prev_ts, v_before) from last[addr]; the access ts is `pc + 1`
-    // (program-order timestamp, inlined — not stored). Splits d = ts - prev_ts - 1 = pc - prev_ts
-    // (>= 0 since prev_ts is an earlier program-order ts or the init 0) into the two limbs (rc_lo,
-    // rc_hi) the rc-table lookup range-checks (proving prev_ts < ts). Returns the filled AccessCols
+    // (program-order timestamp, inlined — not stored). Computes d = ts - prev_ts - 1 = pc - prev_ts
+    // directly (>= 0 since prev_ts is an earlier program-order ts or the init 0) — the SINGLE rc diff
+    // column the rc-table lookup range-checks (proving prev_ts < ts). Returns the filled AccessCols
     // with v = v_before. The caller sets last[addr] to the post-access ts (= pc+1) / value (v_before
     // for reads, v_after for the target write).
     let do_access = |addr: u32, pc: u32, last_ts: &[u32], last_val: &[u32]| -> AccessCols {
@@ -562,16 +591,13 @@ fn simulate_shot(
         debug_assert!(ts > prev_ts, "ts {ts} must exceed prev_ts {prev_ts} (program order)");
         let d = ts - prev_ts - 1; // = pc - prev_ts
         // Completeness guard (checked once at build_rows before any access; see build_rows). Here d is
-        // guaranteed < 2^TS_RC_BITS, so the limb split is exact.
+        // guaranteed < 2^RC_LOG_SIZE (<= 2^TS_RC_BITS).
         debug_assert!((d as u64) < (1u64 << TS_RC_BITS), "diff {d} exceeds range-check bound");
-        let rc_lo = d & ((1u32 << RC_LO_BITS) - 1);
-        let rc_hi = d >> RC_LO_BITS;
         AccessCols {
             addr,
             prev_ts,
             v: v_before,
-            rc_lo,
-            rc_hi,
+            d,
         }
     };
 
@@ -682,82 +708,50 @@ fn qubit_bit(bytes: &[u8], addr: usize) -> u32 {
 // ts-ordering range-check (rc) supply table
 // ----------------------------------------------------------------------------
 //
-// The rc table is a single 2^RC_LOG_SIZE-row `[0, range)` supply table keyed by a `pos` selector:
-//   pos = RC_POS_LO (0): value block  {0, 1, ..., 2^RC_LO_BITS - 1}   (the low-limb range)
-//   pos = RC_POS_HI (1): value block  {0, 1, ..., 2^RC_HI_BITS - 1}   (the high-limb range)
-// Membership count = 2^RC_LO_BITS + 2^RC_HI_BITS = 33792 <= 2^RC_LOG_SIZE = 65536; the remaining
-// rows are padding reusing the (pos=RC_POS_LO, value=0) tuple (a genuine member: multiplicity-counting
-// only counts real limb lookups, so extra supply of an existing tuple is inert). The main component
-// looks up (TAG_RC, pos, limb) for each of the two limbs of every active access; the table supplies
-// -multiplicity / (TAG_RC, pos, value). Because each pos-block enumerates its EXACT range (not a
-// padded power-of-two bound), the lookups pin rc_lo < 2^RC_LO_BITS and rc_hi < 2^RC_HI_BITS with NO
-// slack — reconstruction d = rc_lo + 2^RC_LO_BITS*rc_hi then ranges over exactly [0, 2^TS_RC_BITS).
-const RC_POS_LO: u32 = 0;
-const RC_POS_HI: u32 = 1;
+// The rc table is a SINGLE dynamic 2^RC_LOG_SIZE-row supply table enumerating EXACTLY the range
+// [0, 2^RC_LOG_SIZE) with `val[i] = i` (RC_LOG_SIZE = rc_log_size(total_pc) = ceil(log2(k*n_gates))).
+// There is NO `pos` selector and NO two-block split — one value column, one lookup per access. The
+// membership count is exactly 2^RC_LOG_SIZE (a full power-of-two block), so there are NO padding rows
+// beyond the genuine members; if the caller ever pads it stays a genuine member (val=0). The main
+// component looks up (TAG_RC, d) for the SINGLE diff `d` of every active access; the table supplies
+// -multiplicity / (TAG_RC, value). Because the table enumerates the EXACT range [0, 2^RC_LOG_SIZE)
+// (not a padded over-bound), the lookup pins d < 2^RC_LOG_SIZE with NO slack. Completeness:
+// d_max = k*n_gates - 1 < 2^RC_LOG_SIZE.
 
-/// Supply table for the ts-ordering range-check. `pos`/`val` are PREPROCESSED (the table membership,
-/// shard-invariant); `multiplicity` is WITNESS (count of real limb lookups landing on that row).
+/// Supply table for the ts-ordering range-check. `val` is PREPROCESSED (the table membership,
+/// shard-invariant, `val[i] = i`); `multiplicity` is WITNESS (count of real `d` lookups landing on
+/// that row). The table has `2^log_size` rows enumerating exactly `[0, 2^log_size)`.
 struct RcTable {
     log_size: u32,
-    pos: Vec<u32>,         // preprocessed
-    val: Vec<u32>,         // preprocessed
+    val: Vec<u32>,          // preprocessed: val[i] = i for i in [0, 2^log_size)
     multiplicity: Vec<u32>, // witness
-    lo_len: usize,         // # rows in the RC_POS_LO block (= 2^RC_LO_BITS)
 }
 
 impl RcTable {
-    fn new() -> Self {
-        let size = 1usize << RC_LOG_SIZE;
-        let lo_len = 1usize << RC_LO_BITS;
-        let hi_len = 1usize << RC_HI_BITS;
-        let mut pos = vec![RC_POS_LO; size];
-        let mut val = vec![0u32; size];
-        let mut row = 0usize;
-        for v in 0..lo_len {
-            pos[row] = RC_POS_LO;
-            val[row] = v as u32;
-            row += 1;
-        }
-        for v in 0..hi_len {
-            pos[row] = RC_POS_HI;
-            val[row] = v as u32;
-            row += 1;
-        }
-        debug_assert!(row <= size);
-        // Remaining rows stay (pos=RC_POS_LO, val=0): a valid member, inert padding.
+    fn new(rc_log: u32) -> Self {
+        let size = 1usize << rc_log;
+        // Single block enumerating exactly [0, 2^rc_log): val[i] = i (every row a genuine member).
+        let val = (0..size as u32).collect();
         Self {
-            log_size: RC_LOG_SIZE,
-            pos,
+            log_size: rc_log,
             val,
             multiplicity: vec![0u32; size],
-            lo_len,
         }
     }
 
-    /// Row index of the (pos, value) tuple in the flattened table. lo block first, then hi block.
-    #[inline]
-    fn row_of(&self, pos: u32, value: u32) -> usize {
-        match pos {
-            RC_POS_HI => self.lo_len + value as usize,
-            _ => value as usize,
-        }
-    }
-
-    /// Count the two limb lookups of one active access into the multiplicity column.
+    /// Count the single `d` lookup of one active access into the multiplicity column. `d` indexes the
+    /// table directly since `val[i] = i` (row_of(d) == d).
     #[inline]
     fn count_access(&mut self, a: &AccessCols) {
-        let lo = self.row_of(RC_POS_LO, a.rc_lo);
-        let hi = self.row_of(RC_POS_HI, a.rc_hi);
-        self.multiplicity[lo] += 1;
-        self.multiplicity[hi] += 1;
+        self.multiplicity[a.d as usize] += 1;
     }
 }
 
-/// Build the rc supply table and its multiplicity column by counting every ACTIVE access's two
-/// limb lookups. An access is active iff its owning gate fires it: the target on every real row, a
+/// Build the rc supply table and its multiplicity column by counting every ACTIVE access's single
+/// `d` lookup. An access is active iff its owning gate fires it: the target on every real row, a
 /// control iff the opcode uses it. Padding rows (enabler = 0) emit no lookup, so they are skipped.
-fn build_rc_table(rows: &[Row]) -> RcTable {
-    let mut table = RcTable::new();
+fn build_rc_table(rows: &[Row], rc_log: u32) -> RcTable {
+    let mut table = RcTable::new(rc_log);
     for r in rows {
         if r.enabler == 0 {
             continue;
@@ -787,9 +781,11 @@ fn build_rc_table(rows: &[Row]) -> RcTable {
 // as long as the multiplicity-trace counts only real reads (which it does).
 
 /// Maps (pos, value) -> a row index in the flattened range-check table. The per-address +1 counter
-/// fix removed the range-check LOOKUP; this now survives ONLY so the CUDA trace-gen glue
-/// (`gpu_flat_inputs` -> `off_lo`/`off_hi`) can keep its device-buffer layout unchanged. The
-/// pos/val columns and `row()` accessor are unused by the CPU path (hence `dead_code`).
+/// fix (and later the single-`d` rc lookup) removed the range-check LOOKUP; this now survives ONLY so
+/// the CUDA trace-gen glue (`gpu_flat_inputs` -> `off_lo`/`off_hi`) can keep its device-buffer layout
+/// unchanged (the K1/K4 kernels IGNORE those offsets). The pos/val columns and `row()` accessor are
+/// unused by the CPU path (hence `dead_code`). Size is `2^LIMB_BITS`, independent of the now-dynamic
+/// rc supply table (this index is per-`pos`-block, sum_pos 2^pos = 2^16 - 1 <= 2^LIMB_BITS rows).
 #[allow(dead_code)]
 struct RcIndex {
     pos_col: Vec<u32>,
@@ -801,7 +797,7 @@ struct RcIndex {
 impl RcIndex {
     /// `bound(pos)` returns the exclusive value bound for this pos.
     fn build(bound: impl Fn(usize) -> u32) -> Self {
-        let size = 1usize << RC_LOG_SIZE;
+        let size = 1usize << LIMB_BITS;
         let mut pos_col = vec![0u32; size];
         let mut val_col = vec![0u32; size];
         let mut offset = [0usize; LIMB_BITS + 1];
@@ -907,6 +903,12 @@ struct ProgramTable {
     ctrl_a: Vec<u32>,        // witness
     ctrl_b: Vec<u32>,        // witness
     multiplicity: Vec<u32>,  // witness: samples*K on real slots, 0 on padding
+}
+
+/// Log-size of the program table (one row per gate, padded to a power of two, floored at LANE_COUNT).
+/// Pure function of `n_gates` (shard-invariant), so it can be recovered without the table itself.
+fn program_log_size(n_gates: usize) -> u32 {
+    n_gates.next_power_of_two().max(LANE_COUNT).ilog2()
 }
 
 fn build_program_table(gates: &[Gate], samples: usize, k: usize) -> ProgramTable {
@@ -1108,8 +1110,9 @@ impl FrameworkEval for GateEval {
         );
 
         // --- ts-ordering RANGE-CHECK LOOKUPs (emitted here so their relation-batch order is
-        // qubitmem-pairs, then rc-pairs (target lo/hi, ctrl_a lo/hi, ctrl_b lo/hi), then program;
-        // mirrored exactly by `gen_main_interaction` and the in-circuit MainGate). ---
+        // qubitmem-pairs (6 terms), then the 3 single-`d` rc lookups (target, ctrl_a, ctrl_b), then
+        // program; finalize-in-pairs folds the trailing 3 rc + 1 program into 2 batches:
+        // (rc_t, rc_a) and (rc_b, program). Mirrored exactly by `gen_main_interaction` and MainGate. ---
         add_rc_lookup(&mut eval, &self.elements.rc, &target, enabler.clone());
         add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_a, a_active.clone());
         add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_b, b_active.clone());
@@ -1117,8 +1120,8 @@ impl FrameworkEval for GateEval {
         // --- ts-ordering: RANGE-CHECK prev_ts < ts (soundness-critical). ---
         // The old PIN constraint `active*(ts - (pc*TS_STRIDE + slot)) = 0` is GONE: ts is now
         // structurally `pc + 1` (inlined), so the pin is vacuous. Only the RANGE reconstruction
-        // remains: active*((pc+1) - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 reconstructs
-        // d = pc - prev_ts from its two limbs, each range-checked by the rc-table lookup above =>
+        // remains: active*((pc+1) - prev_ts - 1 - d) = 0 pins the witness `d` to
+        // pc - prev_ts, range-checked by the single rc-table lookup above =>
         // d ∈ [0, 2^TS_RC_BITS), i.e. prev_ts < ts. Together with the structurally program-ordered ts
         // and the LogUp chain balance this forces a FORWARD DAG (no stale-read cycle): each read
         // observes the program-order-last write. Inactive accesses (active=0) unconstrained.
@@ -1155,24 +1158,21 @@ struct AccessMasks<F> {
     addr: F,
     prev_ts: F,
     v: F,
-    rc_lo: F, // low limb of d = ts - prev_ts - 1 = pc - prev_ts (range-checked into [0,2^RC_LO_BITS))
-    rc_hi: F, // high limb of d                                   (range-checked into [0,2^RC_HI_BITS))
+    d: F, // ts-ordering diff d = ts - prev_ts - 1 = pc - prev_ts (range-checked into [0,2^RC_LOG_SIZE))
 }
 
 fn access_masks<E: EvalAtRow>(eval: &mut E) -> AccessMasks<E::F> {
-    // ts is NOT a column — it is the inlined `pc + 1`. Per-access columns: addr, prev_ts, v, rc_lo, rc_hi.
+    // ts is NOT a column — it is the inlined `pc + 1`. Per-access columns: addr, prev_ts, v, d.
     let addr = eval.next_trace_mask();
     let prev_ts = eval.next_trace_mask();
     let v = eval.next_trace_mask();
-    // rc_lo, rc_hi follow v (matches `cell_at`'s per-access column order).
-    let rc_lo = eval.next_trace_mask();
-    let rc_hi = eval.next_trace_mask();
+    // d follows v (matches `cell_at`'s per-access column order).
+    let d = eval.next_trace_mask();
     AccessMasks {
         addr,
         prev_ts,
         v,
-        rc_lo,
-        rc_hi,
+        d,
     }
 }
 
@@ -1212,13 +1212,13 @@ fn add_qubitmem_pair<E: EvalAtRow>(
 }
 
 /// Emit the range-check reconstruction for one access, gated by `active`:
-///   RANGE: active*(ts - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 — reconstructs the diff
-///          d = ts - prev_ts - 1 = pc - prev_ts from its two limbs. The limbs themselves are
-///          range-checked by the rc-table LOOKUP (`add_rc_lookup`), not here, so d ∈ [0, 2^TS_RC_BITS)
-///          (prev_ts < ts). `ts` is the inlined `pc + 1` expression.
+///   RANGE: active*(ts - prev_ts - 1 - d) = 0 — pins the witness `d` column to the diff
+///          d = ts - prev_ts - 1 = pc - prev_ts. `d` itself is range-checked by the rc-table LOOKUP
+///          (`add_rc_lookup`), not here, so d ∈ [0, 2^RC_LOG_SIZE) (prev_ts < ts). `ts` is the inlined
+///          `pc + 1` expression.
 /// The old PIN constraint is removed (ts is structurally pc+1, so the pin is vacuous). The
-/// reconstruction is gated by `active`; the two limb LOOKUPs are also gated by `active` (an inactive
-/// access emits no rc term). Inactive accesses (active = 0) leave prev_ts/rc_lo/rc_hi free.
+/// reconstruction is gated by `active`; the `d` LOOKUP is also gated by `active` (an inactive access
+/// emits no rc term). Inactive accesses (active = 0) leave prev_ts/d free.
 fn add_ts_range<E: EvalAtRow>(
     eval: &mut E,
     ts: &E::F,
@@ -1226,29 +1226,19 @@ fn add_ts_range<E: EvalAtRow>(
     active: E::F,
 ) {
     let one = E::F::one();
-    // RANGE reconstruction: d = rc_lo + 2^RC_LO_BITS * rc_hi.
-    let recon = a.rc_lo.clone() + a.rc_hi.clone() * BaseField::from_u32_unchecked(1u32 << RC_LO_BITS);
     let d = ts.clone() - a.prev_ts.clone() - one;
-    eval.add_constraint(active * (d - recon));
+    eval.add_constraint(active * (d - a.d.clone()));
 }
 
-/// Emit the two rc-table range-check LOOKUPs for one access, gated by `active`. Each limb is looked
-/// up as (TAG_RC, pos, limb); the rc supply table supplies each in-range (pos, value). Emitting the
-/// two terms consecutively (lo then hi) makes them a single finalize-in-pairs batch (mirrored by
+/// Emit the single rc-table range-check LOOKUP for one access, gated by `active`: `d` is looked up as
+/// (TAG_RC, d); the rc supply table supplies each in-range value. One term/access (mirrored by
 /// `gen_main_interaction` and the in-circuit MainGate).
 fn add_rc_lookup<E: EvalAtRow>(eval: &mut E, rc: &GateRel, a: &AccessMasks<E::F>, active: E::F) {
     let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
-    let pos_lo = E::F::one() * BaseField::from_u32_unchecked(RC_POS_LO);
-    let pos_hi = E::F::one() * BaseField::from_u32_unchecked(RC_POS_HI);
-    eval.add_to_relation(RelationEntry::new(
-        rc,
-        E::EF::from(active.clone()),
-        &[tag.clone(), pos_lo, a.rc_lo.clone()],
-    ));
     eval.add_to_relation(RelationEntry::new(
         rc,
         E::EF::from(active),
-        &[tag, pos_hi, a.rc_hi.clone()],
+        &[tag, a.d.clone()],
     ));
 }
 
@@ -1360,30 +1350,31 @@ impl FrameworkEval for ProgramTableEval {
     }
 }
 
-/// ts-ordering range-check table (supply side). `pos`/`val` are preprocessed (the table membership);
-/// `multiplicity` is witness (count of real limb lookups landing on this row). Emits
-/// -multiplicity / combine(TAG_RC, pos, val) — one term/row => 1 batch => 4 interaction columns.
+/// ts-ordering range-check table (supply side). `val` is preprocessed (the table membership,
+/// val[i]=i over [0,2^log_size)); `multiplicity` is witness (count of real `d` lookups landing on
+/// this row). Emits -multiplicity / combine(TAG_RC, val) — one term/row => 1 batch => 4 interaction
+/// columns. `log_size` is DYNAMIC (= rc_log_size(total_pc) = ceil(log2(k*n_gates))).
 #[derive(Clone)]
 struct RcTableEval {
+    log_size: u32,
     elements: GateRel,
 }
 
 impl FrameworkEval for RcTableEval {
     fn log_size(&self) -> u32 {
-        RC_LOG_SIZE
+        self.log_size
     }
     fn max_constraint_log_degree_bound(&self) -> u32 {
         self.log_size() + 1
     }
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let pos = eval.get_preprocessed_column(pp_id("gate_rc_pos"));
         let val = eval.get_preprocessed_column(pp_id("gate_rc_val"));
         let multiplicity = eval.next_trace_mask();
         let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
         eval.add_to_relation(RelationEntry::new(
             &self.elements,
             -E::EF::from(multiplicity),
-            &[tag, pos, val],
+            &[tag, val],
         ));
         eval.finalize_logup();
         eval
@@ -1395,19 +1386,22 @@ fn pp_id(id: &str) -> PreProcessedColumnId {
 }
 
 /// Number of preprocessed columns (count-only uses; the order is `preprocessed_column_ids`).
-/// prog_slot + (enabler/shot_id/pc/pc_in_prog) + (bnd_shot/bnd_addr/bnd_enabler) + (rc_pos/rc_val) = 10.
-const N_PREPROCESSED_COLS: usize = 10;
+/// prog_slot + (enabler/shot_id/pc/pc_in_prog) + (bnd_shot/bnd_addr/bnd_enabler) + rc_val = 9.
+const N_PREPROCESSED_COLS: usize = 9;
 
 /// Each preprocessed column paired with its log_size, in a fixed canonical listing order, then
 /// STABLE-sorted ascending by size. The committed preprocessed tree MUST be size-sorted (stwo's
 /// lifted Merkle sorts each tree's columns by length, and the in-circuit verifier does NOT re-sort
 /// the preprocessed tree). The sizes are DYNAMIC: `gate_pc_in_prog` is sized with the main trace,
 /// `gate_prog_slot` with the program table, `gate_bnd_*` with the boundary table, and the rc table
-/// columns are fixed at RC_LOG_SIZE.
+/// column `gate_rc_val` at the DYNAMIC `rc_log` (= ceil(log2(k*n_gates)); <= main_log_size).
+/// SOUNDNESS: `rc_log` MUST be derived from the public (k, n_gates) both sides trust (never read from
+/// the proof) — it sizes the [0,2^rc_log) membership table pinned by the preprocessed root.
 fn preprocessed_columns_sorted(
     main_log_size: u32,
     program_log_size: u32,
     boundary_log_size: u32,
+    rc_log: u32,
 ) -> Vec<(PreProcessedColumnId, u32)> {
     let mut cols = vec![
         (pp_id("gate_prog_slot"), program_log_size),
@@ -1420,9 +1414,8 @@ fn preprocessed_columns_sorted(
         (pp_id("gate_bnd_shot"), boundary_log_size),
         (pp_id("gate_bnd_addr"), boundary_log_size),
         (pp_id("gate_bnd_enabler"), boundary_log_size),
-        // ts-ordering range-check table membership (pos, val). Fixed at RC_LOG_SIZE.
-        (pp_id("gate_rc_pos"), RC_LOG_SIZE),
-        (pp_id("gate_rc_val"), RC_LOG_SIZE),
+        // ts-ordering range-check table membership (val[i]=i). Sized at the DYNAMIC rc_log.
+        (pp_id("gate_rc_val"), rc_log),
     ];
     cols.sort_by_key(|&(_, s)| s); // stable: ties keep the listing order above
     cols
@@ -1432,8 +1425,9 @@ fn preprocessed_column_ids(
     main_log_size: u32,
     program_log_size: u32,
     boundary_log_size: u32,
+    rc_log: u32,
 ) -> Vec<PreProcessedColumnId> {
-    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size)
+    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size, rc_log)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -1494,6 +1488,7 @@ fn build_components(
     log_n_rows: u32,
     program_log_size: u32,
     boundary_log_size: u32,
+    rc_log: u32,
     elements: &LookupElements,
     main_sum: SecureField,
     program_sum: SecureField,
@@ -1501,7 +1496,7 @@ fn build_components(
     rc_sum: SecureField,
 ) -> Components {
     let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(
-        &preprocessed_column_ids(log_n_rows, program_log_size, boundary_log_size),
+        &preprocessed_column_ids(log_n_rows, program_log_size, boundary_log_size, rc_log),
     );
     let main = GateComponent::new(
         &mut allocator,
@@ -1530,6 +1525,7 @@ fn build_components(
     let rc = RcComponent::new(
         &mut allocator,
         RcTableEval {
+            log_size: rc_log,
             elements: elements.rc.clone(),
         },
         rc_sum,
@@ -1547,10 +1543,10 @@ fn build_components(
 // ----------------------------------------------------------------------------
 
 /// Single scalar cell of `row` at canonical column index `col`. The column order
-/// matches the order `evaluate` reads masks (each access block = ACCESS_COLS core + RC_N_LIMBS limbs):
+/// matches the order `evaluate` reads masks (each access block = ACCESS_COLS core + 1 rc diff col):
 ///   is_{nop,not,cnot,toffoli}(4),
-///   target(addr,prev_ts,v, rc_lo,rc_hi),
-///   ctrl_a(addr,prev_ts,v, rc_lo,rc_hi), ctrl_b(addr,prev_ts,v, rc_lo,rc_hi),
+///   target(addr,prev_ts,v, d),
+///   ctrl_a(addr,prev_ts,v, d), ctrl_b(addr,prev_ts,v, d),
 ///   ab, fire, delta (3).
 /// NOTE: enabler, shot_id, pc are NOT here — they are preprocessed (tree0). ts (= pc+1) and the
 /// target's v_after (= v_before+delta) are NOT columns either — they are inlined in `evaluate`.
@@ -1559,13 +1555,12 @@ fn cell_at(row: &Row, col: usize) -> u32 {
     debug_assert!(col < TRACE_COLUMNS);
     #[inline]
     fn access_cell(a: &AccessCols, i: usize) -> u32 {
-        // 0..ACCESS_COLS: addr, prev_ts, v ; then rc_lo, rc_hi.
+        // 0..ACCESS_COLS: addr, prev_ts, v ; then d.
         match i {
             0 => a.addr,
             1 => a.prev_ts,
             2 => a.v,
-            3 => a.rc_lo,
-            _ => a.rc_hi,
+            _ => a.d,
         }
     }
     let mut c = col;
@@ -1789,11 +1784,11 @@ fn generate_program_witness(
     ]
 }
 
-/// Preprocessed rc-table membership columns (pos, val), in the order RcTableEval reads them.
+/// Preprocessed rc-table membership column (val), the single column RcTableEval reads.
 fn generate_rc_preprocessed(
     rc: &RcTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(&rc.pos), col_from_values(&rc.val)]
+    vec![col_from_values(&rc.val)]
 }
 
 /// rc-table witness (multiplicity tree): a single multiplicity column.
@@ -1815,16 +1810,14 @@ fn pack(lane: &[&Row; LANE_COUNT], get: impl Fn(&Row) -> u32) -> PackedM31 {
 }
 
 /// Main component interaction trace. Logup batches mirror the relation entries
-/// emitted in `evaluate`, finalized in pairs. Order must match (7 entries -> 4 columns):
+/// emitted in `evaluate`, finalized in pairs. Order must match (5 batches -> 4 columns each):
 ///   pair0: qubitmem target Use (+enabler), target Yield (-enabler)
 ///   pair1: qubitmem ctrl_a Use (+a_active), ctrl_a Yield (-a_active)
 ///   pair2: qubitmem ctrl_b Use (+b_active), ctrl_b Yield (-b_active)
-///   pair3: rc target lo (+enabler), target hi (+enabler)
-///   pair4: rc ctrl_a lo (+a_active), ctrl_a hi (+a_active)
-///   pair5: rc ctrl_b lo (+b_active), ctrl_b hi (+b_active)
-///   col6:  program (+enabler)  [odd tail => a singleton batch, not a pair]
-/// 13 relation entries -> 6 pairs + 1 singleton => 7 batches => 28 interaction columns. The rc terms
-/// are the ts-ordering range-check limb lookups (TAG_RC, pos, limb) mirroring `add_rc_lookup`.
+///   pair3: rc target d (+enabler), rc ctrl_a d (+a_active)
+///   pair4: rc ctrl_b d (+b_active), program (+enabler)
+/// 10 relation entries -> 5 pairs => 5 batches => 20 interaction columns. The rc terms are the
+/// ts-ordering range-check single-`d` lookups (TAG_RC, d) mirroring `add_rc_lookup`.
 fn gen_main_interaction(
     rows: &[Row],
     padded_rows: usize,
@@ -1884,19 +1877,11 @@ fn gen_main_interaction(
     let a_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_cnot + r.is_toffoli);
     let b_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_toffoli);
 
-    // ts-ordering range-check use-side denominators: (TAG_RC, pos, limb) per limb of each access.
-    let rc_lo = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
+    // ts-ordering range-check use-side denominator: (TAG_RC, d) — single `d` per access.
+    let rc_d = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
         el.rc.combine(&[
             ptag(TAG_RC),
-            ptag(RC_POS_LO),
-            pack(lane, |r| sel(r).rc_lo),
-        ])
-    };
-    let rc_hi = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
-        el.rc.combine(&[
-            ptag(TAG_RC),
-            ptag(RC_POS_HI),
-            pack(lane, |r| sel(r).rc_hi),
+            pack(lane, |r| sel(r).d),
         ])
     };
 
@@ -1951,32 +1936,6 @@ fn gen_main_interaction(
         });
         gen.col_from_par_iter(col_iter);
     }
-    // Write one logup column for a SINGLE relation entry: fraction = m0/d0. Used for the odd tail
-    // (program) so the prover-side batching matches `finalize_logup_in_pairs`'s last (singleton)
-    // chunk when the relation-entry count is odd.
-    fn write_single_par<N0, D0>(
-        gen: &mut LogupTraceGenerator,
-        rows: &[Row],
-        n_vec: usize,
-        num0: N0,
-        den0: D0,
-        sign0: i32,
-    ) where
-        N0: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
-        D0: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
-    {
-        use rayon::prelude::*;
-        let pad = Row::padding();
-        let col_iter = (0..n_vec).into_par_iter().map(|vec_row| {
-            let lane: [&Row; LANE_COUNT] =
-                std::array::from_fn(|l| rows.get(vec_row * LANE_COUNT + l).unwrap_or(&pad));
-            let m0 = PackedSecureField::from(num0(&lane));
-            let m0 = if sign0 < 0 { -m0 } else { m0 };
-            let d0 = den0(&lane);
-            (m0, d0)
-        });
-        gen.col_from_par_iter(col_iter);
-    }
     let n_vec = padded_rows / LANE_COUNT;
     let write_pair = |gen: &mut LogupTraceGenerator,
                       num0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
@@ -2018,38 +1977,27 @@ fn gen_main_interaction(
         &|l| qm_yield_ctrl(l, sel_b),
         -1,
     );
-    // pair3: rc target lo (+enabler), rc target hi (+enabler).
+    // pair3: rc target d (+enabler), rc ctrl_a d (+a_active).
     write_pair(
         &mut gen,
         &enabler,
-        &|l| rc_lo(l, sel_t),
+        &|l| rc_d(l, sel_t),
+        1,
+        &a_active,
+        &|l| rc_d(l, sel_a),
+        1,
+    );
+    // pair4: rc ctrl_b d (+b_active), program (+enabler). The trailing 3 rc + 1 program fold into
+    // these two pairs (matches `finalize_logup_in_pairs` on the 10-entry stream).
+    write_pair(
+        &mut gen,
+        &b_active,
+        &|l| rc_d(l, sel_b),
         1,
         &enabler,
-        &|l| rc_hi(l, sel_t),
+        &program,
         1,
     );
-    // pair4: rc ctrl_a lo (+a_active), rc ctrl_a hi (+a_active).
-    write_pair(
-        &mut gen,
-        &a_active,
-        &|l| rc_lo(l, sel_a),
-        1,
-        &a_active,
-        &|l| rc_hi(l, sel_a),
-        1,
-    );
-    // pair5: rc ctrl_b lo (+b_active), rc ctrl_b hi (+b_active).
-    write_pair(
-        &mut gen,
-        &b_active,
-        &|l| rc_lo(l, sel_b),
-        1,
-        &b_active,
-        &|l| rc_hi(l, sel_b),
-        1,
-    );
-    // col6: program (+enabler). Odd tail => a singleton batch (matches finalize_logup_in_pairs).
-    write_single_par(&mut gen, rows, n_vec, enabler, program, 1);
 
     // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
     // prover backend happens later via `to_prover` at the `extend_evals` boundary.
@@ -2442,6 +2390,7 @@ fn build_tree0_columns(
     padded_rows: usize,
     log_n_rows: u32,
     n_gates: usize,
+    rc_log: u32,
     boundary: &BoundaryTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     let mut tagged: Vec<(u32, CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>)> = vec![
@@ -2456,11 +2405,12 @@ fn build_tree0_columns(
             .into_iter()
             .map(|c| (boundary.log_size, c)),
     );
-    let rc = RcTable::new();
+    // rc membership table sized at the DYNAMIC rc_log (single [0,2^rc_log) val column).
+    let rc = RcTable::new(rc_log);
     tagged.extend(
         generate_rc_preprocessed(&rc)
             .into_iter()
-            .map(|c| (RC_LOG_SIZE, c)),
+            .map(|c| (rc_log, c)),
     );
     tagged.sort_by_key(|(s, _)| *s); // stable: identical key+listing order as preprocessed_columns_sorted
     tagged.into_iter().map(|(_, c)| c).collect()
@@ -2496,6 +2446,9 @@ struct BaseProverPrecompute {
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
     padded_rows: usize,
     log_n_rows: u32,
+    /// Dynamic rc-table log-size (= ceil(log2(k*n_gates))); shard-invariant. Used to REBUILD tree0
+    /// (device n != 0 replica / the debug rebuild check) with the same rc membership sizing.
+    rc_log: u32,
     /// (cuda) shape needed to REBUILD the device-resident parts on a producer's device (device != 0).
     #[cfg(feature = "cuda")]
     max_log_size: u32,
@@ -2563,6 +2516,7 @@ impl BaseProverPrecompute {
         padded_rows: usize,
         log_n_rows: u32,
         n_gates: usize,
+        rc_log: u32,
         #[cfg(feature = "cuda")] gates_flat: &[u32],
         #[cfg(feature = "cuda")] off_lo: &[u32],
         #[cfg(feature = "cuda")] off_hi: &[u32],
@@ -2585,7 +2539,7 @@ impl BaseProverPrecompute {
         // does (it uses the same scheme config, which has lifting_log_size from leaf_pcs_config). The
         // store flag is FALSE to match the base proof's barycentric-OODS path (no stored coeffs).
         let cols = build_tree0_columns(
-            &program0, rows0, padded_rows, log_n_rows, n_gates, &boundary0,
+            &program0, rows0, padded_rows, log_n_rows, n_gates, rc_log, &boundary0,
         );
         let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
         let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -2620,6 +2574,7 @@ impl BaseProverPrecompute {
             boundary: boundary0,
             padded_rows,
             log_n_rows,
+            rc_log,
             #[cfg(feature = "cuda")]
             max_log_size,
             #[cfg(feature = "cuda")]
@@ -2665,7 +2620,7 @@ impl BaseProverPrecompute {
         let pool = BaseColumnPool::<ProverBackend>::new();
         let cols = build_tree0_columns(
             &self.program, &self.rows0, self.padded_rows, self.log_n_rows, self.n_gates,
-            &self.boundary,
+            self.rc_log, &self.boundary,
         );
         let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
         let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -2759,7 +2714,13 @@ fn assert_tree0_matches_rebuild(
     // Rebuild via the exact old path (fresh scheme/channel; columns from the same builder).
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(
-            pc.log_n_rows.max(RC_LOG_SIZE) + 1 + pc.config.fri_config.log_blowup_factor,
+            tree0_max_log_size(
+                pc.log_n_rows,
+                pc.rc_log,
+                pc.program.log_size,
+                pc.boundary.log_size,
+            ) + 1
+                + pc.config.fri_config.log_blowup_factor,
         )
         .circle_domain()
         .half_coset,
@@ -2767,7 +2728,7 @@ fn assert_tree0_matches_rebuild(
     let mut scheme =
         CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(pc.config, &twiddles);
     let cols = build_tree0_columns(
-        &pc.program, rows0, pc.padded_rows, pc.log_n_rows, n_gates, &pc.boundary,
+        &pc.program, rows0, pc.padded_rows, pc.log_n_rows, n_gates, pc.rc_log, &pc.boundary,
     );
     let n_cols = cols.len();
     let mut tb = scheme.tree_builder();
@@ -2815,6 +2776,147 @@ fn assert_tree0_matches_rebuild(
         "gate-air: base-precompute tree0 root-equality OK ({} cols, root matches rebuilt shard-0)",
         n_cols
     );
+}
+
+/// SOUNDNESS (base pp-root pin, step 1): recompute the CANONICAL base gate_air preprocessed (tree0)
+/// root at BUILD TIME purely from the trusted PUBLIC config — the program table, `k`, `n_gates`,
+/// `shots_per_shard`, the shard-invariant row shape, the boundary layout, `rc_log = rc_log_size(k *
+/// n_gates)`, and the base blowup. This is the value the base-fanning unpacker BAKES as a constant
+/// (`config.base_preprocessed_root`, leaf.rs) so the trusted final verifier's canonical-unpacker-root
+/// check pins every base to a canonical preprocessed trace (positional pc, in-range rc table).
+///
+/// It must NOT read `base_extended.proof` (the prover's `commitments[0]` — a forgeable value). tree0
+/// is SHARD-INVARIANT (every preprocessed column is positional / shape-derived, see
+/// [`build_tree0_columns`]), so ANY shard's rows recompute the same root; the caller passes shard 0's
+/// rows (already materialized for the base proof). The build mirrors [`BaseProverPrecompute::new`]'s
+/// tree0 path exactly (same columns, blowup, lifting, `store=false`), so the recomputed root equals
+/// the honest prover's committed base preprocessed root by construction.
+///
+/// REBUILD-ASSERT GUARD (debug/test only, mirrors [`assert_tree0_matches_rebuild`]): the tree0 root is
+/// re-derived via a fresh `CommitmentSchemeProver` + `tree_builder().commit()` and asserted equal, so
+/// a column-order / blowup / lifting / sort divergence aborts before the canonical constant is baked.
+/// Compiled out of `--release` (byte-identical, pays nothing).
+#[allow(clippy::too_many_arguments)]
+fn canonical_base_preprocessed_root(
+    program: &ProgramTable,
+    rows: &[Row],
+    padded_rows: usize,
+    log_n_rows: u32,
+    n_gates: usize,
+    rc_log: u32,
+    boundary: &BoundaryTable,
+    pcs_config: stwo::core::pcs::PcsConfig,
+) -> circuits::blake::HashValue<SecureField> {
+    use circuits::blake::HashValue;
+    use stwo::prover::CommitmentTreeProver;
+    use stwo::prover::mempool::BaseColumnPool;
+    use stwo::prover::poly::circle::PolyOps;
+
+    let max_log_size =
+        tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let twiddles = ProverBackend::precompute_twiddles(
+        CanonicCoset::new(max_log_size + 1 + pcs_config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+    let pool = BaseColumnPool::<ProverBackend>::new();
+    // Same tree0 build as `BaseProverPrecompute::new` (barycentric-OODS path: store=false).
+    let cols = build_tree0_columns(program, rows, padded_rows, log_n_rows, n_gates, rc_log, boundary);
+    let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
+    let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
+        polys,
+        pcs_config.fri_config.log_blowup_factor,
+        &twiddles,
+        false,
+        pcs_config.lifting_log_size,
+        &pool,
+    );
+    let canonical: HashValue<SecureField> = tree0.commitment.root().into();
+
+    // Rebuild-assert (debug/test only): independent fresh-scheme rebuild must give the same root.
+    #[cfg(any(debug_assertions, test))]
+    {
+        let twiddles_r = ProverBackend::precompute_twiddles(
+            CanonicCoset::new(max_log_size + 1 + pcs_config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let mut scheme = CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
+            pcs_config,
+            &twiddles_r,
+        );
+        let cols_r =
+            build_tree0_columns(program, rows, padded_rows, log_n_rows, n_gates, rc_log, boundary);
+        let mut tb = scheme.tree_builder();
+        tb.extend_evals(to_prover(cols_r));
+        let mut throwaway_channel = Blake2sM31Channel::default();
+        tb.commit(&mut throwaway_channel);
+        assert_eq!(
+            tree0.commitment.root(),
+            scheme.trees[0].commitment.root(),
+            "canonical base tree0 root != independent rebuild (column order/blowup/lifting mismatch)"
+        );
+    }
+
+    canonical
+}
+
+/// TRUSTED FINAL VERIFIER (step 3) for the base-fanning recursion. Independently checks the single
+/// published root-verification proof `rv` against a CANONICAL unpacker circuit recomputed here from
+/// the TRUSTED PUBLIC `(n, config)` — never from any prover-supplied value — closing the base
+/// pp-root soundness hole:
+///
+///   1. Recompute the canonical base-node roots for the `base_fan_group_sizes(n, b)` groups via
+///      `base_node_root_for_arity` (public, arity-derived — NOT the prover's reported `bn.preprocessed_root`).
+///   2. Recompute the canonical unpacker `CircuitConfig` (`base_fan_unpacker_verify_config`) — its
+///      `preprocessed_root` is the canonical unpacker root, built through the SAME shared builder the
+///      prover used but with a `NoValue` witness, so it is byte-identical to the honest proof's
+///      preprocessed root. Because the child roots (base tree0, base-node, R2/short) are BAKED as
+///      constants in that circuit, this canonical root PINS them: a proof whose unpacker baked a
+///      forged child root has a different preprocessed root and is REJECTED here.
+///   3. `verify_circuit` the proof against that canonical config, with the CALLER-COMMITTED outputs
+///      (`rv.leaf_outputs`, the per-base `H_i`) as public data — NOT values lifted from the proof.
+///
+/// `zk_n_padding` must equal the prover's blinding `n_padding` (the root PCS `n_queries`) so the
+/// recomputed circuit's component sizes match; `None` for an unblinded (test) proof. Modeled on
+/// `privacy_circuit_verify::verify_recursive_circuit`.
+fn verify_gate_air_root(
+    rv: &recursive_aggregate::RootVerificationOutput,
+    config: &leaf::BaseFanConfig,
+    n: usize,
+    log_blowup_factor: u32,
+    zk_n_padding: Option<usize>,
+) -> anyhow::Result<()> {
+    use circuit_verifier::verify::{CircuitPublicData, verify_circuit};
+    use recursive_aggregate::{base_fan_group_sizes, base_fan_unpacker_verify_config};
+
+    let b = config.b;
+    // (1) Canonical base-node roots for each group (public, arity-derived — never prover-reported).
+    let base_node_roots: Vec<_> = base_fan_group_sizes(n, b)
+        .into_iter()
+        .map(|arity| leaf::base_node_root_for_arity(config, arity))
+        .collect();
+
+    // (2) Canonical unpacker verify config recomputed from trusted public params (NoValue), sharing
+    //     the prover's builder ⇒ byte-identical preprocessed root/shape.
+    let verify_config = base_fan_unpacker_verify_config(
+        n,
+        b,
+        &config.agg,
+        &base_node_roots,
+        log_blowup_factor,
+        zk_n_padding,
+    );
+
+    // (3) Verify the published proof with the CALLER-COMMITTED per-base outputs.
+    let output_values: Vec<SecureField> = rv.leaf_outputs.iter().flatten().copied().collect();
+    verify_circuit(
+        verify_config,
+        rv.proof.clone(),
+        CircuitPublicData { output_values },
+    )
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!("trusted gate_air root verification failed: {e}"))
 }
 
 // ----------------------------------------------------------------------------
@@ -3039,7 +3141,14 @@ fn main() -> Result<()> {
             let real_rows = rows.len();
             let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
             let log_n_rows = padded_rows.ilog2();
-            let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+            // Dynamic rc-table log-size = ceil(log2(k*n_gates)); <= log_n_rows (never raises the floor).
+            let rc_log = rc_log_size(k * gates.len());
+            let max_log_size = tree0_max_log_size(
+                log_n_rows,
+                rc_log,
+                program_log_size(gates.len()),
+                boundary.log_size,
+            );
             let base_blowup: u32 = topo.base_log_blowup;
             let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
 
@@ -3102,7 +3211,7 @@ fn main() -> Result<()> {
                 }
                 None => {
                     let pp = build_tree0_columns(
-                        program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
+                        program, &rows, padded_rows, log_n_rows, n_gates, rc_log, &boundary,
                     );
                     let mut tree_builder = commitment_scheme.tree_builder();
                     tree_builder.extend_evals(to_prover(pp));
@@ -3119,7 +3228,7 @@ fn main() -> Result<()> {
                     // Old path: build the (size-sorted) preprocessed columns, then interpolate + LDE +
                     // Merkle-commit them inline (the shard-invariant work this precompute eliminates).
                     let pp = build_tree0_columns(
-                        program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
+                        program, &rows, padded_rows, log_n_rows, n_gates, rc_log, &boundary,
                     );
                     let mut tree_builder = commitment_scheme.tree_builder();
                     tree_builder.extend_evals(to_prover(pp));
@@ -3156,7 +3265,7 @@ fn main() -> Result<()> {
             let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
 
             // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
-            let rc_table = build_rc_table(&rows);
+            let rc_table = build_rc_table(&rows, rc_log);
 
             // Tree 1: main trace + program witness + boundary witness + rc multiplicity.
             let small_main = {
@@ -3199,11 +3308,11 @@ fn main() -> Result<()> {
                     }
                 }
                 .map_err(|e| anyhow::anyhow!(e))?;
-                // Fix (b) (`GATE_AIR_FUSED_INTERP`): same as the single-proof path — feed the 188
+                // Fix (b) (`GATE_AIR_FUSED_INTERP`): same as the single-proof path — feed the 19
                 // borrowed `d_cols` eval views as `CircleCoefficients` via `extend_polys` (skip the
                 // batched interpolate) so the per-column-interpolate commit path handles them without
                 // the second main-trace resident copy; `small_main` (different size) stays on
-                // `extend_evals`. Order is 188 main THEN small_main, matching the flag-off path.
+                // `extend_evals`. Order is 19 main THEN small_main, matching the flag-off path.
                 if std::env::var("GATE_AIR_FUSED_INTERP").is_ok() {
                     use stwo::prover::poly::circle::CircleCoefficients;
                     let main_polys: Vec<CircleCoefficients<ProverBackend>> = main_dev
@@ -3295,13 +3404,12 @@ fn main() -> Result<()> {
                 gen_program_interaction(program, &elements.program);
             let (boundary_interaction, boundary_sum) =
                 gen_boundary_interaction(&boundary, &elements.qubitmem);
-            // rc supply: -multiplicity / combine(TAG_RC, pos, val).
+            // rc supply: -multiplicity / combine(TAG_RC, val).
             let (rc_interaction, rc_sum) = {
                 let el = elements.rc.clone();
                 gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
                     el.combine(&[
                         ptag(TAG_RC),
-                        pack_seq(&rc_table.pos, vec_row),
                         pack_seq(&rc_table.val, vec_row),
                     ])
                 })
@@ -3374,6 +3482,7 @@ fn main() -> Result<()> {
                 log_n_rows,
                 program.log_size,
                 boundary.log_size,
+                rc_log,
                 &elements,
                 main_sum,
                 program_sum,
@@ -3430,7 +3539,9 @@ fn main() -> Result<()> {
             let real_rows0 = rows0.len();
             let padded_rows0 = real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
             let log_n_rows0 = padded_rows0.ilog2();
-            let max_log_size0 = log_n_rows0.max(RC_LOG_SIZE);
+            let rc_log0 = rc_log_size(k * n_gates);
+            let max_log_size0 =
+                tree0_max_log_size(log_n_rows0, rc_log0, program0.log_size, boundary0.log_size);
             let base_blowup: u32 = topo.base_log_blowup;
             let config0 = leaf::leaf_pcs_config(max_log_size0, base_blowup);
             #[cfg(feature = "cuda")]
@@ -3445,6 +3556,7 @@ fn main() -> Result<()> {
                 padded_rows0,
                 log_n_rows0,
                 n_gates,
+                rc_log0,
                 #[cfg(feature = "cuda")]
                 &gates_flat0,
                 #[cfg(feature = "cuda")]
@@ -3632,8 +3744,11 @@ fn main() -> Result<()> {
             ref base0_boundary,
             base0_total_pc,
         ) = shard_bases[0];
+        // rc_log derived from the PUBLIC total_pc (= k*n_gates) the leaf binds — never from a proof
+        // field (soundness: an inflated rc table would admit out-of-range d). <= base0_log_n_rows.
+        let base0_rc_log = rc_log_size(base0_total_pc as usize);
         let base0_config =
-            leaf::leaf_pcs_config(base0_log_n_rows.max(RC_LOG_SIZE), topo.base_log_blowup);
+            leaf::leaf_pcs_config(base0_log_n_rows.max(base0_rc_log), topo.base_log_blowup);
         let cfg = ProofConfig::new(
             &gate_air_components::<NoValue>(),
             n_pp,
@@ -3870,12 +3985,37 @@ fn main() -> Result<()> {
             FoldMode::BaseFanning => {
                 eprintln!("gate-air: deriving base-fanning config (b={b}) ...");
                 let t = Instant::now();
+                // SOUNDNESS (step 1): recompute the CANONICAL base preprocessed root from the trusted
+                // PUBLIC config (program table + shard-invariant row shape + boundary + rc_log + base
+                // blowup) — NOT from the base proof's `commitments[0]`. tree0 is shard-invariant
+                // (positional columns), so shard 0's rebuilt rows recompute the honest prover's base
+                // preprocessed root. This is what the unpacker bakes as a constant for every base.
+                let canonical_base_pp_root = {
+                    let program0 = build_program_table(&gates, shots_per_shard, k);
+                    let (rows0, boundary0) = build_rows(&gates, &shard_case_sets[0], k)?;
+                    let real_rows0 = rows0.len();
+                    let padded_rows0 =
+                        real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
+                    let log_n_rows0 = padded_rows0.ilog2();
+                    let rc_log0 = rc_log_size(k * n_gates);
+                    canonical_base_preprocessed_root(
+                        &program0,
+                        &rows0,
+                        padded_rows0,
+                        log_n_rows0,
+                        n_gates,
+                        rc_log0,
+                        &boundary0,
+                        base0_config,
+                    )
+                };
                 let config = derive_base_fanning_config(
                     &cfg,
                     &shape_params,
                     b,
                     topo.fold_arity,
                     recursion_log_blowup,
+                    canonical_base_pp_root,
                 );
                 eprintln!(
                     "gate-air: config derived in {:.1}s (node target qm31_ops={})",
@@ -3976,6 +4116,27 @@ fn main() -> Result<()> {
                     t.elapsed().as_secs_f64(),
                     rv.trace_log_size,
                     rv.leaf_outputs.len()
+                );
+
+                // TRUSTED FINAL VERIFY (step 3): check the published proof against a canonical unpacker
+                // circuit recomputed here from the trusted public `(n, config)` — the real soundness
+                // anchor. Replaces the old fingerprint-only "self-verify" claim: the canonical unpacker
+                // root PINS every baked child root (incl. the canonical base tree0 root), and the
+                // per-base outputs are taken from `rv.leaf_outputs` (caller-committed), not the proof.
+                let n_bases = rv.leaf_outputs.len();
+                let tv = Instant::now();
+                verify_gate_air_root(
+                    &rv,
+                    &config,
+                    n_bases,
+                    recursion_log_blowup,
+                    Some(config.agg.node_pcs_config.fri_config.n_queries),
+                )
+                .expect("trusted gate_air root verification failed");
+                eprintln!(
+                    "gate-air: TRUSTED root verify OK in {:.1}s (canonical unpacker root, {} caller-committed outputs)",
+                    tv.elapsed().as_secs_f64(),
+                    n_bases,
                 );
                 (base_nodes, out, rv)
             }
@@ -4097,7 +4258,11 @@ fn main() -> Result<()> {
     }
 
     // ---- Proving ----
-    let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+    // Dynamic rc-table log-size = ceil(log2(k*n_gates)); rc_log <= log_n_rows so the .max reduces to
+    // log_n_rows (the rc table never raises the FRI/twiddle domain floor).
+    let rc_log = rc_log_size(k * n_gates);
+    let max_log_size =
+        tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
     // SECURE base config (~96-bit) instead of PcsConfig::default() (which is a 13-bit TOY: blowup 1,
     // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
     // the base proof passes the privacy-verifier security test. The in-circuit verifier replays this
@@ -4139,7 +4304,7 @@ fn main() -> Result<()> {
     let t_phase = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     let pp = build_tree0_columns(
-        &program, &rows, padded_rows, log_n_rows, n_gates, &boundary,
+        &program, &rows, padded_rows, log_n_rows, n_gates, rc_log, &boundary,
     );
     tree_builder.extend_evals(to_prover(pp));
     tree_builder.commit(prover_channel);
@@ -4197,9 +4362,9 @@ fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
 
-    // ts-ordering range-check supply table (multiplicity counted from the active accesses' limb
-    // lookups). Shard-invariant membership (pos/val) lives in tree0; only the multiplicity is witness.
-    let rc_table = build_rc_table(&rows);
+    // ts-ordering range-check supply table (multiplicity counted from the active accesses' `d`
+    // lookups). Shard-invariant membership (val) lives in tree0; only the multiplicity is witness.
+    let rc_table = build_rc_table(&rows, rc_log);
 
     // Tree 1: main trace + program witness (op cols+mult) + boundary witness + rc multiplicity.
     let t_phase = Instant::now();
@@ -4380,13 +4545,12 @@ fn main() -> Result<()> {
     let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
     let (boundary_interaction, boundary_sum) =
         gen_boundary_interaction(&boundary, &elements.qubitmem);
-    // rc supply: -multiplicity / combine(TAG_RC, pos, val).
+    // rc supply: -multiplicity / combine(TAG_RC, val).
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
         gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
             el.combine(&[
                 ptag(TAG_RC),
-                pack_seq(&rc_table.pos, vec_row),
                 pack_seq(&rc_table.val, vec_row),
             ])
         })
@@ -4449,6 +4613,7 @@ fn main() -> Result<()> {
             &rc_interaction,
             rc_sum,
             RcTableEval {
+                log_size: rc_table.log_size,
                 elements: elements.rc.clone(),
             },
         );
@@ -4502,10 +4667,7 @@ fn main() -> Result<()> {
         bail!("boundary claimed sum mismatch");
     }
     let rc_expected = table_public_sum(&rc_table.multiplicity, &elements.rc, TAG_RC, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_table.pos[i]),
-            BaseField::from_u32_unchecked(rc_table.val[i]),
-        ]
+        vec![BaseField::from_u32_unchecked(rc_table.val[i])]
     });
     if rc_sum != rc_expected {
         bail!("rc claimed sum mismatch");
@@ -4561,6 +4723,7 @@ fn main() -> Result<()> {
         log_n_rows,
         program.log_size,
         boundary.log_size,
+        rc_log,
         &elements,
         main_sum,
         program_sum,
@@ -4719,10 +4882,7 @@ fn main() -> Result<()> {
     let v_program = program_claimed_sum(&program, &v_elements.program);
     let v_boundary = boundary_public_sum(&boundary, &v_elements.qubitmem);
     let v_rc = table_public_sum(&rc_table.multiplicity, &v_elements.rc, TAG_RC, |i| {
-        vec![
-            BaseField::from_u32_unchecked(rc_table.pos[i]),
-            BaseField::from_u32_unchecked(rc_table.val[i]),
-        ]
+        vec![BaseField::from_u32_unchecked(rc_table.val[i])]
     });
     let v_b_public = boundary_public_term(&boundary, &v_elements.qubitmem);
     let v_p_pub = program_public_term(&program, &v_elements.program);
@@ -4734,6 +4894,7 @@ fn main() -> Result<()> {
         log_n_rows,
         program.log_size,
         boundary.log_size,
+        rc_log,
         &v_elements,
         v_main,
         v_program,
@@ -4877,8 +5038,13 @@ mod tests {
         let real_rows = rows.len();
         let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
         let log_n_rows = padded_rows.ilog2();
-        let max_log_size = log_n_rows.max(RC_LOG_SIZE);
         let program = build_program_table(gates, cases.len(), k);
+        let max_log_size = tree0_max_log_size(
+            log_n_rows,
+            rc_log_size(k * gates.len()),
+            program.log_size,
+            boundary.log_size,
+        );
         let config = leaf::leaf_pcs_config(
             max_log_size,
             recursive_aggregate::TopologyConfig::default().base_log_blowup,
@@ -4899,6 +5065,7 @@ mod tests {
         circuits_stark_verifier::proof::Proof<QM31>,
         leaf::GateAirLeafParams,
         circuits_stark_verifier::proof::ProofConfig,
+        circuits::blake::HashValue<QM31>,
     ) {
         use circuit_statement::gate_air_components;
         use circuits::blake::HashValue;
@@ -4916,8 +5083,10 @@ mod tests {
         let real_rows = rows.len();
         let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
         let log_n_rows = padded_rows.ilog2();
-        let max_log_size = log_n_rows.max(RC_LOG_SIZE);
+        let rc_log = rc_log_size(k * n_gates);
         let program = build_program_table(gates, cases.len(), k);
+        let max_log_size =
+            tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
         // TOY (INSECURE) base PCS: blowup 1, ONE FRI query, no grind. This is a LAPTOP-SAFETY lever:
         // the in-circuit STARK verifier (`emit_one_base`) builds a decommit circuit whose size scales
         // with `n_queries`, so a 1-query base makes the base-NODE trace ~2^15 instead of the
@@ -4936,7 +5105,7 @@ mod tests {
             },
             lifting_log_size: Some(max_log_size + 1),
         };
-        let rc_table = build_rc_table(&rows);
+        let rc_table = build_rc_table(&rows, rc_log);
 
         let twiddles = TraceBackend::precompute_twiddles(
             CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
@@ -4952,7 +5121,7 @@ mod tests {
 
         // Tree 0: preprocessed.
         let mut tree_builder = commitment_scheme.tree_builder();
-        let pp = build_tree0_columns(&program, &rows, padded_rows, log_n_rows, n_gates, &boundary);
+        let pp = build_tree0_columns(&program, &rows, padded_rows, log_n_rows, n_gates, rc_log, &boundary);
         tree_builder.extend_evals(to_prover(pp));
         tree_builder.commit(prover_channel);
 
@@ -4986,7 +5155,6 @@ mod tests {
             gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
                 el.combine(&[
                     ptag(TAG_RC),
-                    pack_seq(&rc_table.pos, vec_row),
                     pack_seq(&rc_table.val, vec_row),
                 ])
             })
@@ -5008,7 +5176,7 @@ mod tests {
         tree_builder.commit(prover_channel);
 
         let components = build_components(
-            log_n_rows, program.log_size, boundary.log_size,
+            log_n_rows, program.log_size, boundary.log_size, rc_log,
             &elements, main_sum, program_sum, boundary_sum, rc_sum,
         );
         let prover_refs = components.prover_refs();
@@ -5039,7 +5207,13 @@ mod tests {
         };
         let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
         let circuit_proof = proof_from_stark_proof(&extended, &cfg, claim, interaction_pow_nonce, channel_salt);
-        (circuit_proof, params, cfg)
+        // Canonical base preprocessed root recomputed from the trusted shape + toy config (step 1).
+        // Equals `pp_root` (the committed root) in this honest test — the recompute path the
+        // production base-fanning config uses to pin the base root against a forgeable proof value.
+        let canonical_base_pp_root = canonical_base_preprocessed_root(
+            &program, &rows, padded_rows, log_n_rows, n_gates, rc_log, &boundary, config,
+        );
+        (circuit_proof, params, cfg, canonical_base_pp_root)
     }
 
     /// End-to-end base-fanning correctness gate (test i): prove `N` tiny gate_air bases on SimdBackend,
@@ -5137,7 +5311,7 @@ mod tests {
 
         // Prove one shared tiny base shape; reuse it for all N bases (identical bases are fine — the
         // fold/unpack don't require distinctness). The base config/params shape is shard-invariant.
-        let (proof0, params0, cfg) = prove_tiny_base(&gates, &cases, k);
+        let (proof0, params0, cfg, canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
         let config = derive_base_fanning_config_ex(
             &cfg,
             &params0,
@@ -5145,6 +5319,7 @@ mod tests {
             fold_arity,
             log_blowup_factor,
             single_base_node,
+            canonical_base_pp_root,
         );
 
         // Build N (proof, params) bases (clone the shared one).
@@ -5174,12 +5349,20 @@ mod tests {
         let pools = PoolSet::new(1, cores.max(1));
         let out = recursive_aggregate_prove(base_nodes, &config.agg, &pools);
 
-        // Root verification: unpack from the bases + self-verify.
+        // Root verification: unpack from the bases (no zk-blinding in the test).
         let bottom = BaseFanBottom { bases: all_base_outputs, b, base_node_roots };
         let rv = prove_root_verification(&out.root, &bottom, &config.agg, log_blowup_factor, None);
         assert_eq!(rv.leaf_outputs.len(), n_bases, "root exposes one H_i per base");
+
+        // TRUSTED FINAL VERIFY (step 3): check `rv` against a canonical unpacker circuit recomputed
+        // from trusted public `(n, config)` — canonical base-node roots (arity-derived), canonical
+        // unpacker root (pins every baked child root incl. the canonical base tree0 root), and the
+        // caller-committed `rv.leaf_outputs`. `None` blinding matches the unblinded test proof above.
+        verify_gate_air_root(&rv, &config, n_bases, log_blowup_factor, None)
+            .expect("trusted gate_air root verification failed (roundtrip)");
+
         eprintln!(
-            "gate-air: base_fanning roundtrip OK (b={b}, N={n_bases}, single_base_node={single_base_node}, groups={sizes:?}, n_levels={}, root trace 2^{})",
+            "gate-air: base_fanning roundtrip OK (b={b}, N={n_bases}, single_base_node={single_base_node}, groups={sizes:?}, n_levels={}, root trace 2^{}) [trusted verify OK]",
             out.n_levels, rv.trace_log_size
         );
     }
@@ -5200,7 +5383,9 @@ mod tests {
         use circuits_stark_verifier::proof::Proof;
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
-        let (proof0, params0, cfg) = prove_tiny_base(&gates, &cases, k);
+        // LeafR1R2 uses the leaf preprocessed root (not the base-fanning canonical base root), so the
+        // recomputed canonical base pp root is unused here.
+        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
         let config = derive_aggregate_config(&cfg, &params0, fold_arity, log_blowup_factor);
 
         let make_base = || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
@@ -5272,6 +5457,7 @@ mod tests {
         let n_gates = gates.len();
         let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
             shard0_shape(&gates, &cases, k);
+        let rc_log = rc_log_size(k * n_gates);
         let pc = BaseProverPrecompute::new(
             config,
             max_log_size,
@@ -5281,6 +5467,7 @@ mod tests {
             padded_rows,
             log_n_rows,
             n_gates,
+            rc_log,
         )
         .expect("precompute new");
         // Panics on any mismatch (root / column count / sizes) — the invariant under test.
@@ -5296,7 +5483,7 @@ mod tests {
         let n_gates = gates.len();
         let (rows, boundary, program, padded_rows, log_n_rows, _max_log_size, _config) =
             shard0_shape(&gates, &cases, k);
-        let rc_table = build_rc_table(&rows);
+        let rc_table = build_rc_table(&rows, rc_log_size(k * n_gates));
 
         // Draw the LogUp relation exactly as the prover does (salt=0, then config is mixed in the
         // real path; for a self-contained balance check the challenge just needs to be consistent
@@ -5314,7 +5501,6 @@ mod tests {
             gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
                 el.combine(&[
                     ptag(TAG_RC),
-                    pack_seq(&rc_table.pos, vec_row),
                     pack_seq(&rc_table.val, vec_row),
                 ])
             })

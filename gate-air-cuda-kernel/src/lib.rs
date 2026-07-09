@@ -76,16 +76,17 @@ extern "C" {
 }
 
 /// gate_air structural constants (must equal the Rust constants in gate-air-leaf src/main.rs).
-/// QUBIT-MEMORY + pc-pinned ts + rc-table encoding (branch anatg/gate-air-qubit-mem): the whole-state
-/// 188-col TAG_STATE encoding is replaced by the 22-col per-qubit chain-lookup qubit-memory with the
-/// ts-ordering rc-table range-check (ACCESS_BLOCK = 5 = addr,prev_ts,v,rc_lo,rc_hi; ts=pc+1 inlined).
+/// QUBIT-MEMORY + pc-pinned ts + single-`d` rc-table encoding (branch anatg/gate-air-qubit-mem): the
+/// whole-state 188-col TAG_STATE encoding is replaced by the 19-col per-qubit chain-lookup qubit-memory
+/// with the ts-ordering rc-table range-check (ACCESS_BLOCK = 4 = addr,prev_ts,v,d; ts=pc+1 inlined; the
+/// two rc limbs collapsed to a single 25-bit diff column `d`).
 /// These MUST match the actual component's shape — `is_gate_air_main` uses them to decide whether the
 /// GPU kernel applies, so a stale value silently FALLS BACK to the host delegate (no fail-fast).
-const GATE_AIR_TRACE_COLUMNS: usize = 22; // main cols (trace1): 4 opcode + 3*ACCESS_BLOCK(5) + 3 (ts=pc+1 and v_after=v_before+delta inlined)
-const GATE_AIR_INTERACTION_COLUMNS: usize = 28; // 7 LogUp cols * 4 QM31 coords (trace2)
+const GATE_AIR_TRACE_COLUMNS: usize = 19; // main cols (trace1): 4 opcode + 3*ACCESS_BLOCK(4) + 3 (ts=pc+1 and v_after=v_before+delta inlined)
+const GATE_AIR_INTERACTION_COLUMNS: usize = 20; // 5 LogUp cols * 4 QM31 coords (trace2)
 const GATE_AIR_PREPROCESSED_COLUMNS: usize = 4; // enabler, shot_id, pc, pc_in_prog (trace0), in get_preprocessed_column call order
-const GATE_AIR_N_CONSTRAINTS: usize = 15 + 7; // 15 algebraic (19 -3 PIN -1 v_after eq) + 7 LogUp pair-batch constraints
-const GATE_AIR_LOGUP_COUNTS: u32 = 13; // 13 relation entries -> 6 pairs + 1 singleton = 7 batches
+const GATE_AIR_N_CONSTRAINTS: usize = 15 + 5; // 15 algebraic (19 -3 PIN -1 v_after eq) + 5 LogUp pair-batch constraints
+const GATE_AIR_LOGUP_COUNTS: u32 = 10; // 10 relation entries -> 5 pairs = 5 batches
 const GATE_AIR_REL_WIDTH: usize = 6; // relation!(GateRel, 6): tag + widest payload (program = 5)
 
 /// `fnv1a("gate_air_main")` — kept for parity with the eval struct's first field (`CommonEval`).

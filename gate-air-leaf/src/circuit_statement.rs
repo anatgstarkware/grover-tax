@@ -31,9 +31,9 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::leaf::ProgramRows;
 use crate::{
-    ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, RC_LOG_SIZE, RC_LO_BITS, RC_POS_HI, RC_POS_LO,
+    ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
     TAG_PROGRAM, TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
-    pp_id, preprocessed_column_ids,
+    pp_id, preprocessed_column_ids, rc_log_size,
 };
 
 /// QM31 constant Var of base-field value `v` (= `(v,0,0,0)`), used for tags and literals.
@@ -140,8 +140,8 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
     }
 }
 
-/// ts-ordering range-check table (supply). `pos`/`val` preprocessed; `multiplicity` witness.
-/// Mirrors main.rs `RcTableEval`: emits -multiplicity / (TAG_RC, pos, val). One term/row => 4 cols.
+/// ts-ordering range-check table (supply). `val` preprocessed (val[i]=i over [0,2^R)); `multiplicity`
+/// witness. Mirrors main.rs `RcTableEval`: emits -multiplicity / (TAG_RC, val). One term/row => 4 cols.
 pub struct RcTable;
 impl<Value: IValue> CircuitEval<Value> for RcTable {
     fn name(&self) -> String {
@@ -168,29 +168,27 @@ impl<Value: IValue> CircuitEval<Value> for RcTable {
         let [mult] = *component_data.trace_columns() else {
             panic!("rc table: expected 1 trace column")
         };
-        let pos = acc.get_preprocessed_column(&pp_id("gate_rc_pos"));
         let val = acc.get_preprocessed_column(&pp_id("gate_rc_val"));
         let tag = context.constant(qm31_from_u32s(TAG_RC, 0, 0, 0));
         let num = eval!(context, -(mult));
-        acc.add_to_relation(context, num, &[tag, pos, val]);
+        acc.add_to_relation(context, num, &[tag, val]);
     }
 }
 
 // ----------------------------------------------------------------------------
-// Main gate component: mirrors gate_air's GateEval::evaluate exactly (same 22-col trace-column
-// order, same constraint order, same 13 relation-term emission order => 6 pairs + 1 singleton => 28
-// interaction cols). ts (= pc+1) and the target's v_after (= v_before+delta) are inlined, not
-// columns. Timestamp ordering is a degree-1 range-check reconstruction + a limb lookup.
+// Main gate component: mirrors gate_air's GateEval::evaluate exactly (same 19-col trace-column
+// order, same constraint order, same 10 relation-term emission order => 5 pairs => 20 interaction
+// cols). ts (= pc+1) and the target's v_after (= v_before+delta) are inlined, not columns.
+// Timestamp ordering is a degree-1 range-check reconstruction + a single-`d` lookup.
 // ----------------------------------------------------------------------------
 
-/// Parsed access-block Vars: addr, prev_ts, v, then the two range-check limbs rc_lo, rc_hi.
+/// Parsed access-block Vars: addr, prev_ts, v, then the single range-check diff `d`.
 /// The access timestamp `ts` is NOT a column — it is the inlined `pc + 1` expression.
 struct AccessVars {
     addr: Var,
     prev_ts: Var,
     v: Var,
-    rc_lo: Var,
-    rc_hi: Var,
+    d: Var,
 }
 
 fn parse_access(cols: &[Var], off: usize) -> AccessVars {
@@ -198,13 +196,12 @@ fn parse_access(cols: &[Var], off: usize) -> AccessVars {
         addr: cols[off],
         prev_ts: cols[off + 1],
         v: cols[off + 2],
-        rc_lo: cols[off + ACCESS_COLS],
-        rc_hi: cols[off + ACCESS_COLS + 1],
+        d: cols[off + ACCESS_COLS],
     }
 }
 
-/// Main gate component. Emits 13 relation terms => 6 pairs + 1 singleton => 28 interaction columns
-/// (3 qubitmem pairs + 3 rc-limb pairs + 1 program singleton).
+/// Main gate component. Emits 10 relation terms => 5 pairs => 20 interaction columns
+/// (3 qubitmem pairs + 3 single-`d` rc terms + 1 program, folded into 5 pairs).
 pub struct MainGate;
 impl<Value: IValue> CircuitEval<Value> for MainGate {
     fn name(&self) -> String {
@@ -214,15 +211,15 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         TRACE_COLUMNS
     }
     fn interaction_columns(&self) -> usize {
-        28
+        20
     }
     fn relation_uses_per_row(&self) -> &[RelationUse] {
-        // Positive USE terms per row: 3 chain USEs (target + 2 controls) + 6 rc-limb range checks
-        // (2 limbs * 3 accesses) + 1 program = 10. The 3 chain YIELDs are negative. (One shared
-        // relation id.) The ts-ordering PIN + limb-reconstruction stay degree-1 algebraic.
+        // Positive USE terms per row: 3 chain USEs (target + 2 controls) + 3 rc range checks (one `d`
+        // per access) + 1 program = 7. The 3 chain YIELDs are negative. (One shared relation id.)
+        // The ts-ordering range reconstruction stays degree-1 algebraic.
         &[
             RelationUse { relation_id: "gate_qubitmem_use", uses: 3 },
-            RelationUse { relation_id: "gate_rc_use", uses: 6 },
+            RelationUse { relation_id: "gate_rc_use", uses: 3 },
             RelationUse { relation_id: "gate_program", uses: 1 },
         ]
     }
@@ -297,8 +294,6 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         // --- Qubit-memory chain: per active access Use(predecessor) + Yield(successor). ---
         let tag_qm = konst(context, TAG_QUBITMEM);
         let tag_rc = konst(context, TAG_RC);
-        let pos_lo = konst(context, RC_POS_LO);
-        let pos_hi = konst(context, RC_POS_HI);
         let tag_prog = konst(context, TAG_PROGRAM);
 
         // pair0: target Use (+enabler), Yield (-enabler). ts = pc+1 (inlined); v_after = v_before+delta.
@@ -314,16 +309,15 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         let neg_b = eval!(context, -(b_active));
         acc.add_to_relation(context, neg_b, &[tag_qm, shot_id, ctrl_b.addr, ts, ctrl_b.v]);
 
-        // --- ts-ordering RANGE-CHECK LOOKUPs: per active access, look up its two limbs into the rc
-        // table (mirrors main.rs `add_rc_lookup`). Emitted AFTER the qubitmem pairs and BEFORE the
-        // program emit so the relation-batch order is qubitmem-pairs, rc-pairs (target lo/hi,
-        // ctrl_a lo/hi, ctrl_b lo/hi), program singleton. ---
+        // --- ts-ordering RANGE-CHECK LOOKUPs: per active access, look up its single diff `d` into the
+        // rc table (mirrors main.rs `add_rc_lookup`). Emitted AFTER the qubitmem pairs and BEFORE the
+        // program emit so the relation-batch order is qubitmem-pairs (6), then the 3 rc `d` terms, then
+        // program — folded by finalize-in-pairs into (rc_t, rc_a) and (rc_b, program). ---
         let add_rc = |context: &mut Context<Value>,
                       acc: &mut CompositionConstraintAccumulator,
                       a: &AccessVars,
                       active: Var| {
-            acc.add_to_relation(context, active, &[tag_rc, pos_lo, a.rc_lo]);
-            acc.add_to_relation(context, active, &[tag_rc, pos_hi, a.rc_hi]);
+            acc.add_to_relation(context, active, &[tag_rc, a.d]);
         };
         add_rc(context, acc, &target, enabler);
         add_rc(context, acc, &ctrl_a, a_active);
@@ -331,20 +325,17 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
 
         // --- ts-ordering: RANGE-CHECK reconstruction (mirrors main.rs `add_ts_range`,
         // target/ctrl_a/ctrl_b in order). Per active access:
-        //   RANGE: active*(ts - prev_ts - 1 - rc_lo - 2^RC_LO_BITS*rc_hi) = 0 (the limbs are
-        //       range-checked by the rc-table lookup above), with ts = pc+1 inlined. The old PIN
-        //       constraint is gone (ts is structurally pc+1). pc is the preprocessed per-shot program
-        //       counter (verifier-pinned); the structural program-ordered ts + the forward-DAG
-        //       range-check defeat the reorder.
-        let pow_lo = konst(context, 1u32 << RC_LO_BITS);
+        //   RANGE: active*(ts - prev_ts - 1 - d) = 0 (the witness `d` is range-checked by the rc-table
+        //       lookup above), with ts = pc+1 inlined. The old PIN constraint is gone (ts is
+        //       structurally pc+1). pc is the preprocessed per-shot program counter (verifier-pinned);
+        //       the structural program-ordered ts + the forward-DAG range-check defeat the reorder.
         let add_ts_range = |context: &mut Context<Value>,
                             acc: &mut CompositionConstraintAccumulator,
                             a: &AccessVars,
                             active: Var| {
-            // RANGE reconstruction: d = rc_lo + 2^RC_LO_BITS * rc_hi, d = ts - prev_ts - 1 = pc - prev_ts.
-            let recon = eval!(context, (a.rc_lo) + ((a.rc_hi) * (pow_lo)));
-            let d = eval!(context, ((ts) - (a.prev_ts)) - (one));
-            let c = eval!(context, (active) * ((d) - (recon)));
+            // RANGE reconstruction: d (witness) == ts - prev_ts - 1 = pc - prev_ts.
+            let recon = eval!(context, ((ts) - (a.prev_ts)) - (one));
+            let c = eval!(context, (active) * ((recon) - (a.d)));
             acc.add_constraint(context, c);
         };
         add_ts_range(context, acc, &target, enabler);
@@ -433,8 +424,19 @@ impl<Value: IValue> GateAirStatement<Value> {
         program: ProgramRows,
         nonce: [u32; 2],
     ) -> Self {
-        // Component order: main, program, boundary, rc (rc fixed at RC_LOG_SIZE).
-        let log_sizes = [main_log_size, program_log_size, boundary_log_size, RC_LOG_SIZE];
+        // Component order: main, program, boundary, rc. The rc component's OWN log_size is the DYNAMIC
+        // R = ceil(log2(k*n_gates)) = rc_log_size(total_pc) — the native size of its [0,2^R) supply
+        // table (R <= main_log_size; the table is lifted in the committed tree but its component
+        // log_size is R, not main). SOUNDNESS-CRITICAL: R is DERIVED here from the PUBLIC `total_pc`
+        // the leaf already binds (= k*n_gates), NEVER read from the proof — a prover-supplied, inflated
+        // R would enlarge the table and admit out-of-range `d` (forging prev_ts >= ts => stale read).
+        // The same R sizes the `gate_rc_val` preprocessed column (get_preprocessed_column_ids below),
+        // so R is bound by BOTH the transcript (component_log_sizes) AND the preprocessed root (the
+        // canonical member-only [0,2^R) table contents). LOUD guard: 2^R < p (R <= 30); R = ceil(log2(
+        // total_pc)) <= 25 for our k range, so this holds with margin.
+        let rc_log = rc_log_size(total_pc as usize);
+        assert!(rc_log <= 30, "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)");
+        let log_sizes = [main_log_size, program_log_size, boundary_log_size, rc_log];
         let n_components = log_sizes.len();
         let packed = pack_into_qm31s(log_sizes.iter().cloned())
             .into_iter()
@@ -569,7 +571,16 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         &self.component_log_sizes
     }
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
-        preprocessed_column_ids(self.main_log_size, self.program_log_size, self.boundary_log_size)
+        // rc_log DERIVED from the public `total_pc` (never a proof field) — same value used for the rc
+        // component log_size in `new`, so the gate_rc_val column is sized/ordered consistently and
+        // bound by the preprocessed root.
+        let rc_log = rc_log_size(self.total_pc as usize);
+        preprocessed_column_ids(
+            self.main_log_size,
+            self.program_log_size,
+            self.boundary_log_size,
+            rc_log,
+        )
     }
     fn get_preprocessed_root(&self, _context: &mut Context<Value>) -> HashValue<Var> {
         self.preprocessed_root.clone()
