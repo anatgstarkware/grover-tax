@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 use circuit_multiverifier::verify::{ChildVerifier, build_fanning_circuit};
 use recursive_aggregate::{
-    AggregateConfig, BaseOutput, CircuitPrecompute, TreeProof, multiverifier_node_preprocessed,
-    node_preprocessed_from_shared, preprocessed_root, shared_config_for_leaf,
+    AggregateConfig, BaseOutput, CircuitPrecompute, RecursionPrecompute, TreeProof,
+    multiverifier_node_preprocessed, node_preprocessed_from_shared, preprocessed_root,
+    shared_config_for_leaf,
 };
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
@@ -244,12 +245,26 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
 /// LeafR1R2 extras (`leaf_shared_config`, R1, `leaf_preprocessed_root`, leaf target/PCS, leaf/level1
 /// precomputes); the base-fanning-only fields (`base_node_preprocessed_root`, `base_preprocessed_root`)
 /// are set to the leaf root (unused under this mode — the leaf unpacker never reads them).
+/// The preprocessed circuits + their (pcs, root) for the leaf/R1/R2 shapes, carried out of
+/// [`derive_aggregate_config`] so [`build_recursion_precompute`] can build the heavy
+/// [`CircuitPrecompute`]s WITHOUT recomputing the (expensive) node fixed-point loop.
+pub struct AggregateShapes {
+    pub leaf_pp: PreprocessedCircuit,
+    pub pcs: PcsConfig,
+    pub leaf_root: HashValue<QM31>,
+    pub level1_pp: PreprocessedCircuit,
+    pub node_pcs: PcsConfig,
+    pub level1_root: HashValue<QM31>,
+    pub node_pp: PreprocessedCircuit,
+    pub node_root: HashValue<QM31>,
+}
+
 pub fn derive_aggregate_config(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     fold_arity: usize,
     log_blowup_factor: u32,
-) -> AggregateConfig {
+) -> (AggregateConfig, AggregateShapes) {
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
     let shape = || build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params);
     let leaf_sizes = compute_padded_sizes(&shape());
@@ -306,37 +321,25 @@ pub fn derive_aggregate_config(
         roots_collapse,
     );
 
-    // Witness-independent precomputes (GATE_AIR_NO_PRECOMPUTE=1 -> all None).
-    let no_precompute = std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok();
-    let (leaf_precompute, level1_precompute, node_precompute) = if no_precompute {
-        (None, None, None)
-    } else {
-        (
-            Some(Arc::new(CircuitPrecompute::new(
-                leaf_pp,
-                pcs,
-                leaf_preprocessed_root.clone(),
-            ))),
-            Some(Arc::new(CircuitPrecompute::new(
-                level1_pp,
-                node_pcs,
-                level1_preprocessed_root.clone(),
-            ))),
-            Some(Arc::new(CircuitPrecompute::new(
-                node_pp,
-                node_pcs,
-                node_preprocessed_root.clone(),
-            ))),
-        )
+    // The recursion precomputes are built up front by `build_recursion_precompute` from the shapes
+    // returned below — NOT here, so the fixed-point loop is not on the precompute-build path.
+    let shapes = AggregateShapes {
+        leaf_pp,
+        pcs,
+        leaf_root: leaf_preprocessed_root.clone(),
+        level1_pp,
+        node_pcs,
+        level1_root: level1_preprocessed_root.clone(),
+        node_pp,
+        node_root: node_preprocessed_root.clone(),
     };
 
-    AggregateConfig {
+    let agg = AggregateConfig {
         // Shared / R2 (also used by the shared up-tree fold).
         node_shared_config,
         node_preprocessed_root,
         node_target_padding_sizes: node_target,
         node_pcs_config: node_pcs,
-        node_precompute,
         fold_arity,
         // Base-fanning-only fields — unused under LeafR1R2; set to the leaf root (well-formed, unread).
         base_node_preprocessed_root: leaf_preprocessed_root.clone(),
@@ -347,8 +350,38 @@ pub fn derive_aggregate_config(
         leaf_preprocessed_root: Some(leaf_preprocessed_root),
         leaf_target_padding_sizes: Some(leaf_target),
         leaf_pcs_config: Some(pcs),
-        level1_precompute,
-        leaf_precompute,
+    };
+    (agg, shapes)
+}
+
+/// Builds the leaf/R1/R2 [`RecursionPrecompute`] from the shapes carried out of
+/// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Honors
+/// `GATE_AIR_NO_PRECOMPUTE=1` -> all `None` (rebuild-per-prove).
+pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecompute {
+    let AggregateShapes {
+        leaf_pp,
+        pcs,
+        leaf_root,
+        level1_pp,
+        node_pcs,
+        level1_root,
+        node_pp,
+        node_root,
+    } = shapes;
+    let no_precompute = std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok();
+    if no_precompute {
+        return RecursionPrecompute {
+            node_precompute: None,
+            level1_precompute: None,
+            leaf_precompute: None,
+        };
+    }
+    RecursionPrecompute {
+        leaf_precompute: Some(Arc::new(CircuitPrecompute::new(leaf_pp, pcs, leaf_root))),
+        level1_precompute: Some(Arc::new(CircuitPrecompute::new(
+            level1_pp, node_pcs, level1_root,
+        ))),
+        node_precompute: Some(Arc::new(CircuitPrecompute::new(node_pp, node_pcs, node_root))),
     }
 }
 
@@ -360,6 +393,7 @@ pub fn prove_gate_air_leaf(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     config: &AggregateConfig,
+    pre: &RecursionPrecompute,
 ) -> TreeProof {
     let leaf_target = config
         .leaf_target_padding_sizes
@@ -374,7 +408,7 @@ pub fn prove_gate_air_leaf(
         .expect("prove_gate_air_leaf requires a LeafR1R2 config (leaf_preprocessed_root present)");
     let mut context = build_gate_air_leaf_circuit::<QM31>(real_proof, cfg, params);
     pad_to_targets(&mut context, leaf_target);
-    let circuit_proof = match &config.leaf_precompute {
+    let circuit_proof = match &pre.leaf_precompute {
         Some(pc) => prove_circuit_with_precompute::<Blake2sM31MerkleChannel>(
             &pc.base_column_pool,
             &pc.twiddles,
@@ -504,7 +538,7 @@ pub fn derive_base_fanning_config(
     fold_arity: usize,
     log_blowup_factor: u32,
     canonical_base_preprocessed_root: HashValue<QM31>,
-) -> BaseFanConfig {
+) -> (BaseFanConfig, RecursionPrecompute) {
     derive_base_fanning_config_ex(
         cfg,
         params,
@@ -542,7 +576,7 @@ pub fn derive_base_fanning_config_ex(
     log_blowup_factor: u32,
     single_base_node: bool,
     canonical_base_preprocessed_root: HashValue<QM31>,
-) -> BaseFanConfig {
+) -> (BaseFanConfig, RecursionPrecompute) {
     assert!(b >= 1, "base_fan_arity b must be >= 1");
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
     // Base tree0 root: shard-invariant, the single trusted base preprocessed root the unpacker BAKES
@@ -646,8 +680,15 @@ pub fn derive_base_fanning_config_ex(
         ))),
         _ => None,
     };
+    // The R2 precompute now lives on the up-front `RecursionPrecompute` (decoupled from the config);
+    // the base-node precompute stays on `BaseFanConfig` (base-fanning-specific). LeafR1R2 tiers unused.
+    let pre = RecursionPrecompute {
+        node_precompute,
+        level1_precompute: None,
+        leaf_precompute: None,
+    };
 
-    BaseFanConfig {
+    let config = BaseFanConfig {
         agg: AggregateConfig {
             node_shared_config,
             node_preprocessed_root,
@@ -655,7 +696,6 @@ pub fn derive_base_fanning_config_ex(
             base_preprocessed_root,
             node_target_padding_sizes: node_target.clone(),
             node_pcs_config: node_pcs,
-            node_precompute,
             fold_arity,
             // Base-fanning mode carries no leaf/R1/R2 tier; those fields are `None`.
             leaf_shared_config: None,
@@ -663,8 +703,6 @@ pub fn derive_base_fanning_config_ex(
             leaf_preprocessed_root: None,
             leaf_target_padding_sizes: None,
             leaf_pcs_config: None,
-            level1_precompute: None,
-            leaf_precompute: None,
         },
         b,
         base_cfg: cfg.clone(),
@@ -672,7 +710,8 @@ pub fn derive_base_fanning_config_ex(
         node_pcs_config: node_pcs,
         node_target_padding_sizes: node_target,
         base_node_precompute,
-    }
+    };
+    (config, pre)
 }
 
 /// The trusted preprocessed root a base-node of `arity` bases reports — full-`b` groups return
