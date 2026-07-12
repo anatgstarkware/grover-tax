@@ -3140,8 +3140,9 @@ fn main() -> Result<()> {
             AggregateConfig, BaseFanBottom, BaseOutput, FoldMode, LeafBottom, PoolSet,
             RecursionPrecompute, TopologyConfig, TreeProof, ZkBlind, base_fan_group_sizes,
             prove_root_verification, prove_root_verification_leaves, recursive_aggregate_prove,
-            recursive_aggregate_prove_leaves,
+            recursive_aggregate_prove_leaves, recursive_aggregate_prove_leaves_streaming,
         };
+        use recursive_aggregate::AggregateOutput;
         use stwo::core::proof::ExtendedStarkProof;
         use stwo::core::utils::MaybeOwned;
         use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
@@ -3166,6 +3167,7 @@ fn main() -> Result<()> {
         // blowup, fold arity, base-fan arity, and shots-per-shard are all read off it.
         let topo = TopologyConfig::from_env();
         let recursion_log_blowup = topo.recursion_log_blowup;
+        let leaf_log_blowup = topo.leaf_log_blowup;
 
         // Shard partition: equal-sized shards of `shots_per_shard` shots; ragged final shard is
         // padded (below) so all shards share the leaf circuit shape.
@@ -3749,6 +3751,7 @@ fn main() -> Result<()> {
                     &shape_params,
                     topo.fold_arity,
                     recursion_log_blowup,
+                    leaf_log_blowup,
                 );
                 let pre = build_recursion_precompute(shapes);
                 eprintln!(
@@ -4004,20 +4007,21 @@ fn main() -> Result<()> {
         // MEMORY/THROUGHPUT TRADEOFF: each concurrent pool holds one large in-flight `TreeProof`
         // (FRI layers + Merkle decommits, multi-GB) while it proves a leaf/fold node, so the number
         // of pools == the number of proofs in flight == the multiplier on peak host RAM. On a big box
-        // (96 vCPU) we want K = cores/48 pools for real leaf/fold concurrency; on a memory-limited box
-        // (12 vCPU, ~40-85GB) K collapses to 1 (12/48 -> 0 -> max(1)), which is what we want: a single
-        // in-flight fold proof, no RAM multiplier. That already prevents the N>=4 concurrency OOM.
+        // (192 vCPU / g4) we want K = cores/24 pools for real leaf/fold concurrency; on a memory-limited
+        // box (12 vCPU, ~40-85GB) K collapses to 1 (12/24 -> 0 -> max(1)), which is what we want: a
+        // single in-flight fold proof, no RAM multiplier. That already prevents the N>=4 concurrency OOM.
+        // Default 24 is box-measured (BOX_VALIDATION_LOG #22 + overlap: pt=24 beat pt=48 on wall).
         //
-        // The remaining waste: `PoolSet::new(1, 48)` would still spawn 48 rayon OS threads (each with
-        // a large default stack, and 48 > 12 cores oversubscribes) for a pool that only ever runs one
+        // The remaining waste: `PoolSet::new(1, 24)` would still spawn 24 rayon OS threads (each with
+        // a large default stack, and 24 > 12 cores oversubscribes) for a pool that only ever runs one
         // proof at a time. When a single pool is used we therefore clamp its worker count to the
-        // actual core count, so we don't reserve ~48 big thread stacks on a 12-core box. This is a
+        // actual core count, so we don't reserve big thread stacks it can't schedule. This is a
         // pure thread-count change (rayon fan-out over NTT/Merkle/FRI is order-independent) and does
         // not touch any proof value -> byte-identical output.
         let pool_threads: usize = std::env::var("POOL_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(48);
+            .unwrap_or(24);
         let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(pool_threads);
         let n_pools = (cores / pool_threads).max(1);
         // With a single pool there is no sibling proof to run alongside it, so let that one pool use
@@ -4057,16 +4061,19 @@ fn main() -> Result<()> {
         // Materialize every base in shard order (shared by both FoldModes). Base-node grouping / leaf
         // proving + the fold + root-verify happen in the FoldMode dispatch AFTER this.
         //
-        // BASE↔LEAF OVERLAP (LeafR1R2 + pipeline only): each leaf verifies exactly ONE base, so we can
-        // WRAP each base into a leaf on the CPU `pools` the instant it arrives from the GPU producer
-        // channel — overlapping GPU base-proving with CPU leaf-wrap. The leaf/R1/R2 config + precompute
-        // are already built up front (`leaf_cfg` / `recursion_pre`). base_fanning (groups b bases per
-        // node, needs them together) and the non-pipeline path keep the old "materialize all bases,
-        // then wrap/group" flow. Overlap yields `pre_wrapped_leaves`; the other paths yield `bases`.
+        // BASE↔LEAF OVERLAP (LeafR1R2 + pipeline only), "hide the fold behind base-proving" (Model 1):
+        // each leaf verifies exactly ONE base, so as bases arrive from the GPU producer channel we feed
+        // them into `recursive_aggregate_prove_leaves_streaming`, which WRAPS each base into a leaf AND
+        // folds the whole tree (level-0 leaf→R1 layer + shared R2 up-tree fold) PROGRESSIVELY on the CPU
+        // `pools` — so GPU base-proving overlaps with BOTH the CPU leaf-wrap AND the fold (no separate
+        // fold tail). The leaf/R1/R2 config + precompute are already built up front (`leaf_cfg` /
+        // `recursion_pre`). base_fanning (groups b bases per node, needs them together) and the
+        // non-pipeline path keep the old "materialize all bases, then wrap/group" flow. Overlap yields
+        // the already-folded `(leaves, AggregateOutput)`; the other paths yield `bases`.
         let overlap_leaves = pipeline && matches!(topo.fold_mode, FoldMode::LeafR1R2);
-        let (bases, pre_wrapped_leaves): (
+        let (bases, overlapped_fold): (
             Vec<(Proof<QM31>, GateAirLeafParams)>,
-            Option<Vec<TreeProof>>,
+            Option<(Vec<TreeProof>, AggregateOutput)>,
         ) = if pipeline {
             // PIPELINE: producer thread(s) prove shards 1.. (GPU) and send each base — TAGGED WITH ITS
             // SHARD INDEX — over a channel. With GATE_AIR_BASE_GPUS>1, up to `base_gpus` producer
@@ -4084,10 +4091,10 @@ fn main() -> Result<()> {
             // base at its shard position regardless of producer arrival order.
             let mut bases_vec: Vec<Option<(Proof<QM31>, GateAirLeafParams)>> =
                 (0..n_shards_bases).map(|_| None).collect();
-            // OVERLAP: filled with wrapped leaves as bases arrive (LeafR1R2 pipeline). Left empty
-            // otherwise; `bases_vec` is used instead.
-            let mut leaves_slots: Vec<Option<TreeProof>> =
-                (0..n_shards_bases).map(|_| None).collect();
+            // OVERLAP (Model 1): the streaming coordinator wraps + folds progressively and returns the
+            // ordered leaves + the folded root; captured here (escapes the producer `thread::scope`).
+            // Left `None` on the non-overlap path (`bases_vec` is used instead).
+            let mut overlap_result: Option<(Vec<TreeProof>, AggregateOutput)> = None;
             // Tagged bases: (shard_index, result). Unbounded so no producer blocks a peer.
             let (base_tx, base_rx) =
                 std::sync::mpsc::channel::<(usize, Result<BaseShardOutput>)>();
@@ -4161,58 +4168,64 @@ fn main() -> Result<()> {
 
                 // CONSUMER (this thread). Every shard (0..n_shards) arrives tagged from the producers.
                 if overlap_leaves {
-                    // OVERLAP: wrap each base into a leaf on the pools AS IT ARRIVES, concurrent with
-                    // the GPU producers still proving later shards. One wrap-worker per pool pulls
-                    // `(shard_idx, base)` from its own channel and runs `prove_gate_air_leaf` on that
-                    // pool (via `install_on`), returning `(shard_idx, leaf)`; results are reassembled
-                    // by shard index, so leaf i = shard i (byte-identical to the sequential wrap).
+                    // OVERLAP (Model 1): feed each base into `recursive_aggregate_prove_leaves_streaming`
+                    // AS IT ARRIVES, concurrent with the GPU producers still proving later shards. The
+                    // coordinator owns the single wrap+R1+R2 pool and folds progressively; the injected
+                    // `wrap` closure (make_base + prove_gate_air_leaf) runs INSIDE its pool workers, so
+                    // GPU base-proving overlaps BOTH the leaf-wrap and the fold. Leaf i = shard i
+                    // (index-tagged), byte-identical to the sequential wrap+fold.
                     let agg = leaf_cfg.as_ref().expect("leaf_cfg present when overlap_leaves");
                     let pre = recursion_pre_ref;
                     let make_base_ref = &make_base;
                     let pools_ref = &pools;
-                    let np = pools.n_pools();
-                    let (wrap_txs, wrap_rxs): (Vec<_>, Vec<_>) = (0..np)
-                        .map(|_| std::sync::mpsc::channel::<(usize, BaseShardOutput)>())
-                        .unzip();
-                    let wrap_handles: Vec<_> = wrap_rxs
-                        .into_iter()
-                        .enumerate()
-                        .map(|(w, wrx)| {
-                            scope.spawn(move || {
-                                let mut out: Vec<(usize, TreeProof)> = Vec::new();
-                                while let Ok((idx, base)) = wrx.recv() {
-                                    let tl = Instant::now();
-                                    let (proof, params) = make_base_ref(&base);
-                                    let leaf = pools_ref.install_on(w, || {
-                                        prove_gate_air_leaf(proof, cfg_ref, &params, agg, pre)
-                                    });
-                                    eprintln!(
-                                        "gate-air: MEASURE t_leaf[{idx}] (pool {w})={:.3}s",
-                                        tl.elapsed().as_secs_f64()
-                                    );
-                                    out.push((idx, leaf));
-                                }
-                                out
-                            })
-                        })
-                        .collect();
-                    // Drain every producer base (0..n_shards) and feed it round-robin to the wrap
-                    // workers, keyed by shard index (leaf i = shard i on reassembly).
+                    // The wrap closure the coordinator runs per leaf (heavy — runs inside a pool
+                    // worker via the crate's `pool.install`). Keeps the crate leaf-agnostic.
+                    let wrap = move |base: BaseShardOutput| -> TreeProof {
+                        let (proof, params) = make_base_ref(&base);
+                        prove_gate_air_leaf(proof, cfg_ref, &params, agg, pre)
+                    };
+                    // The coordinator reads `(shard_idx, base)`; a small forward loop on THIS thread
+                    // pulls tagged producer results and forwards the Ok bases, so a base `Err` still
+                    // short-circuits via `?` (as the non-overlap drain does). The coordinator runs on
+                    // its own scope thread so it folds while this thread keeps draining producers.
+                    let (leaf_tx, leaf_rx) =
+                        std::sync::mpsc::channel::<(usize, BaseShardOutput)>();
+                    let fold_handle = scope.spawn(move || {
+                        recursive_aggregate_prove_leaves_streaming(
+                            leaf_rx, n_shards, wrap, agg, pre, pools_ref,
+                        )
+                    });
+                    let mut base_err: Option<anyhow::Error> = None;
                     for _ in 0..n_shards {
                         let (shard_idx, base) = base_rx.recv().expect("producer hung up early");
-                        let base = base?;
-                        wrap_txs[shard_idx % np].send((shard_idx, base)).ok();
+                        match base {
+                            Ok(base) => {
+                                // Coordinator gone (already errored/panicked) ⇒ stop forwarding.
+                                if leaf_tx.send((shard_idx, base)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                base_err = Some(e);
+                                break;
+                            }
+                        }
                     }
-                    drop(wrap_txs); // close channels → wrap workers drain remaining leaves and finish
+                    drop(leaf_tx); // close the stream → coordinator finishes (or errors, on a short-circuit)
                     for (gpu, p) in producers.into_iter().enumerate() {
                         p.join()
                             .unwrap_or_else(|_| panic!("base producer thread (gpu {gpu}) panicked"));
                     }
-                    for h in wrap_handles {
-                        for (idx, leaf) in h.join().expect("leaf-wrap worker panicked") {
-                            leaves_slots[idx] = Some(leaf);
-                        }
+                    // A base error wins: return it via `?` and DROP the coordinator's join (whose recv
+                    // then failed) — do not unwrap its panic. Otherwise all leaves were delivered, so
+                    // the coordinator completed; unwrap its `(leaves, out)` (re-panicking a genuine
+                    // wrap/fold worker panic on this thread).
+                    let fold_join = fold_handle.join();
+                    if let Some(e) = base_err {
+                        return Err(e);
                     }
+                    let (leaves, out) = fold_join.expect("streaming leaf fold coordinator panicked");
+                    overlap_result = Some((leaves, out));
                 } else {
                     // Drain every tagged base (0..n_shards) into its shard slot.
                     for _ in 0..n_shards {
@@ -4228,19 +4241,16 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
             if overlap_leaves {
-                // Dense shard-ordered leaves (every slot filled by the wrap workers above).
-                let leaves: Vec<TreeProof> = leaves_slots
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        l.unwrap_or_else(|| panic!("leaf {i} missing after pipelined proving"))
-                    })
-                    .collect();
+                // The coordinator already wrapped every leaf AND folded the tree during base-proving
+                // (Model 1). `overlap_result` carries the ordered leaves + the folded root.
+                let (leaves, out) = overlap_result
+                    .expect("overlap coordinator must have produced (leaves, out)");
                 eprintln!(
-                    "gate-air: pipelined {n_shards_bases} bases proved + leaves wrapped (overlap) in {:.1}s",
-                    t.elapsed().as_secs_f64()
+                    "gate-air: pipelined {n_shards_bases} bases proved + leaves wrapped + folded (overlap) in {:.1}s ({} levels)",
+                    t.elapsed().as_secs_f64(),
+                    out.n_levels
                 );
-                (Vec::new(), Some(leaves))
+                (Vec::new(), Some((leaves, out)))
             } else {
                 // Dense shard-ordered bases (every slot filled by the drain above).
                 let bases: Vec<(Proof<QM31>, GateAirLeafParams)> = bases_vec
@@ -4432,63 +4442,66 @@ fn main() -> Result<()> {
                 // the pipeline overlap wrapped leaves early).
                 let agg = leaf_cfg.expect("leaf_cfg present under FoldMode::LeafR1R2");
 
-                // Leaves (one standalone leaf per base, b=1, shard order). Reuse the ones wrapped
-                // during the base↔leaf pipeline overlap if present; else wrap now, pool-parallel.
+                // Leaves + folded root. Under the pipeline overlap (Model 1, "hide the fold behind
+                // base-proving"), the coordinator ALREADY wrapped every leaf AND folded the whole tree
+                // during base-proving, so we reuse its `(leaves, out)` and SKIP the separate fold. The
+                // non-overlap arm wraps the materialized bases (pool-parallel) then runs the classic
+                // collect-then-fold `recursive_aggregate_prove_leaves`.
                 //
-                // POOL-PARALLEL: leaves are independent + deterministic — each proves its own base
-                // proof against the immutable shared `cfg`/`agg`, no shared mutable state — so we
-                // dispatch one job per leaf across the recursion `pools`, mirroring the R1 leaf-node
-                // layer in `recursive_aggregate_prove_leaves` and the base_fanning base-node layer
-                // above. `pools.map` assigns jobs round-robin and returns results in input order, so
-                // leaf `i` stays shard `i`; this changes only wall time, not the proofs.
-                let leaves: Vec<TreeProof> = if let Some(wrapped) = pre_wrapped_leaves {
-                    eprintln!(
-                        "gate-air: reusing {} leaves wrapped during base-proving overlap",
-                        wrapped.len()
-                    );
-                    wrapped
-                } else {
-                    let cfg_ref = &cfg;
-                    let agg_ref = &agg;
-                    let pre_ref = recursion_pre_ref;
-                    let tg = Instant::now();
-                    let jobs: Vec<_> = bases
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (proof, params))| {
-                            move || {
-                                let tl = Instant::now();
-                                let leaf = prove_gate_air_leaf(proof, cfg_ref, &params, agg_ref, pre_ref);
-                                eprintln!(
-                                    "gate-air: MEASURE t_leaf[{i}]={:.3}s",
-                                    tl.elapsed().as_secs_f64()
-                                );
-                                leaf
-                            }
-                        })
-                        .collect();
-                    let leaves = pools.map(jobs);
-                    eprintln!(
-                        "gate-air: {} leaf/leaves proved in {:.1}s",
-                        leaves.len(),
-                        tg.elapsed().as_secs_f64()
-                    );
-                    leaves
-                };
-
-                // Fold: level-0 R1 layer over the leaves + shared R2 up-tree fold.
-                let tf = Instant::now();
-                let out = recursive_aggregate_prove_leaves(
-                    leaves.clone(),
-                    &agg,
-                    recursion_pre_ref,
-                    &pools,
-                );
-                eprintln!(
-                    "gate-air: folded to root in {:.1}s ({} levels)",
-                    tf.elapsed().as_secs_f64(),
-                    out.n_levels
-                );
+                // POOL-PARALLEL (non-overlap wrap): leaves are independent + deterministic — each
+                // proves its own base proof against the immutable shared `cfg`/`agg`, no shared mutable
+                // state — so we dispatch one job per leaf across the recursion `pools` (`pools.map`
+                // preserves input order, so leaf `i` stays shard `i`); this changes only wall time.
+                let (leaves, out): (Vec<TreeProof>, AggregateOutput) =
+                    if let Some((leaves, out)) = overlapped_fold {
+                        eprintln!(
+                            "gate-air: reusing {} leaves + folded root from base-proving overlap ({} levels)",
+                            leaves.len(),
+                            out.n_levels
+                        );
+                        (leaves, out)
+                    } else {
+                        let cfg_ref = &cfg;
+                        let agg_ref = &agg;
+                        let pre_ref = recursion_pre_ref;
+                        let tg = Instant::now();
+                        let jobs: Vec<_> = bases
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (proof, params))| {
+                                move || {
+                                    let tl = Instant::now();
+                                    let leaf =
+                                        prove_gate_air_leaf(proof, cfg_ref, &params, agg_ref, pre_ref);
+                                    eprintln!(
+                                        "gate-air: MEASURE t_leaf[{i}]={:.3}s",
+                                        tl.elapsed().as_secs_f64()
+                                    );
+                                    leaf
+                                }
+                            })
+                            .collect();
+                        let leaves: Vec<TreeProof> = pools.map(jobs);
+                        eprintln!(
+                            "gate-air: {} leaf/leaves proved in {:.1}s",
+                            leaves.len(),
+                            tg.elapsed().as_secs_f64()
+                        );
+                        // Fold: level-0 R1 layer over the leaves + shared R2 up-tree fold.
+                        let tf = Instant::now();
+                        let out = recursive_aggregate_prove_leaves(
+                            leaves.clone(),
+                            &agg,
+                            recursion_pre_ref,
+                            &pools,
+                        );
+                        eprintln!(
+                            "gate-air: folded to root in {:.1}s ({} levels)",
+                            tf.elapsed().as_secs_f64(),
+                            out.n_levels
+                        );
+                        (leaves, out)
+                    };
                 eprintln!("gate-air: multiverifier fold OK");
 
                 // Root verification: unpack from the raw leaves + self-verify.
@@ -5718,7 +5731,8 @@ mod tests {
         // LeafR1R2 uses the leaf preprocessed root (not the base-fanning canonical base root), so the
         // recomputed canonical base pp root is unused here.
         let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
-        let (config, shapes) = derive_aggregate_config(&cfg, &params0, fold_arity, log_blowup_factor);
+        let (config, shapes) =
+            derive_aggregate_config(&cfg, &params0, fold_arity, log_blowup_factor, log_blowup_factor);
         let pre = build_recursion_precompute(shapes);
 
         let make_base = || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
@@ -5787,6 +5801,172 @@ mod tests {
         // N=2: two leaves → one level-0 R1 leaf-node that IS the root (N <= k, no R2). Bump to N > k to
         // also exercise the R2 up-tree fold once a box run confirms the R1 layer.
         leaf_r1r2_roundtrip(2, 3, recursive_aggregate::TopologyConfig::default().fold_arity);
+    }
+
+    /// SCHEDULING-INDEPENDENCE (byte-identity) roundtrip for the overlapped
+    /// [`recursive_aggregate_prove_leaves_streaming`]: prove `n_leaves` tiny gate_air leaves ONCE,
+    /// then fold them (a) in order via the collect-then-fold [`recursive_aggregate_prove_leaves`] and
+    /// (b) in a SCRAMBLED arrival order via the streaming coordinator (identity `wrap`, so only the
+    /// SCHEDULE differs), and assert the root proof (bytes + pp_root + outs), `n_levels`, and the
+    /// returned ordered leaves are BIT-EQUAL. Because the only difference is arrival/completion order,
+    /// equality proves the streaming path is byte-identical to the sequential one — the acceptance
+    /// invariant for "hide the fold behind base-proving". `k` is the default fold arity.
+    ///
+    /// HEAVY (box-only): builds real R1 (and, at `n > k`, R2) multiverifier nodes (~2^22, GBs) so it
+    /// OOMs a laptop; env-gated to GATE_AIR_HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
+    fn leaf_r1r2_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
+        use leaf::{
+            GateAirLeafParams, build_recursion_precompute, derive_aggregate_config,
+            prove_gate_air_leaf,
+        };
+        use recursive_aggregate::{
+            AggregateOutput, PoolSet, TreeProof, recursive_aggregate_prove_leaves,
+            recursive_aggregate_prove_leaves_streaming,
+        };
+        use circuits_stark_verifier::proof::Proof;
+
+        let (gates, cases, k) = nop_fixture(4, 2, 1);
+        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
+        let (config, shapes) =
+            derive_aggregate_config(&cfg, &params0, fold_arity, log_blowup_factor, log_blowup_factor);
+        let pre = build_recursion_precompute(shapes);
+
+        let make_base = || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
+        let leaves: Vec<TreeProof> = (0..n_leaves)
+            .map(|_| {
+                let (p, params) = make_base();
+                prove_gate_air_leaf(p, &cfg, &params, &config, &pre)
+            })
+            .collect();
+
+        // Bit-identity signature of a folded root (proof + pp_root + outs) and its leaves. `TreeProof`
+        // is only `Clone`, so compare via the same deterministic `{:?}` canonicalisation the
+        // recursion fingerprint uses.
+        let sig = |leaves: &[TreeProof], out: &AggregateOutput| -> String {
+            let mut s = format!("n_levels={}", out.n_levels);
+            s += &format!("|root.proof={:?}", out.root.proof);
+            s += &format!("|root.pp={:?}", out.root.preprocessed_root);
+            s += &format!("|root.outs={:?}", out.root.output_values);
+            for (i, l) in leaves.iter().enumerate() {
+                s += &format!("|leaf[{i}].proof={:?}", l.proof);
+                s += &format!("|leaf[{i}].pp={:?}", l.preprocessed_root);
+                s += &format!("|leaf[{i}].outs={:?}", l.output_values);
+            }
+            s
+        };
+
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(2);
+        // (a) Sequential collect-then-fold (the reference).
+        let pools_seq = PoolSet::new(1, cores.max(1));
+        let out_seq =
+            recursive_aggregate_prove_leaves(leaves.clone(), &config, &pre, &pools_seq);
+        let seq_sig = sig(&leaves, &out_seq);
+
+        // (b) Streaming, SCRAMBLED arrival order (reverse), identity `wrap` (the leaves already
+        // exist — only the schedule differs). Try n_pools 1 and 2 to cover both worker counts.
+        for n_pools in [1usize, 2] {
+            let pools = PoolSet::new(n_pools, (cores / n_pools).max(1));
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, TreeProof)>();
+            // Scramble: send indices in reverse (a base-producer never guarantees arrival order).
+            for i in (0..n_leaves).rev() {
+                tx.send((i, leaves[i].clone())).unwrap();
+            }
+            drop(tx);
+            let (leaves_out, out_stream) = recursive_aggregate_prove_leaves_streaming(
+                rx,
+                n_leaves,
+                |t: TreeProof| t, // identity wrap
+                &config,
+                &pre,
+                &pools,
+            );
+            assert_eq!(
+                sig(&leaves_out, &out_stream),
+                seq_sig,
+                "n_leaves={n_leaves} n_pools={n_pools}: streaming fold not bit-identical to sequential"
+            );
+        }
+        eprintln!(
+            "gate-air: leaf_r1r2 streaming-equiv OK (N={n_leaves}, bit-identical to sequential, scrambled arrival, n_pools 1+2)"
+        );
+    }
+
+    /// (box-only) Scheduling-independence roundtrip over the required n ∈ {1, 2, k, k+1, ragged
+    /// r==1, ~2k+3}. Env-gated (heavy R1/R2 proving). Proves streaming == sequential byte-for-byte.
+    #[test]
+    fn leaf_r1r2_streaming_equiv_sweep() {
+        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+            eprintln!(
+                "leaf_r1r2_streaming_equiv_sweep: SKIPPED (heavy: real R1/R2 proving ~2^22). Set \
+                 GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the out-of-order equivalence sweep."
+            );
+            return;
+        }
+        let k = recursive_aggregate::TopologyConfig::default().fold_arity;
+        // n = k+1 is the ragged r==1 case (splits into k-1 and 2); 2k+3 exercises multi-group + carry.
+        for n in [1usize, 2, k, k + 1, 2 * k + 3] {
+            leaf_r1r2_streaming_equiv(n, 1, k);
+        }
+    }
+
+    /// TERMINATION + PANIC PROPAGATION for the streaming coordinator: a `wrap` closure that panics
+    /// must make the coordinator re-panic on the parent (via `thread::scope` join) — no hang, no
+    /// silent drop — for BOTH n_pools == 1 and > 1. The panic fires INSIDE `wrap`, before any R1/fold
+    /// node proves, so the machinery under test is pure scheduling/termination.
+    ///
+    /// HEAVY (box-only): `derive_aggregate_config` builds the ~2^22 R1/R2 node preprocessed shapes
+    /// (heavy REGARDLESS of leaf size — a node verifies `fold_arity` in-circuit STARK proofs), which
+    /// OOMs a laptop; env-gated to GATE_AIR_HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
+    #[test]
+    fn leaf_r1r2_streaming_wrap_panic_propagates() {
+        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+            eprintln!(
+                "leaf_r1r2_streaming_wrap_panic_propagates: SKIPPED (heavy: config build ~2^22). \
+                 Set GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the panic-propagation test."
+            );
+            return;
+        }
+        use recursive_aggregate::{
+            PoolSet, TreeProof, recursive_aggregate_prove_leaves_streaming,
+        };
+
+        // Build the smallest valid LeafR1R2 config from a tiny base. No recursion PROVE runs (wrap
+        // panics first), but the config build itself is the heavy part gated above.
+        let (gates, cases, k) = nop_fixture(4, 2, 1);
+        let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k);
+        let fold_arity = recursive_aggregate::TopologyConfig::default().fold_arity;
+        let (config, shapes) = leaf::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
+        let pre = leaf::build_recursion_precompute(shapes);
+
+        for n_pools in [1usize, 2] {
+            let config = &config;
+            let pre = &pre;
+            let n_leaves = 2usize; // one R1 group (n <= k); wrap panics before any node proves.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pools = PoolSet::new(n_pools, 2);
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+                for i in 0..n_leaves {
+                    tx.send((i, i)).unwrap();
+                }
+                drop(tx);
+                // Every `wrap` panics — a worker panic must re-panic on the coordinator's
+                // `thread::scope` join (not hang, not be silently dropped). The panic fires inside
+                // `wrap`, before any R1/fold node runs, so no real proving happens (laptop-safe).
+                recursive_aggregate_prove_leaves_streaming(
+                    rx,
+                    n_leaves,
+                    |i: usize| -> TreeProof { panic!("intentional wrap panic at leaf {i}") },
+                    config,
+                    pre,
+                    &pools,
+                );
+            }));
+            assert!(
+                result.is_err(),
+                "n_pools={n_pools}: a panicking wrap must re-panic on the parent (no hang, no silent drop)"
+            );
+        }
+        eprintln!("gate-air: streaming wrap-panic propagation OK (re-panics, no hang; n_pools 1+2)");
     }
 
     /// (#1a) The precompute's cached tree-0 must match an independent rebuild (root + column count +

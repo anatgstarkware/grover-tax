@@ -263,7 +263,12 @@ pub fn derive_aggregate_config(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     fold_arity: usize,
+    // Node (R1/R2/root) FRI blowup.
     log_blowup_factor: u32,
+    // Leaf-wrap FRI blowup, decoupled from the node blowup (equal to it unless `LEAF_BLOWUP` is set).
+    // Only the leaf shape's own PCS + preprocessed root take this; R1 verifies leaves at this blowup
+    // automatically because its child config is `shared_config_for_leaf(&leaf_pp, pcs)`.
+    leaf_log_blowup: u32,
 ) -> (AggregateConfig, AggregateShapes) {
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
     let shape = || build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params);
@@ -276,22 +281,32 @@ pub fn derive_aggregate_config(
         let mut leaf_ctx = shape();
         pad_to_targets(&mut leaf_ctx, leaf_target.clone());
         let leaf_pp = PreprocessedCircuit::preprocess_circuit(&mut leaf_ctx);
-        let pcs = leaf_pcs_config(leaf_pp.trace_log_size, log_blowup_factor);
+        let pcs = leaf_pcs_config(leaf_pp.trace_log_size, leaf_log_blowup);
         (leaf_pp, pcs)
     };
-    let leaf_preprocessed_root = preprocessed_root(&leaf_pp, log_blowup_factor);
+    let leaf_preprocessed_root = preprocessed_root(&leaf_pp, leaf_log_blowup);
     let leaf_shared_config = shared_config_for_leaf(&leaf_pp, pcs);
 
     // The two node variants both pad to a COMMON `node_target` (self-verification fixed point):
-    //   - level-1 node (R1): verifies `fold_arity` LEAVES (child config = leaf shape).
-    //   - level-≥2 node (R2): verifies `fold_arity` NODES  (child config = node shape).
+    //   - level-1 node (R1): verifies `fold_arity` LEAVES → sized with the leaf `pcs`.
+    //   - level-≥2 node (R2): verifies `fold_arity` NODES → sized with a NODE pcs (node blowup +
+    //     the node's OWN trace_log = `level1_pp.trace_log_size`, which is padded to `node_target`).
+    // Sizing R2's child as a node (not with the leaf `pcs`) makes the fixed point exact for ANY
+    // leaf/node blowup pair. This only sets witness padding; the pinned pp-roots are independent of
+    // blowup/trace_size, so it does not touch the trust anchors.
     let (_, node1_seed_sizes) = multiverifier_node_preprocessed(&leaf_pp, pcs, None, fold_arity);
     let mut node_target = node1_seed_sizes;
     let (level1_pp, node_pp) = loop {
         let (level1_pp, level1_unpadded) =
             multiverifier_node_preprocessed(&leaf_pp, pcs, Some(node_target.clone()), fold_arity);
-        let (node_pp, node2_unpadded) =
-            multiverifier_node_preprocessed(&level1_pp, pcs, Some(node_target.clone()), fold_arity);
+        // R2 verifies NODES: size its child with the node blowup + the node's own trace_log.
+        let node_child_pcs = leaf_pcs_config(level1_pp.trace_log_size, log_blowup_factor);
+        let (node_pp, node2_unpadded) = multiverifier_node_preprocessed(
+            &level1_pp,
+            node_child_pcs,
+            Some(node_target.clone()),
+            fold_arity,
+        );
         let new_target = max_sizes(&level1_unpadded, &node2_unpadded);
         if new_target == node_target {
             break (level1_pp, node_pp);
