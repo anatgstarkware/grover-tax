@@ -11,28 +11,28 @@
 //! committed hidden circuit. The native verifier recomputes every `H_i` from the ONE published `H_P`,
 //! enforcing same-program across shards for free.
 
-use circuits::blake::{HashValue, blake2s, unpack_qm31s_to_u32_words};
+use circuits::blake::{blake2s, unpack_qm31s_to_u32_words, HashValue};
 use circuits::context::{Context, FinalizedContext, Var};
 use circuits::ivalue::{IValue, NoValue};
 use circuits::ops::Guess;
 use circuits::wrappers::U32Wrapper;
-use circuits_stark_verifier::proof::{Proof, ProofConfig, empty_proof};
+use circuits_stark_verifier::proof::{empty_proof, Proof, ProofConfig};
 use circuits_stark_verifier::verify::verify;
 
-use circuit_common::N_RESERVED;
-use circuit_common::finalize::{ComponentSizes, compute_padded_sizes, pad_to_targets};
+use circuit_common::finalize::{compute_padded_sizes, pad_to_targets, ComponentSizes};
 use circuit_common::preprocessed::PreprocessedCircuit;
+use circuit_common::N_RESERVED;
 use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment,
     prove_circuit_with_precompute,
 };
 use std::sync::Arc;
 
-use circuit_multiverifier::verify::{ChildVerifier, build_fanning_circuit};
+use circuit_multiverifier::verify::{build_fanning_circuit, ChildVerifier};
 use recursive_aggregate::{
-    AggregateConfig, BaseOutput, CircuitPrecompute, RecursionPrecompute, TreeProof,
     multiverifier_node_preprocessed, node_preprocessed_from_shared, preprocessed_root,
-    shared_config_for_leaf,
+    shared_config_for_leaf, AggregateConfig, BaseOutput, CircuitPrecompute, RecursionPrecompute,
+    TreeProof,
 };
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
@@ -42,8 +42,8 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
 
-use crate::N_LIMBS;
 use crate::circuit_statement::GateAirStatement;
+use crate::N_LIMBS;
 
 /// Public parameters of the gate_air proof the leaf verifies (everything `GateAirStatement::new`
 /// needs). Identical for the NoValue shape pass and the real QM31 assignment.
@@ -322,7 +322,8 @@ pub fn derive_aggregate_config(
     let node_shared_config = shared_config_for_leaf(&level1_pp, node_pcs);
     // Rebuild the R2 (node-verifying) node shape with the NODE pcs for its children (matches
     // `build_node_context` at prove time).
-    let node_pp = node_preprocessed_from_shared(&node_shared_config, node_target.clone(), fold_arity);
+    let node_pp =
+        node_preprocessed_from_shared(&node_shared_config, node_target.clone(), fold_arity);
     let node_preprocessed_root = preprocessed_root(&node_pp, log_blowup_factor);
 
     let roots_collapse = level1_preprocessed_root == node_preprocessed_root;
@@ -394,9 +395,13 @@ pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecomput
     RecursionPrecompute {
         leaf_precompute: Some(Arc::new(CircuitPrecompute::new(leaf_pp, pcs, leaf_root))),
         level1_precompute: Some(Arc::new(CircuitPrecompute::new(
-            level1_pp, node_pcs, level1_root,
+            level1_pp,
+            node_pcs,
+            level1_root,
         ))),
-        node_precompute: Some(Arc::new(CircuitPrecompute::new(node_pp, node_pcs, node_root))),
+        node_precompute: Some(Arc::new(CircuitPrecompute::new(
+            node_pp, node_pcs, node_root,
+        ))),
     }
 }
 
@@ -410,10 +415,9 @@ pub fn prove_gate_air_leaf(
     config: &AggregateConfig,
     pre: &RecursionPrecompute,
 ) -> TreeProof {
-    let leaf_target = config
-        .leaf_target_padding_sizes
-        .clone()
-        .expect("prove_gate_air_leaf requires a LeafR1R2 config (leaf_target_padding_sizes present)");
+    let leaf_target = config.leaf_target_padding_sizes.clone().expect(
+        "prove_gate_air_leaf requires a LeafR1R2 config (leaf_target_padding_sizes present)",
+    );
     let leaf_pcs = config
         .leaf_pcs_config
         .expect("prove_gate_air_leaf requires a LeafR1R2 config (leaf_pcs_config present)");
@@ -610,7 +614,8 @@ pub fn derive_base_fanning_config_ex(
     } else {
         // PRODUCTION fixed point: pad the base-node + the R2 node to a common `node_target`.
         // A PCS sized from the base-node's own trace, used only to seed the fixed point.
-        let (seed_base_node_pp, base_node_seed_sizes) = base_node_preprocessed(b, cfg, params, None);
+        let (seed_base_node_pp, base_node_seed_sizes) =
+            base_node_preprocessed(b, cfg, params, None);
         let seed_pcs = leaf_pcs_config(seed_base_node_pp.trace_log_size, log_blowup_factor);
         // R2 (verifies FOLD_ARITY base-node proofs) is typically LARGER than the base-node; seed the
         // common target from max(base-node, R2) so the FIRST iteration's padding never shrinks a
@@ -657,7 +662,11 @@ pub fn derive_base_fanning_config_ex(
     let node_pp_r2: Option<PreprocessedCircuit> = if single_base_node {
         None
     } else {
-        Some(node_preprocessed_from_shared(&node_shared_config, node_target.clone(), fold_arity))
+        Some(node_preprocessed_from_shared(
+            &node_shared_config,
+            node_target.clone(),
+            fold_arity,
+        ))
     };
     // `node_preprocessed_root` (R2) — the real R2 root in production; in single-base-node mode there
     // is no R2, so this field is unused and set to `R_base` (harmless: no R2 node is built or bound).
@@ -759,7 +768,10 @@ pub fn prove_base_node(
     config: &BaseFanConfig,
 ) -> (TreeProof, Vec<BaseOutput>) {
     let m = bases.len();
-    assert!((1..=config.b).contains(&m), "base-node arity must be 1..=b (got {m})");
+    assert!(
+        (1..=config.b).contains(&m),
+        "base-node arity must be 1..=b (got {m})"
+    );
 
     // Per-base unpacker hints: each base's own preprocessed root + host-computed H_i (byte-identical
     // to the H_i the base-node circuit emits for that base).
@@ -773,7 +785,11 @@ pub fn prove_base_node(
 
     let inputs: Vec<GateAirBaseInput<QM31>> = bases
         .into_iter()
-        .map(|(proof, params)| GateAirBaseInput { proof, cfg: config.base_cfg.clone(), params })
+        .map(|(proof, params)| GateAirBaseInput {
+            proof,
+            cfg: config.base_cfg.clone(),
+            params,
+        })
         .collect();
     let mut context = build_gate_air_base_node_circuit::<QM31>(inputs);
     // Pad the base-node to the common node target so R2 verifies it identically to any node.

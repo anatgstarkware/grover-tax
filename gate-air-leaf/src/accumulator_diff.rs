@@ -81,7 +81,11 @@ pub enum AccumulatorDiff {
     /// Length mismatch — the two columns have different row counts.
     LenMismatch { cpu_rows: usize, gpu_rows: usize },
     /// First diverging row, with the oracle vs kernel values at that row.
-    FirstDiff { row: usize, cpu: SecureField, gpu: SecureField },
+    FirstDiff {
+        row: usize,
+        cpu: SecureField,
+        gpu: SecureField,
+    },
 }
 
 /// Compare two host-side composition-polynomial accumulator columns, each given as its flat
@@ -92,11 +96,18 @@ pub enum AccumulatorDiff {
 /// `cpu` is the golden oracle (`accumulate_pointwise_cpu` result), `gpu` is the kernel output.
 pub fn diff_secure_columns(cpu: &[SecureField], gpu: &[SecureField]) -> AccumulatorDiff {
     if cpu.len() != gpu.len() {
-        return AccumulatorDiff::LenMismatch { cpu_rows: cpu.len(), gpu_rows: gpu.len() };
+        return AccumulatorDiff::LenMismatch {
+            cpu_rows: cpu.len(),
+            gpu_rows: gpu.len(),
+        };
     }
     for (row, (&c, &g)) in cpu.iter().zip(gpu.iter()).enumerate() {
         if c != g {
-            return AccumulatorDiff::FirstDiff { row, cpu: c, gpu: g };
+            return AccumulatorDiff::FirstDiff {
+                row,
+                cpu: c,
+                gpu: g,
+            };
         }
     }
     AccumulatorDiff::Equal { rows: cpu.len() }
@@ -111,9 +122,7 @@ pub fn report_accumulator_diff(label: &str, cpu: &[SecureField], gpu: &[SecureFi
             true
         }
         AccumulatorDiff::LenMismatch { cpu_rows, gpu_rows } => {
-            println!(
-                "gate-air: accumulator_diff[{label}]=FAIL len cpu={cpu_rows} gpu={gpu_rows}"
-            );
+            println!("gate-air: accumulator_diff[{label}]=FAIL len cpu={cpu_rows} gpu={gpu_rows}");
             false
         }
         AccumulatorDiff::FirstDiff { row, cpu, gpu } => {
@@ -133,7 +142,10 @@ mod tests {
     #[test]
     fn equal_columns() {
         let a = vec![SecureField::one(), SecureField::zero(), SecureField::one()];
-        assert_eq!(diff_secure_columns(&a, &a), AccumulatorDiff::Equal { rows: 3 });
+        assert_eq!(
+            diff_secure_columns(&a, &a),
+            AccumulatorDiff::Equal { rows: 3 }
+        );
     }
 
     #[test]
@@ -150,6 +162,9 @@ mod tests {
     fn len_mismatch() {
         let a = vec![SecureField::one()];
         let b = vec![SecureField::one(), SecureField::one()];
-        assert!(matches!(diff_secure_columns(&a, &b), AccumulatorDiff::LenMismatch { .. }));
+        assert!(matches!(
+            diff_secure_columns(&a, &b),
+            AccumulatorDiff::LenMismatch { .. }
+        ));
     }
 }

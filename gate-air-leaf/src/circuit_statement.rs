@@ -14,11 +14,11 @@
 
 use circuits::blake::HashValue;
 use circuits::context::{Context, Var};
-use circuits::wrappers::U32Wrapper;
 use circuits::eval;
-use circuits::ivalue::{IValue, qm31_from_u32s};
+use circuits::ivalue::{qm31_from_u32s, IValue};
 use circuits::ops::Guess;
 use circuits::simd::Simd;
+use circuits::wrappers::U32Wrapper;
 use circuits_stark_verifier::constraint_eval::{
     CircuitEval, ComponentDataTrait, CompositionConstraintAccumulator, RelationUse,
 };
@@ -31,9 +31,8 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::leaf::ProgramRows;
 use crate::{
-    ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
+    pp_id, preprocessed_column_ids, rc_log_size, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
     TAG_PROGRAM, TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
-    pp_id, preprocessed_column_ids, rc_log_size,
 };
 
 /// QM31 constant Var of base-field value `v` (= `(v,0,0,0)`), used for tags and literals.
@@ -82,8 +81,16 @@ impl<Value: IValue> CircuitEval<Value> for ProgramTable {
         let tag_pub = context.constant(qm31_from_u32s(TAG_PROGRAM_PUB, 0, 0, 0));
         let neg = eval!(context, -(mult));
         // internal (-mult) / TAG_PROGRAM ; public (+mult) / TAG_PROGRAM_PUB.
-        acc.add_to_relation(context, neg, &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b]);
-        acc.add_to_relation(context, mult, &[tag_pub, slot, opcode_scalar, target, ctrl_a, ctrl_b]);
+        acc.add_to_relation(
+            context,
+            neg,
+            &[tag, slot, opcode_scalar, target, ctrl_a, ctrl_b],
+        );
+        acc.add_to_relation(
+            context,
+            mult,
+            &[tag_pub, slot, opcode_scalar, target, ctrl_a, ctrl_b],
+        );
     }
 }
 
@@ -132,7 +139,7 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
         let tag = context.constant(qm31_from_u32s(TAG_QUBITMEM, 0, 0, 0));
         let ts_final = context.constant(qm31_from_u32s(TS_FINAL, 0, 0, 0));
         let _ = x; // booleanity-checked above; not emitted by the boundary (main carries x at ts=0).
-        // (B) internal final Use[+bnd_enabler] / (shot, addr, ts_last, y).
+                   // (B) internal final Use[+bnd_enabler] / (shot, addr, ts_last, y).
         acc.add_to_relation(context, bnd_enabler, &[tag, shot, addr, ts_last, y]);
         // (D) public final Yield[-bnd_enabler] / (shot, addr, TS_FINAL, y).
         let neg_enabler = eval!(context, -(bnd_enabler));
@@ -218,9 +225,18 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         // per access) + 1 program = 7. The 3 chain YIELDs are negative. (One shared relation id.)
         // The ts-ordering range reconstruction stays degree-1 algebraic.
         &[
-            RelationUse { relation_id: "gate_qubitmem_use", uses: 3 },
-            RelationUse { relation_id: "gate_rc_use", uses: 3 },
-            RelationUse { relation_id: "gate_program", uses: 1 },
+            RelationUse {
+                relation_id: "gate_qubitmem_use",
+                uses: 3,
+            },
+            RelationUse {
+                relation_id: "gate_rc_use",
+                uses: 3,
+            },
+            RelationUse {
+                relation_id: "gate_program",
+                uses: 1,
+            },
         ]
     }
     fn log_size(&self, _: &OrderedHashMap<PreProcessedColumnId, u32>) -> Option<u32> {
@@ -233,7 +249,11 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         acc: &mut CompositionConstraintAccumulator,
     ) {
         let cols = component_data.trace_columns();
-        assert_eq!(cols.len(), TRACE_COLUMNS, "main: unexpected trace column count");
+        assert_eq!(
+            cols.len(),
+            TRACE_COLUMNS,
+            "main: unexpected trace column count"
+        );
         // enabler, shot_id, pc, pc_in_prog are preprocessed (tree0).
         let enabler = acc.get_preprocessed_column(&pp_id("gate_enabler"));
         let shot_id = acc.get_preprocessed_column(&pp_id("gate_shot_id"));
@@ -265,7 +285,10 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
             let c = eval!(context, (op) * ((op) - (one)));
             acc.add_constraint(context, c);
         }
-        let c = eval!(context, ((((enabler) - (is_nop)) - (is_not)) - (is_cnot)) - (is_toffoli));
+        let c = eval!(
+            context,
+            ((((enabler) - (is_nop)) - (is_not)) - (is_cnot)) - (is_toffoli)
+        );
         acc.add_constraint(context, c);
 
         let a_active = eval!(context, (is_cnot) + (is_toffoli));
@@ -284,7 +307,10 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         let t_bit = target.v; // v_before
         let c = eval!(context, (ab) - ((a_bit) * (b_bit)));
         acc.add_constraint(context, c);
-        let c = eval!(context, (((fire) - (is_not)) - ((is_cnot) * (a_bit))) - ((is_toffoli) * (ab)));
+        let c = eval!(
+            context,
+            (((fire) - (is_not)) - ((is_cnot) * (a_bit))) - ((is_toffoli) * (ab))
+        );
         acc.add_constraint(context, c);
         // delta = fire*(1 - 2*v_before). (v_after = v_before + delta is now inlined, so the old
         // `v_after - v_before - delta = 0` equality is vacuous and removed.)
@@ -297,17 +323,41 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         let tag_prog = konst(context, TAG_PROGRAM);
 
         // pair0: target Use (+enabler), Yield (-enabler). ts = pc+1 (inlined); v_after = v_before+delta.
-        acc.add_to_relation(context, enabler, &[tag_qm, shot_id, target.addr, target.prev_ts, target.v]);
+        acc.add_to_relation(
+            context,
+            enabler,
+            &[tag_qm, shot_id, target.addr, target.prev_ts, target.v],
+        );
         let neg_enabler = eval!(context, -(enabler));
-        acc.add_to_relation(context, neg_enabler, &[tag_qm, shot_id, target.addr, ts, v_after]);
+        acc.add_to_relation(
+            context,
+            neg_enabler,
+            &[tag_qm, shot_id, target.addr, ts, v_after],
+        );
         // pair1: ctrl_a Use (+a_active), Yield (-a_active) (read: value propagates). ts = pc+1.
-        acc.add_to_relation(context, a_active, &[tag_qm, shot_id, ctrl_a.addr, ctrl_a.prev_ts, ctrl_a.v]);
+        acc.add_to_relation(
+            context,
+            a_active,
+            &[tag_qm, shot_id, ctrl_a.addr, ctrl_a.prev_ts, ctrl_a.v],
+        );
         let neg_a = eval!(context, -(a_active));
-        acc.add_to_relation(context, neg_a, &[tag_qm, shot_id, ctrl_a.addr, ts, ctrl_a.v]);
+        acc.add_to_relation(
+            context,
+            neg_a,
+            &[tag_qm, shot_id, ctrl_a.addr, ts, ctrl_a.v],
+        );
         // pair2: ctrl_b Use (+b_active), Yield (-b_active). ts = pc+1.
-        acc.add_to_relation(context, b_active, &[tag_qm, shot_id, ctrl_b.addr, ctrl_b.prev_ts, ctrl_b.v]);
+        acc.add_to_relation(
+            context,
+            b_active,
+            &[tag_qm, shot_id, ctrl_b.addr, ctrl_b.prev_ts, ctrl_b.v],
+        );
         let neg_b = eval!(context, -(b_active));
-        acc.add_to_relation(context, neg_b, &[tag_qm, shot_id, ctrl_b.addr, ts, ctrl_b.v]);
+        acc.add_to_relation(
+            context,
+            neg_b,
+            &[tag_qm, shot_id, ctrl_b.addr, ts, ctrl_b.v],
+        );
 
         // --- ts-ordering RANGE-CHECK LOOKUPs: per active access, look up its single diff `d` into the
         // rc table (mirrors main.rs `add_rc_lookup`). Emitted AFTER the qubitmem pairs and BEFORE the
@@ -343,12 +393,21 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         add_ts_range(context, acc, &ctrl_b, b_active);
 
         // --- Program-consistency (use side, +enabler). ---
-        let opcode_scalar =
-            eval!(context, ((is_not) + ((is_cnot) * (two))) + ((is_toffoli) * (three)));
+        let opcode_scalar = eval!(
+            context,
+            ((is_not) + ((is_cnot) * (two))) + ((is_toffoli) * (three))
+        );
         acc.add_to_relation(
             context,
             enabler,
-            &[tag_prog, pc_in_prog, opcode_scalar, target.addr, ctrl_a.addr, ctrl_b.addr],
+            &[
+                tag_prog,
+                pc_in_prog,
+                opcode_scalar,
+                target.addr,
+                ctrl_a.addr,
+                ctrl_b.addr,
+            ],
         );
     }
 }
@@ -361,9 +420,18 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
 
 pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn CircuitEval<Value>>> {
     IndexMap::from([
-        ("gate_main", Box::new(MainGate) as Box<dyn CircuitEval<Value>>),
-        ("gate_program", Box::new(ProgramTable) as Box<dyn CircuitEval<Value>>),
-        ("gate_boundary", Box::new(BoundaryTable) as Box<dyn CircuitEval<Value>>),
+        (
+            "gate_main",
+            Box::new(MainGate) as Box<dyn CircuitEval<Value>>,
+        ),
+        (
+            "gate_program",
+            Box::new(ProgramTable) as Box<dyn CircuitEval<Value>>,
+        ),
+        (
+            "gate_boundary",
+            Box::new(BoundaryTable) as Box<dyn CircuitEval<Value>>,
+        ),
         ("gate_rc", Box::new(RcTable) as Box<dyn CircuitEval<Value>>),
     ])
 }
@@ -435,7 +503,10 @@ impl<Value: IValue> GateAirStatement<Value> {
         // canonical member-only [0,2^R) table contents). LOUD guard: 2^R < p (R <= 30); R = ceil(log2(
         // total_pc)) <= 25 for our k range, so this holds with margin.
         let rc_log = rc_log_size(total_pc as usize);
-        assert!(rc_log <= 30, "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)");
+        assert!(
+            rc_log <= 30,
+            "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)"
+        );
         let log_sizes = [main_log_size, program_log_size, boundary_log_size, rc_log];
         let n_components = log_sizes.len();
         let packed = pack_into_qm31s(log_sizes.iter().cloned())
@@ -454,8 +525,10 @@ impl<Value: IValue> GateAirStatement<Value> {
         let boundary_vars = boundary
             .iter()
             .map(|(x_limbs, y_limbs)| {
-                let x = x_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
-                let y = y_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
+                let x =
+                    x_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
+                let y =
+                    y_limbs.map(|v| Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context));
                 (x, y)
             })
             .collect::<Vec<_>>();
@@ -463,7 +536,8 @@ impl<Value: IValue> GateAirStatement<Value> {
         // H_P program Vars. slot + multiplicity are PINNED public constants (a prover cannot forge
         // them: slot = row index, mult = samples*k shape value). op/addresses are GUESSED (the hidden
         // program) — bound to the base via TAG_PROGRAM_PUB in `public_logup_sum`.
-        let konst_c = |context: &mut Context<Value>, v: u32| context.constant(qm31_from_u32s(v, 0, 0, 0));
+        let konst_c =
+            |context: &mut Context<Value>, v: u32| context.constant(qm31_from_u32s(v, 0, 0, 0));
         let guess_c = |context: &mut Context<Value>, v: u32| {
             Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context)
         };
@@ -473,7 +547,11 @@ impl<Value: IValue> GateAirStatement<Value> {
         // vary padding op/addr to change H_P without breaking balance (same-program forgery). Pin them
         // as constants matching `build_program_table` (padding op/addr all 0).
         let field_var = |context: &mut Context<Value>, is_pad: bool, v: u32| {
-            if is_pad { konst_c(context, v) } else { guess_c(context, v) }
+            if is_pad {
+                konst_c(context, v)
+            } else {
+                guess_c(context, v)
+            }
         };
         let is_pad: Vec<bool> = program.multiplicity.iter().map(|&m| m == 0).collect();
         let program_vars = ProgramVars {
@@ -502,7 +580,11 @@ impl<Value: IValue> GateAirStatement<Value> {
                 .enumerate()
                 .map(|(i, &v)| field_var(context, is_pad[i], v))
                 .collect(),
-            multiplicity: program.multiplicity.iter().map(|&v| konst_c(context, v)).collect(),
+            multiplicity: program
+                .multiplicity
+                .iter()
+                .map(|&v| konst_c(context, v))
+                .collect(),
         };
         // Nonce is GUESSED (witness), not a constant: it is secret (hiding), so it must stay out of the
         // leaf's public preprocessed trace. It is shard-invariant, so all leaves guess the same value.
@@ -585,7 +667,11 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
     fn get_preprocessed_root(&self, _context: &mut Context<Value>) -> HashValue<Var> {
         self.preprocessed_root.clone()
     }
-    fn public_logup_sum(&self, context: &mut Context<Value>, interaction_elements: [Var; 2]) -> Var {
+    fn public_logup_sum(
+        &self,
+        context: &mut Context<Value>,
+        interaction_elements: [Var; 2],
+    ) -> Var {
         // PHASE-3 x/y binding. The base is no longer internally balanced: its re-keyed boundary leaves
         // a PUBLIC dangling term B = Σ_{shot,addr} ( +[shot,addr,0,x] − [shot,addr,TS_FINAL,y] ) in the
         // committed claimed sums. `verify` enforces `public_logup_sum + Σ claimed_sums == 0`, so this
@@ -605,8 +691,11 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         let pow2: Vec<Var> = (0..LIMB_BITS).map(|p| konst(context, 1u32 << p)).collect();
 
         let mut acc_sum = context.zero();
-        for (shot, ((x_limbs, y_limbs), (x_u32, y_u32))) in
-            self.boundary.iter().zip(self.boundary_u32.iter()).enumerate()
+        for (shot, ((x_limbs, y_limbs), (x_u32, y_u32))) in self
+            .boundary
+            .iter()
+            .zip(self.boundary_u32.iter())
+            .enumerate()
         {
             let shot_c = konst(context, shot as u32);
             for limb in 0..N_LIMBS {
@@ -636,11 +725,19 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
                     let yt = eval!(context, (y_bit) * (pow2[p]));
                     y_recon = eval!(context, (y_recon) + (yt));
                     // −1/combine(TAG, shot, addr, 0, x_bit).
-                    let dx = combine_term(context, &[tag, shot_c, addr_c, ts0, x_bit], interaction_elements);
+                    let dx = combine_term(
+                        context,
+                        &[tag, shot_c, addr_c, ts0, x_bit],
+                        interaction_elements,
+                    );
                     let ix = inv(context, dx);
                     acc_sum = eval!(context, (acc_sum) - (ix));
                     // +1/combine(TAG, shot, addr, TS_FINAL, y_bit).
-                    let dy = combine_term(context, &[tag, shot_c, addr_c, ts_final, y_bit], interaction_elements);
+                    let dy = combine_term(
+                        context,
+                        &[tag, shot_c, addr_c, ts_final, y_bit],
+                        interaction_elements,
+                    );
                     let iy = inv(context, dy);
                     acc_sum = eval!(context, (acc_sum) + (iy));
                 }
@@ -666,7 +763,14 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         for i in 0..p.slot.len() {
             let denom = combine_term(
                 context,
-                &[tag_prog_pub, p.slot[i], p.opcode_scalar[i], p.target[i], p.ctrl_a[i], p.ctrl_b[i]],
+                &[
+                    tag_prog_pub,
+                    p.slot[i],
+                    p.opcode_scalar[i],
+                    p.target[i],
+                    p.ctrl_a[i],
+                    p.ctrl_b[i],
+                ],
                 interaction_elements,
             );
             let inv_d = inv(context, denom);
@@ -705,8 +809,9 @@ mod constraint_tests {
         let dummy_interaction = vec![qm31_from_u32s(0, 0, 0, 0); 16];
         for (ri, row) in rows.iter().enumerate() {
             let mut ctx = Context::<QM31>::default();
-            let trace: Vec<QM31> =
-                (0..TRACE_COLUMNS).map(|c| qm31_from_u32s(cell_at(row, c), 0, 0, 0)).collect();
+            let trace: Vec<QM31> = (0..TRACE_COLUMNS)
+                .map(|c| qm31_from_u32s(cell_at(row, c), 0, 0, 0))
+                .collect();
             let comp = TestComponentData::from_values(
                 &mut ctx,
                 &trace,
@@ -717,8 +822,14 @@ mod constraint_tests {
             // enabler / shot_id / pc / pc_in_prog are PREPROCESSED; feed them via the map.
             let pc = row.pc;
             let pp = HashMap::from([
-                (pp_id("gate_enabler"), ctx.constant(qm31_from_u32s(row.enabler, 0, 0, 0))),
-                (pp_id("gate_shot_id"), ctx.constant(qm31_from_u32s(row.shot_id, 0, 0, 0))),
+                (
+                    pp_id("gate_enabler"),
+                    ctx.constant(qm31_from_u32s(row.enabler, 0, 0, 0)),
+                ),
+                (
+                    pp_id("gate_shot_id"),
+                    ctx.constant(qm31_from_u32s(row.shot_id, 0, 0, 0)),
+                ),
                 (pp_id("gate_pc"), ctx.constant(qm31_from_u32s(pc, 0, 0, 0))),
                 (
                     pp_id("gate_pc_in_prog"),

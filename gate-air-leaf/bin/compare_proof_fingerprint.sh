@@ -26,6 +26,10 @@ run() {
   # $1 = label, $2.. = extra cargo args (e.g. --features cuda)
   local label="$1"; shift
   echo "==> [$label] proving fixture=$FIXTURE samples=$SAMPLES" >&2
+  # This harness validates a SINGLE non-fold proof (SimdBackend vs CudaBackend
+  # byte-identity). GATE_AIR_FOLD / GATE_AIR_PIPELINE are now default-ON, so pin
+  # them OFF to keep the single-proof (non-fold, sequential) path under test.
+  GATE_AIR_FOLD=0 GATE_AIR_PIPELINE=0 \
   GATE_AIR_PROOF_HASH=1 cargo "$TOOLCHAIN" run --release "$@" -- \
     --fixture "$FIXTURE" --samples "$SAMPLES" 2>&1 \
     | grep 'gate-air: proof_fingerprint=' | sed 's/.*proof_fingerprint=//'

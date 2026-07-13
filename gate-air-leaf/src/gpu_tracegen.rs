@@ -98,7 +98,10 @@ pub(crate) fn set_base_gpu(ordinal: usize) {
     #[cfg(feature = "cuda")]
     {
         let rc = unsafe { stwo::stwo_cuda::bindings::cuda_set_device(ordinal as i32) };
-        assert_eq!(rc, 0, "cuda_set_device({ordinal}) failed on producer thread");
+        assert_eq!(
+            rc, 0,
+            "cuda_set_device({ordinal}) failed on producer thread"
+        );
     }
 }
 
@@ -163,7 +166,9 @@ pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
     static DEVS: [OnceLock<Arc<cudarc::driver::CudaDevice>>; MAX_BASE_GPUS] =
         [const { OnceLock::new() }; MAX_BASE_GPUS];
     let ord = base_gpu_ordinal();
-    let slot = DEVS.get(ord).ok_or_else(|| format!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"))?;
+    let slot = DEVS
+        .get(ord)
+        .ok_or_else(|| format!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"))?;
     if let Some(d) = slot.get() {
         // Ensure THIS thread has the device's primary context current (cheap; needed when the same
         // cached handle is first touched from a new thread — see cudarc bind_to_thread contract).
@@ -171,8 +176,8 @@ pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
             .map_err(|e| format!("bind_to_thread(dev {ord}): {e}"))?;
         return Ok(d.clone());
     }
-    let d = cudarc::driver::CudaDevice::new(ord)
-        .map_err(|e| format!("CudaDevice::new({ord}): {e}"))?;
+    let d =
+        cudarc::driver::CudaDevice::new(ord).map_err(|e| format!("CudaDevice::new({ord}): {e}"))?;
     let _ = slot.set(d.clone());
     Ok(d)
 }
@@ -185,9 +190,7 @@ pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
 ///
 /// Returns the module name + a `bool` (true on the first load) for callers that want to log.
 #[cfg(feature = "gpu-cuda")]
-fn gate_sim_module(
-    dev: &Arc<cudarc::driver::CudaDevice>,
-) -> Result<(&'static str, bool), String> {
+fn gate_sim_module(dev: &Arc<cudarc::driver::CudaDevice>) -> Result<(&'static str, bool), String> {
     use cudarc::nvrtc::compile_ptx;
     // PER-ORDINAL load guard: cudarc registers a loaded module on the SPECIFIC CudaDevice (its
     // CUcontext), so each device must load the PTX once. A single shared guard would load only on
@@ -210,7 +213,12 @@ fn gate_sim_module(
         dev.load_ptx(
             ptx,
             "gate_sim_mod",
-            &["prog_slot_meta", "gate_sim_states", "gate_sim", "fill_padding"],
+            &[
+                "prog_slot_meta",
+                "gate_sim_states",
+                "gate_sim",
+                "fill_padding",
+            ],
         )
         .map_err(|e| format!("load_ptx: {e}"))?;
         Ok(())
@@ -270,7 +278,13 @@ fn alloc_rep_and_slot(
     k: u32,
     n_gates: u32,
     n_shots: u32,
-) -> Result<(cudarc::driver::CudaSlice<u32>, cudarc::driver::CudaSlice<u32>), String> {
+) -> Result<
+    (
+        cudarc::driver::CudaSlice<u32>,
+        cudarc::driver::CudaSlice<u32>,
+    ),
+    String,
+> {
     use cudarc::driver::{LaunchAsync, LaunchConfig};
     let n_exec = (n_shots as u64) * (k as u64);
     let d_rep = dev
@@ -724,18 +738,28 @@ pub fn gpu_gen_main_trace(
         .ok_or_else(|| "get_func gate_sim".to_string())?;
 
     let _ = (off_lo, off_hi); // RcIndex offsets no longer used (repurposed arg slots carry rep_states/slot_meta).
-    let d_gates = dev.htod_copy(gates_flat.to_vec()).map_err(|e| format!("htod gates: {e}"))?;
-    let d_x = dev.htod_copy(x_states.to_vec()).map_err(|e| format!("htod x_states: {e}"))?;
+    let d_gates = dev
+        .htod_copy(gates_flat.to_vec())
+        .map_err(|e| format!("htod gates: {e}"))?;
+    let d_x = dev
+        .htod_copy(x_states.to_vec())
+        .map_err(|e| format!("htod x_states: {e}"))?;
     let mut d_cols = dev
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
+    let mut d_qd = dev
+        .alloc_zeros::<u32>(512)
+        .map_err(|e| format!("alloc qdecode: {e}"))?;
     // rc multiplicity histogram over the single diff `d ∈ [0, 2^rc_log)`. Sized DYNAMICALLY to
     // `1 << rc_log_size(k*n_gates)` (NOT a fixed 2^16) — the kernel bumps `rc_hist[d]` with d up to
     // total_pc-1, so the buffer must cover [0,2^rc_log). `d_hi` stays inert (arg-list compat).
     let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
-    let mut d_lo = dev.alloc_zeros::<u32>(rc_hist_len).map_err(|e| format!("alloc rc_hist: {e}"))?;
-    let mut d_hi = dev.alloc_zeros::<u32>(1).map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
+    let mut d_lo = dev
+        .alloc_zeros::<u32>(rc_hist_len)
+        .map_err(|e| format!("alloc rc_hist: {e}"))?;
+    let mut d_hi = dev
+        .alloc_zeros::<u32>(1)
+        .map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
     let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, &d_gates, k, n_gates, n_shots)?;
@@ -758,8 +782,18 @@ pub fn gpu_gen_main_trace(
         func.launch(
             cfg,
             (
-                &d_gates, &d_x, &d_rep, &d_slot, &mut d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
-                k, n_gates, n_shots, padded_rows as u64,
+                &d_gates,
+                &d_x,
+                &d_rep,
+                &d_slot,
+                &mut d_cols,
+                &mut d_qd,
+                &mut d_lo,
+                &mut d_hi,
+                k,
+                n_gates,
+                n_shots,
+                padded_rows as u64,
             ),
         )
         .map_err(|e| format!("launch gate_sim: {e}"))?;
@@ -789,11 +823,15 @@ pub fn gpu_gen_main_trace(
     let mut cols = vec![0u32; TRACE_COLUMNS * padded_rows];
     let mut qd = vec![0u32; 512];
     let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
-    let mut hi = vec![0u32; 1];           // inert
-    dev.dtoh_sync_copy_into(&d_cols, &mut cols).map_err(|e| format!("dtoh cols: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_qd, &mut qd).map_err(|e| format!("dtoh qdecode: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_hist: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
+    let mut hi = vec![0u32; 1]; // inert
+    dev.dtoh_sync_copy_into(&d_cols, &mut cols)
+        .map_err(|e| format!("dtoh cols: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_qd, &mut qd)
+        .map_err(|e| format!("dtoh qdecode: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_lo, &mut lo)
+        .map_err(|e| format!("dtoh rc_hist: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_hi, &mut hi)
+        .map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     Ok((cols, qd, lo, hi))
 }
 
@@ -820,10 +858,13 @@ pub fn k1_byte_identity(
     // CPU reference (qubit-memory `build_rows`: (rows, boundary)); boundary is a separate component
     // not covered by K1, so it is ignored here. `build_rc_table` gives the CPU rc multiplicity
     // histogram (one row per row_of(pos,limb)) that the K1 device histogram must match.
-    let (rows, _boundary) =
-        crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
+    let (rows, _boundary) = crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     if rows.len() != real_rows {
-        return Err(format!("rows.len()={} != real_rows={}", rows.len(), real_rows));
+        return Err(format!(
+            "rows.len()={} != real_rows={}",
+            rows.len(),
+            real_rows
+        ));
     }
     // Dynamic rc supply-table log-size: rc_log_size(total_pc) with total_pc = k*n_gates.
     let rc_log = crate::rc_log_size(k * n_gates);
@@ -843,7 +884,9 @@ pub fn k1_byte_identity(
         x_states.extend_from_slice(&crate::state_to_limbs(&bytes));
     }
     // off_lo/off_hi are unused by the kernel now (arg-compat only); pass the RcIndex offsets.
-    let off_lo: Vec<u32> = (0..crate::LIMB_BITS).map(|p| rc_lo.offset[p] as u32).collect();
+    let off_lo: Vec<u32> = (0..crate::LIMB_BITS)
+        .map(|p| rc_lo.offset[p] as u32)
+        .collect();
     let off_hi = off_lo.clone();
 
     // GPU. `hist` (2nd histogram return) is the rc multiplicity histogram; `qd`/`hi` are unused.
@@ -882,7 +925,10 @@ pub fn k1_byte_identity(
         if hist[i] != cpu_rc.multiplicity[i] {
             hist_mismatches += 1;
             if samples.len() < 20 {
-                samples.push(format!("hist row {i}: gpu={} cpu={}", hist[i], cpu_rc.multiplicity[i]));
+                samples.push(format!(
+                    "hist row {i}: gpu={} cpu={}",
+                    hist[i], cpu_rc.multiplicity[i]
+                ));
             }
         }
     }
@@ -896,7 +942,9 @@ pub fn k1_byte_identity(
     }
 
     if mismatches == 0 && hist_mismatches == 0 {
-        eprintln!("[K1 byte-identity] PASS — GPU trace == CPU trace (19 main columns + rc histogram)");
+        eprintln!(
+            "[K1 byte-identity] PASS — GPU trace == CPU trace (19 main columns + rc histogram)"
+        );
         Ok(())
     } else {
         Err(format!(
@@ -1325,12 +1373,16 @@ pub fn gpu_gen_interaction(
     };
 
     // Upload main trace + challenges.
-    let d_cols = dev.htod_copy(cols.to_vec()).map_err(|e| format!("htod cols: {e}"))?;
+    let d_cols = dev
+        .htod_copy(cols.to_vec())
+        .map_err(|e| format!("htod cols: {e}"))?;
     let mut ap_flat = Vec::with_capacity(GATE_REL_WIDTH * 4);
     for p in alpha_powers {
         ap_flat.extend_from_slice(p);
     }
-    let d_ap = dev.htod_copy(ap_flat).map_err(|e| format!("htod ap: {e}"))?;
+    let d_ap = dev
+        .htod_copy(ap_flat)
+        .map_err(|e| format!("htod ap: {e}"))?;
     // Positional dims for K4's enabler/shot_id/pc recompute (moved to tree0). One pointer arg keeps
     // the launch tuple within cudarc's LaunchAsync arity cap.
     let d_dims = dev
@@ -1364,7 +1416,10 @@ pub fn gpu_gen_interaction(
                     (
                         &d_cols,
                         padded_rows as u64,
-                        z[0], z[1], z[2], z[3],
+                        z[0],
+                        z[1],
+                        z[2],
+                        z[3],
                         &d_ap,
                         k,
                         n_gates,
@@ -1382,7 +1437,9 @@ pub fn gpu_gen_interaction(
 
     // claimed_sum = Σ last column (per coord), then subtract cumsum_shift.
     let last_k = (N_LOGUP_COLS - 1) as u32;
-    let mut d_sums = dev.alloc_zeros::<u32>(4).map_err(|e| format!("alloc sums: {e}"))?;
+    let mut d_sums = dev
+        .alloc_zeros::<u32>(4)
+        .map_err(|e| format!("alloc sums: {e}"))?;
     let red_block = 256u32;
     let red_grid = ((padded_rows as u32).div_ceil(red_block)).min(1024);
     let red_cfg = LaunchConfig {
@@ -1403,7 +1460,13 @@ pub fn gpu_gen_interaction(
         get("logup_cumsum_shift")?
             .launch(
                 cfg,
-                (padded_rows as u64, last_k, padded_rows as u32, &d_sums, &mut d_inter),
+                (
+                    padded_rows as u64,
+                    last_k,
+                    padded_rows as u32,
+                    &d_sums,
+                    &mut d_inter,
+                ),
             )
             .map_err(|e| format!("launch cumsum_shift: {e}"))?;
     }
@@ -1415,7 +1478,15 @@ pub fn gpu_gen_interaction(
         .map_err(|e| format!("alloc ps tmp: {e}"))?;
     for j in 0..4u64 {
         let offset = ((last_k as u64) * 4 + j) * padded_rows as u64;
-        prefix_sum_column(&dev, &mut d_inter, offset, padded_rows, bits, &mut d_tmp, &get)?;
+        prefix_sum_column(
+            &dev,
+            &mut d_inter,
+            offset,
+            padded_rows,
+            bits,
+            &mut d_tmp,
+            &get,
+        )?;
     }
 
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
@@ -1537,8 +1608,7 @@ pub fn k4_byte_identity(
     let log_n_rows = padded_rows.ilog2();
 
     // CPU reference: build rows + fixed dummy elements + gen_main_interaction.
-    let (rows, _boundary) =
-        crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
+    let (rows, _boundary) = crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     let elements = crate::LookupElements::dummy();
     let (cpu_cols, cpu_sum) =
         crate::gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
@@ -1556,11 +1626,19 @@ pub fn k4_byte_identity(
         let bytes = hex::decode(&c.x_hex).map_err(|e| format!("decode x_hex: {e}"))?;
         x_states.extend_from_slice(&crate::state_to_limbs(&bytes));
     }
-    let off_lo: Vec<u32> = (0..crate::LIMB_BITS).map(|p| _rc_lo.offset[p] as u32).collect();
+    let off_lo: Vec<u32> = (0..crate::LIMB_BITS)
+        .map(|p| _rc_lo.offset[p] as u32)
+        .collect();
     let off_hi = off_lo.clone(); // unused by the kernel; passed for arg-list compat.
     let (main_cols, _qd, _lo, _hi) = gpu_gen_main_trace(
-        &gates_flat, &x_states, &off_lo, &off_hi,
-        k as u32, n_gates as u32, n_shots as u32, padded_rows,
+        &gates_flat,
+        &x_states,
+        &off_lo,
+        &off_hi,
+        k as u32,
+        n_gates as u32,
+        n_shots as u32,
+        padded_rows,
     )?;
 
     // Extract (z, alpha_powers) from the relation via the PUBLIC `Relation::combine`
@@ -1570,8 +1648,10 @@ pub fn k4_byte_identity(
     //   combine(unit_i)   = α^i − z             → α^i    = combine(unit_i) + z
     let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.qubitmem);
     let z = secure_to_m31x4(z_qm);
-    let alpha_powers: Vec<[u32; 4]> =
-        alpha_powers_qm.iter().map(|p| secure_to_m31x4(*p)).collect();
+    let alpha_powers: Vec<[u32; 4]> = alpha_powers_qm
+        .iter()
+        .map(|p| secure_to_m31x4(*p))
+        .collect();
 
     let (gpu_inter, gpu_sum_arr) = gpu_gen_interaction(
         &main_cols,
@@ -1611,7 +1691,9 @@ pub fn k4_byte_identity(
     }
 
     if mismatches == 0 && sum_ok {
-        eprintln!("[K4 byte-identity] PASS — GPU interaction == CPU interaction (20 cols + claimed_sum)");
+        eprintln!(
+            "[K4 byte-identity] PASS — GPU interaction == CPU interaction (20 cols + claimed_sum)"
+        );
         Ok(())
     } else {
         Err(format!(
@@ -1804,11 +1886,25 @@ pub fn gpu_gen_main_trace_device(
     // Upload the shard-INVARIANT inputs (gate list + RcIndex offsets) here, then delegate to the
     // device-buffer body. The base precompute path uploads these ONCE and calls the `_d` body
     // directly (skipping this per-shard upload); only `x_states` is per-shard.
-    let d_gates = dev.htod_copy(gates_flat.to_vec()).map_err(|e| format!("htod gates: {e}"))?;
-    let d_off_lo = dev.htod_copy(off_lo.to_vec()).map_err(|e| format!("htod off_lo: {e}"))?;
-    let d_off_hi = dev.htod_copy(off_hi.to_vec()).map_err(|e| format!("htod off_hi: {e}"))?;
+    let d_gates = dev
+        .htod_copy(gates_flat.to_vec())
+        .map_err(|e| format!("htod gates: {e}"))?;
+    let d_off_lo = dev
+        .htod_copy(off_lo.to_vec())
+        .map_err(|e| format!("htod off_lo: {e}"))?;
+    let d_off_hi = dev
+        .htod_copy(off_hi.to_vec())
+        .map_err(|e| format!("htod off_hi: {e}"))?;
     gpu_gen_main_trace_device_d(
-        &d_gates, x_states, &d_off_lo, &d_off_hi, k, n_gates, n_shots, padded_rows, log_n_rows,
+        &d_gates,
+        x_states,
+        &d_off_lo,
+        &d_off_hi,
+        k,
+        n_gates,
+        n_shots,
+        padded_rows,
+        log_n_rows,
     )
 }
 
@@ -1855,7 +1951,9 @@ pub fn gpu_gen_main_trace_device_d(
         .get_func("gate_sim_mod", "gate_sim")
         .ok_or_else(|| "get_func gate_sim".to_string())?;
 
-    let d_x = dev.htod_copy(x_states.to_vec()).map_err(|e| format!("htod x_states: {e}"))?;
+    let d_x = dev
+        .htod_copy(x_states.to_vec())
+        .map_err(|e| format!("htod x_states: {e}"))?;
     // LOWMEM device-OOM fix (approach a): allocate the ~24 GB main-trace buffer from NitrooZK's
     // `cudaMemPool_t` (`BaseFieldVec::new_zeroes` -> `cudaMallocFromPoolAsync`), NOT cudarc's
     // `cuMemAlloc`. That is the SAME pool tree2's per-column `cudaMallocFromPoolAsync` draws from, so
@@ -1911,15 +2009,21 @@ pub fn gpu_gen_main_trace_device_d(
         None
     };
     let mut d_cols = std::mem::ManuallyDrop::new(d_cols);
-    let mut d_qd = dev.alloc_zeros::<u32>(512).map_err(|e| format!("alloc qdecode: {e}"))?;
+    let mut d_qd = dev
+        .alloc_zeros::<u32>(512)
+        .map_err(|e| format!("alloc qdecode: {e}"))?;
     // rc multiplicity histogram over the single diff `d`. Sized DYNAMICALLY to `1 << rc_log_size(
     // k*n_gates)` — the K1 kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must
     // cover [0,2^rc_log) or the kernel writes out of bounds on real (large-k) runs. Production ignores
     // the returned histogram (the multiplicity witness is host-built), but the device buffer must
     // still be correctly sized so the atomic bumps stay in bounds. `d_hi` stays inert (arg compat).
     let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
-    let mut d_lo = dev.alloc_zeros::<u32>(rc_hist_len).map_err(|e| format!("alloc rc_hist: {e}"))?;
-    let mut d_hi = dev.alloc_zeros::<u32>(1).map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
+    let mut d_lo = dev
+        .alloc_zeros::<u32>(rc_hist_len)
+        .map_err(|e| format!("alloc rc_hist: {e}"))?;
+    let mut d_hi = dev
+        .alloc_zeros::<u32>(1)
+        .map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
     let _ = (d_off_lo, d_off_hi); // RcIndex offsets unused (arg slots repurposed for rep_states/slot_meta).
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
@@ -1941,8 +2045,18 @@ pub fn gpu_gen_main_trace_device_d(
         func.launch(
             cfg,
             (
-                d_gates, &d_x, &d_rep, &d_slot, &mut *d_cols, &mut d_qd, &mut d_lo, &mut d_hi,
-                k, n_gates, n_shots, padded_rows as u64,
+                d_gates,
+                &d_x,
+                &d_rep,
+                &d_slot,
+                &mut *d_cols,
+                &mut d_qd,
+                &mut d_lo,
+                &mut d_hi,
+                k,
+                n_gates,
+                n_shots,
+                padded_rows as u64,
             ),
         )
         .map_err(|e| format!("launch gate_sim: {e}"))?;
@@ -1994,10 +2108,13 @@ pub fn gpu_gen_main_trace_device_d(
     // + uploaded on the existing CPU path in main.rs).
     let mut qd = vec![0u32; 512];
     let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
-    let mut hi = vec![0u32; 1];           // inert
-    dev.dtoh_sync_copy_into(&d_qd, &mut qd).map_err(|e| format!("dtoh qdecode: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_lo, &mut lo).map_err(|e| format!("dtoh rc_hist: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi).map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
+    let mut hi = vec![0u32; 1]; // inert
+    dev.dtoh_sync_copy_into(&d_qd, &mut qd)
+        .map_err(|e| format!("dtoh qdecode: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_lo, &mut lo)
+        .map_err(|e| format!("dtoh rc_hist: {e}"))?;
+    dev.dtoh_sync_copy_into(&d_hi, &mut hi)
+        .map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     dev.synchronize().map_err(|e| format!("sync hist: {e}"))?;
     // SUCCESS handoff. `d_cols` is `ManuallyDrop`, so we must extract the inner `CudaSlice` to return
     // it (otherwise the buffer would leak). K4 reads it directly (no K0/K1 re-run); it is no longer
@@ -2167,7 +2284,8 @@ impl MainTrace {
         drop(self);
         // Settle the free before tree2's first pool alloc so the freed 24 GB is on the pool free-list.
         let dev = cuda_device()?;
-        dev.synchronize().map_err(|e| format!("sync after main-trace free: {e}"))?;
+        dev.synchronize()
+            .map_err(|e| format!("sync after main-trace free: {e}"))?;
         Ok(())
     }
 }
@@ -2218,8 +2336,10 @@ pub fn gpu_gen_interaction_device(
     // Recover the real drawn (z, alpha_powers) from the relation's public combine.
     let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.qubitmem);
     let z = secure_to_m31x4(z_qm);
-    let alpha_powers: Vec<[u32; 4]> =
-        alpha_powers_qm.iter().map(|p| secure_to_m31x4(*p)).collect();
+    let alpha_powers: Vec<[u32; 4]> = alpha_powers_qm
+        .iter()
+        .map(|p| secure_to_m31x4(*p))
+        .collect();
     assert_eq!(alpha_powers.len(), GATE_REL_WIDTH, "alpha_powers width");
 
     let dev = cuda_device()?;
@@ -2243,7 +2363,9 @@ pub fn gpu_gen_interaction_device(
     for p in &alpha_powers {
         ap_flat.extend_from_slice(p);
     }
-    let d_ap = dev.htod_copy(ap_flat).map_err(|e| format!("htod ap: {e}"))?;
+    let d_ap = dev
+        .htod_copy(ap_flat)
+        .map_err(|e| format!("htod ap: {e}"))?;
     // Positional dims for K4's enabler/shot_id/pc recompute (moved to tree0).
     let d_dims = dev
         .htod_copy(vec![real_rows, shot_stride])
@@ -2276,10 +2398,7 @@ pub fn gpu_gen_interaction_device(
         MainTrace::ResidentPooled(pb) => Some(unsafe {
             // SAFETY: `pb.ptr` is a valid `pb.len`-u32 pool allocation on the shared primary context,
             // live for the whole K4 call (owned by `main`, dropped only after K4 returns).
-            dev.upgrade_device_ptr::<u32>(
-                pb.ptr as cudarc::driver::sys::CUdeviceptr,
-                pb.len,
-            )
+            dev.upgrade_device_ptr::<u32>(pb.ptr as cudarc::driver::sys::CUdeviceptr, pb.len)
         }),
         _ => None,
     };
@@ -2312,7 +2431,10 @@ pub fn gpu_gen_interaction_device(
                     (
                         d_cols,
                         padded_rows as u64,
-                        z[0], z[1], z[2], z[3],
+                        z[0],
+                        z[1],
+                        z[2],
+                        z[3],
                         &d_ap,
                         kk,
                         n_gates,
@@ -2323,13 +2445,18 @@ pub fn gpu_gen_interaction_device(
                 )
                 .map_err(|e| format!("launch col_gen[{kk}]: {e}"))?;
             get("logup_finalize_col")?
-                .launch(cfg, (kk, padded_rows as u64, &d_num, &d_denom, &mut d_inter))
+                .launch(
+                    cfg,
+                    (kk, padded_rows as u64, &d_num, &d_denom, &mut d_inter),
+                )
                 .map_err(|e| format!("launch finalize[{kk}]: {e}"))?;
         }
     }
 
     let last_k = (N_LOGUP_COLS - 1) as u32;
-    let mut d_sums = dev.alloc_zeros::<u32>(4).map_err(|e| format!("alloc sums: {e}"))?;
+    let mut d_sums = dev
+        .alloc_zeros::<u32>(4)
+        .map_err(|e| format!("alloc sums: {e}"))?;
     let red_block = 256u32;
     let red_grid = ((padded_rows as u32).div_ceil(red_block)).min(1024);
     let red_cfg = LaunchConfig {
@@ -2350,7 +2477,13 @@ pub fn gpu_gen_interaction_device(
         get("logup_cumsum_shift")?
             .launch(
                 cfg,
-                (padded_rows as u64, last_k, padded_rows as u32, &d_sums, &mut d_inter),
+                (
+                    padded_rows as u64,
+                    last_k,
+                    padded_rows as u32,
+                    &d_sums,
+                    &mut d_inter,
+                ),
             )
             .map_err(|e| format!("launch cumsum_shift: {e}"))?;
     }
@@ -2361,7 +2494,15 @@ pub fn gpu_gen_interaction_device(
         .map_err(|e| format!("alloc ps tmp: {e}"))?;
     for j in 0..4u64 {
         let offset = ((last_k as u64) * 4 + j) * padded_rows as u64;
-        prefix_sum_column(&dev, &mut d_inter, offset, padded_rows, bits, &mut d_tmp, &get)?;
+        prefix_sum_column(
+            &dev,
+            &mut d_inter,
+            offset,
+            padded_rows,
+            bits,
+            &mut d_tmp,
+            &get,
+        )?;
     }
 
     dev.synchronize().map_err(|e| format!("sync (K4): {e}"))?;
