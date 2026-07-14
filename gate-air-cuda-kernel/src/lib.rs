@@ -26,8 +26,8 @@ use stwo::stwo_cuda::base_field_vec::BaseFieldVec;
 use stwo::stwo_cuda::bindings::CudaSecureField;
 
 use stwo_constraint_framework::{
-    set_gpu_constraint_kernel, ConstraintQuotientInputs, GpuConstraintDispatch,
-    INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX,
+    set_expected_kernel_guard, set_gpu_constraint_kernel, ConstraintQuotientInputs,
+    GpuConstraintDispatch, INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX,
 };
 
 // Standalone FFI entry for the gate_air kernel (cuda/entry.cu). Mirrors the generic
@@ -497,8 +497,25 @@ fn gate_air_gpu_kernel(d: GpuConstraintDispatch<'_, '_>) -> bool {
     run_gate_air_kernel(inputs, accum_cols)
 }
 
+/// Coarse "expected-on-GPU MAIN component" fingerprint installed into the generic backend's
+/// `panic_if_main_host_delegate` guard. The gate_air MAIN component is the only one that is BOTH
+/// large (>= 2^18 rows; ~2^22-2^25 in the benchmark) AND carries many constraints (the chain-lookup
+/// AIR: 15 algebraic + 5 LogUp = 20). Requiring BOTH `n_constraints >= 15` AND `log_n_rows >= 18`
+/// separates MAIN from every small fixed-size table component (rc / program / boundary; <= ~3
+/// constraints) with wide margin, and neither bound is tied to the exact column count, so it
+/// survives AIR-shape churn. This lives HERE (not in the generic backend) because "which component
+/// is big enough that a missing kernel is a bug" is gate_air-specific knowledge; the generic
+/// backend never force-panics without a plugin registering this guard.
+fn is_expected_gate_air_main(n_constraints: usize, log_n_rows: u32) -> bool {
+    n_constraints >= 15 && log_n_rows >= 18
+}
+
 /// Install the gate_air GPU constraint kernel into the generic stwo `CudaBackend` prover. Call once
-/// before proving. No-op effect unless `CUDA_GPU_CONSTRAINTS=1` and the gate_air component matches.
+/// before proving. No-op effect unless `CUDA_GPU_CONSTRAINTS` is not opted out and the gate_air
+/// component matches. Also installs the "expected-on-GPU MAIN" guard so the generic backend
+/// hard-fails (no silent ~60x-slower host delegate) if the gate_air MAIN component ever misses this
+/// kernel — the fingerprint that used to be hardcoded in the backend now lives with the plugin.
 pub fn register() {
     set_gpu_constraint_kernel(gate_air_gpu_kernel);
+    set_expected_kernel_guard(is_expected_gate_air_main);
 }
