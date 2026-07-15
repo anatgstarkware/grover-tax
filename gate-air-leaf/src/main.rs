@@ -103,6 +103,13 @@ pub(crate) fn rc_log_size(total_pc: usize) -> u32 {
         .next_power_of_two()
         .ilog2()
         .max(LOG_N_LANES as u32)
+        // FIXED rc=25 POLICY (intentional — NOT a stale experiment): pin the rc table to 2^25 for
+        // ALL k so every curve point runs at the k=8000 target's rc size (dynamic rc = 25 at
+        // k≈8000). Makes the whole curve directly represent the k=8000-relevant per-shard cost.
+        // SOUND (a wider rc range still contains every honest d = pc - prev_ts); BYTE-CHANGING vs the
+        // dynamic-rc proofs (so fingerprints differ from the dynamic set — expected). No-op at
+        // k ≳ 6600 where dynamic rc ≥ 25 already.
+        .max(25)
 }
 
 /// Log-size of the tree-0 twiddle / eval (committed) domain: the MAX over every committed column's
