@@ -58,23 +58,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-// LOWMEM (`GATE_AIR_STREAM_MAIN_LOWMEM`) pool alloc/free for the ~24 GB main-trace buffer.
-//
-// These are NitrooZK's `size_t`-based pool wrappers (crates/stwo/.../cuda_mem_pool.cu), NOT the
-// u32-based `BaseFieldVec::new_zeroes` path. CRITICAL: at 2^25 the buffer is
-// `TRACE_COLUMNS * padded_rows` u32s can OVERFLOW the `u32`/`int` argument of
-// `cuda_alloc_zeroes_uint32_t` (BaseFieldVec::new_zeroes) at large sizes — that truncation allocated
-// a too-small buffer and the K1 kernel then wrote the full buffer into it → out-of-bounds device
-// write → SIGABRT at the K1 sync (exit=134, box-confirmed on the historical 188-col encoding).
-// `cuda_mem_pool_allocate_zeroes_uint32` takes `size_t`, so the full request is passed intact. Both alloc + free route through
-// NitrooZK's `g_mem_pool` (`cudaMallocFromPoolAsync` / `cudaFreeAsync`) — the same pool tree2 draws
-// from — so the freed buffer is directly reusable by tree2. Linked from the stwo cuda static lib.
-#[cfg(feature = "gpu-cuda")]
-extern "C" {
-    fn cuda_mem_pool_allocate_zeroes_uint32(count: usize) -> *mut u32;
-    fn cuda_mem_pool_free_uint32(ptr: *mut u32);
-}
-
 // MULTI-GPU ("option A"): the base GPU ORDINAL this host thread proves on. A producer thread proving
 // shard set S on GPU n calls `set_base_gpu(n)` once at its start; every `cuda_device()` /
 // module-cache access below then keys off THIS thread's ordinal, so the harness tracegen lands on
@@ -1813,35 +1796,6 @@ fn d2d_column(
     CircleEvaluation::<_, _, BitReversedOrder>::new(domain, dst)
 }
 
-/// Fix (b) (`GATE_AIR_FUSED_INTERP`): wrap ONE column (`padded_rows` u32s at element offset
-/// `col_off`) of `src` as a BORROWED (non-owning) `CircleEvaluation<CudaBackend>` — NO device
-/// allocation, NO copy. The returned column aliases `src` (== K1's `d_cols`); `src` MUST outlive it
-/// (it does: `d_cols` is held by the caller through tree1 commit + K4). Drop will NOT free `src`,
-/// and the commit's per-column interpolate copies each view into a reused temp before the in-place
-/// b2n, so `d_cols` is only READ here and stays intact for K4 reuse. This is the memory-saving
-/// replacement for `d2d_column` under the flag: it removes the second full main-trace resident copy.
-#[cfg(feature = "gpu-cuda")]
-fn borrowed_column(
-    src: &cudarc::driver::CudaSlice<u32>,
-    col_off: usize,
-    padded_rows: usize,
-    domain: stwo::core::poly::circle::CircleDomain,
-) -> stwo::prover::poly::circle::CircleEvaluation<
-    stwo::prover::backend::CudaBackend,
-    stwo::core::fields::m31::BaseField,
-    stwo::prover::poly::BitReversedOrder,
-> {
-    use stwo::prover::poly::circle::CircleEvaluation;
-    use stwo::prover::poly::BitReversedOrder;
-    use stwo::stwo_cuda::base_field_vec::BaseFieldVec;
-
-    // SAFETY: `src` lives on the device-0 primary context; the [col_off, col_off+padded_rows) span
-    // is in-bounds (column-major layout). The view is read-only downstream and does not own `src`.
-    let src_ptr = unsafe { cudarc_dptr(src).add(col_off) };
-    let view = BaseFieldVec::from_borrowed_ptr(src_ptr, padded_rows);
-    CircleEvaluation::<_, _, BitReversedOrder>::new(domain, view)
-}
-
 /// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 19 main
 /// columns as `CircleEvaluation<CudaBackend>` (device-resident, no host upload),
 /// plus the qdecode/rc histogram copied to the host (tiny; the
@@ -1954,61 +1908,10 @@ pub fn gpu_gen_main_trace_device_d(
     let d_x = dev
         .htod_copy(x_states.to_vec())
         .map_err(|e| format!("htod x_states: {e}"))?;
-    // LOWMEM device-OOM fix (approach a): allocate the ~24 GB main-trace buffer from NitrooZK's
-    // `cudaMemPool_t` (`BaseFieldVec::new_zeroes` -> `cudaMallocFromPoolAsync`), NOT cudarc's
-    // `cuMemAlloc`. That is the SAME pool tree2's per-column `cudaMallocFromPoolAsync` draws from, so
-    // when `free_after_k4` frees this buffer (`cuda_free_memory` -> `cudaFreeAsync` into the pool) the
-    // 24 GB lands back on the pool free-list and tree2 can immediately reuse it. Freeing via cudarc's
-    // `cuMemFree` (the default `alloc_zeros` path) instead returns the block to the DRIVER, which the
-    // pool cannot reuse -> tree2 OOMs (box-confirmed). We wrap the pool pointer as a cudarc `CudaSlice`
-    // (`upgrade_device_ptr`) purely so the K1/K4 kernel launches can address it, and `from_k1` /
-    // `gpu_gen_interaction_device` `leak()` those wrappers so cudarc NEVER frees the pool pointer (the
-    // owning `PooledBuf` inside `MainTrace::ResidentPooled` is the sole owner + pool-frees on drop).
-    // Flag OFF: the exact previous cudarc `alloc_zeros` path (byte-for-byte).
-    let lowmem = stream_main_lowmem_enabled();
     let cols_len = TRACE_COLUMNS * padded_rows;
-    let d_cols = if lowmem {
-        // FAIL-FAST pool alloc via the size_t-safe wrapper (see the extern block up top). Panics/aborts
-        // are replaced by an explicit error so a box run reports the precise failing step, not SIGABRT.
-        let raw = unsafe { cuda_mem_pool_allocate_zeroes_uint32(cols_len) };
-        if raw.is_null() {
-            return Err(format!(
-                "[LOWMEM] cuda_mem_pool_allocate_zeroes_uint32 returned NULL for the {}-u32 (~{} GiB) \
-                 main-trace buffer at 2^{} — pool could not grow. Aborting before K1.",
-                cols_len,
-                (cols_len as u64 * 4) >> 30,
-                log_n_rows
-            ));
-        }
-        // Wrap the pool pointer as a cudarc `CudaSlice` (`upgrade_device_ptr`) so the K1/K4 kernel
-        // launches can address it. This cudarc wrapper is ALWAYS `leak()`ed (never dropped) — cudarc's
-        // Drop would `cuMemFree` a POOL pointer, which is invalid → abort. The sole owner/freer is the
-        // pool free in `free_after_k4` (`cuda_mem_pool_free_uint32`), called exactly once.
-        // SAFETY: `raw` is a valid `cols_len`-u32 pool allocation on device-0's primary context (shared
-        // with cudarc), zero-initialized on stream 0 (ordered before the K1 launch on the same stream).
-        unsafe { dev.upgrade_device_ptr::<u32>(raw as cudarc::driver::sys::CUdeviceptr, cols_len) }
-    } else {
-        dev.alloc_zeros::<u32>(cols_len)
-            .map_err(|e| format!("alloc cols: {e}"))?
-    };
-    // LOWMEM raw pool pointer, captured so the SUCCESS path (end of this fn) can `leak()` the cudarc
-    // wrapper and re-wrap this same pointer into a fresh leaked `CudaSlice` for the caller — so cudarc's
-    // Drop (which would `cuMemFree` a pool pointer and abort) NEVER runs on it. `None` on the flag-off
-    // cudarc path (its `d_cols` frees correctly via cudarc `cuMemFree`).
-    // ERROR-PATH SAFETY (LOWMEM): capture the pool pointer, then wrap `d_cols` in `ManuallyDrop` so
-    // cudarc's Drop NEVER `cuMemFree`s the POOL pointer (which aborts). On the SUCCESS path (end of
-    // this fn) we extract the pointer and hand back a fresh cudarc slice; on ANY early `?` return (a
-    // CUDA/launch fault below) the `ManuallyDrop` is simply forgotten — the buffer leaks on that
-    // already-failed run instead of aborting, so the real error surfaces. Flag OFF: identical handling
-    // (the buffer is a normal cudarc allocation; we still extract it on success and it leaks only on a
-    // failed run — no behavior change for successful proofs).
-    let lowmem_raw: Option<*mut u32> = if lowmem {
-        use cudarc::driver::DevicePtr;
-        Some((*d_cols.device_ptr()) as usize as *mut u32)
-    } else {
-        None
-    };
-    let mut d_cols = std::mem::ManuallyDrop::new(d_cols);
+    let mut d_cols = dev
+        .alloc_zeros::<u32>(cols_len)
+        .map_err(|e| format!("alloc cols: {e}"))?;
     let mut d_qd = dev
         .alloc_zeros::<u32>(512)
         .map_err(|e| format!("alloc qdecode: {e}"))?;
@@ -2049,7 +1952,7 @@ pub fn gpu_gen_main_trace_device_d(
                 &d_x,
                 &d_rep,
                 &d_slot,
-                &mut *d_cols,
+                &mut d_cols,
                 &mut d_qd,
                 &mut d_lo,
                 &mut d_hi,
@@ -2077,7 +1980,7 @@ pub fn gpu_gen_main_trace_device_d(
             shared_mem_bytes: 0,
         };
         unsafe {
-            fill.launch(pad_cfg, (&mut *d_cols, padded_rows as u64, real_rows))
+            fill.launch(pad_cfg, (&mut d_cols, padded_rows as u64, real_rows))
                 .map_err(|e| format!("launch fill_padding: {e}"))?;
         }
     }
@@ -2085,23 +1988,9 @@ pub fn gpu_gen_main_trace_device_d(
 
     // Device handoff: build the 19 CudaBackend columns from `d_cols` (column-major; column c at
     // element offset c*padded_rows). No host copy.
-    //
-    // Fix (b) (`GATE_AIR_FUSED_INTERP`): when set, build BORROWED views into `d_cols` (zero extra
-    // device memory) instead of 19 D2D copies. This drops the second full main-trace resident copy
-    // so a 2^25 base proof fits a 40 GB A100. The views hold UN-interpolated base-domain evals; the
-    // CudaBackend commit's fused per-column-interpolate path (poly.rs) interpolates each into a
-    // reused temp (never touching `d_cols`), so K4's reuse of `d_cols` stays correct. When unset,
-    // the legacy D2D-copy path is byte-for-byte unchanged.
     let domain = CanonicCoset::new(log_n_rows).circle_domain();
-    let interp_in_commit = std::env::var("GATE_AIR_FUSED_INTERP").is_ok();
     let cols: Vec<_> = (0..TRACE_COLUMNS)
-        .map(|c| {
-            if interp_in_commit {
-                borrowed_column(&d_cols, c * padded_rows, padded_rows, domain)
-            } else {
-                d2d_column(&d_cols, c * padded_rows, padded_rows, domain)
-            }
-        })
+        .map(|c| d2d_column(&d_cols, c * padded_rows, padded_rows, domain))
         .collect();
 
     // Histograms are tiny → keep them on host (the multiplicity columns are built
@@ -2116,173 +2005,32 @@ pub fn gpu_gen_main_trace_device_d(
     dev.dtoh_sync_copy_into(&d_hi, &mut hi)
         .map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     dev.synchronize().map_err(|e| format!("sync hist: {e}"))?;
-    // SUCCESS handoff. `d_cols` is `ManuallyDrop`, so we must extract the inner `CudaSlice` to return
-    // it (otherwise the buffer would leak). K4 reads it directly (no K0/K1 re-run); it is no longer
-    // touched here after the column build above.
-    //
-    // LOWMEM: the inner slice wraps a POOL pointer that cudarc must NEVER `cuMemFree` (abort). We take
-    // the raw pointer out and hand back a FRESH cudarc wrapper over it — identical bytes, and `from_k1`
-    // re-`leak()`s it into a `PooledBuf` (the sole owner that pool-frees). The original `ManuallyDrop`
-    // is forgotten (never dropped), so no cudarc `cuMemFree` ever hits the pool pointer.
-    if let Some(raw) = lowmem_raw {
-        // SAFETY: `raw` is the same valid `cols_len`-u32 pool allocation, still live. The ManuallyDrop
-        // `d_cols` is left un-dropped (forgotten), so the pointer has exactly one live wrapper again.
-        let fresh = unsafe {
-            dev.upgrade_device_ptr::<u32>(raw as cudarc::driver::sys::CUdeviceptr, cols_len)
-        };
-        Ok((cols, qd, lo, hi, fresh))
-    } else {
-        // Flag OFF: extract the owning cudarc slice from ManuallyDrop and return it (frees via cudarc
-        // `cuMemFree` when the caller eventually drops it, exactly as before this fix).
-        let inner = unsafe { std::mem::ManuallyDrop::take(&mut d_cols) };
-        Ok((cols, qd, lo, hi, inner))
-    }
+    // SUCCESS handoff: return the resident `d_cols` device buffer so K4 reads it directly (no K0/K1
+    // re-run); it is no longer touched here after the column build above. The buffer frees via cudarc
+    // `cuMemFree` when the caller eventually drops it.
+    Ok((cols, qd, lo, hi, d_cols))
 }
 
-/// Reads `GATE_AIR_STREAM_MAIN` (main-trace DEVICE-capacity fix, opt-in, DEFAULT OFF). When set, the
-/// gate_air driver DEHYDRATES K1's column-major main-trace device buffer (`d_cols`, 19 columns ×
-/// `padded_rows`) to the HOST right after the tree1 commit and FREES the device
-/// buffer, so it is no longer resident during the K4 interaction-scratch allocations (`d_inter` etc.)
-/// or the tree2 commit — the two phases that OOM at 2^25 on a 40 GB A100 with the buffer pinned.
-/// `gpu_gen_interaction_device` then REHYDRATES the buffer (H2D) only for the duration of its kernel
-/// loop (after the small scratch allocs, so the peak is scratch + one rehydrated copy, ~27 GB) and
-/// FREES it again before returning, so the pin never overlaps tree2.
-///
-/// Mirrors the tree1 EVAL streaming (fused_commit stash) at the leaf/`cudarc` layer: only the byte
-/// SOURCE of the main trace moves (device → host `Vec<u32>` → device); the committed values and the
-/// K4 interaction columns / `claimed_sum` are byte-identical. Composes with (does not require)
-/// `GATE_AIR_BOUNDARY_TRIM` (option-0). The host copy is PAGEABLE (`dtoh_sync_copy_into` /
-/// `htod_copy`), independent of `GATE_AIR_ASYNC_STASH` (which pins the SEPARATE tree1 eval stash),
-/// so the ~72 GB host high-water at 2^25 stays PAGEABLE and does not consume pinnable memory.
+/// The K1 main-trace buffer as consumed by K4: RESIDENT on the device — the `CudaSlice` K1 returned,
+/// held live through tree1 + K4. `gpu_gen_interaction_device` reads it in place for its kernel loop;
+/// the caller frees it via `free_after_k4` after K4 and before tree2.
 #[cfg(feature = "gpu-cuda")]
-pub fn stream_main_enabled() -> bool {
-    std::env::var("GATE_AIR_STREAM_MAIN").is_ok()
-}
-
-/// Reads `GATE_AIR_STREAM_MAIN_LOWMEM` (HOST-memory peak fix, opt-in, DEFAULT OFF). Attacks the
-/// ~72 GB host high-water at 2^25 that OOM-kills the leaf on the ~85 GB box, which is the SUM of two
-/// full-size host copies of the main trace that coexist through K4:
-///   * the tree1 EVAL STASH (19 LDE columns on the 2^26 domain, held on host from tree1
-///     commit through FRI decommit — needed by OODS/quotient/build_leaves/decommit), and
-///   * the ~24 GB DEHYDRATED d_main host `Vec` that plain `GATE_AIR_STREAM_MAIN` creates (a SECOND
-///     host copy of the base-domain main trace, made at the tree1->K4 boundary and consumed by K4).
-///
-/// Under LOWMEM we KEEP K1's `d_cols` RESIDENT on the DEVICE across K4 (device has headroom once the
-/// eval stash has streamed tree1's evals off the device: `d_cols` 24 GB + K4 scratch ~3 GB < 40 GB)
-/// instead of dehydrating it to a duplicate host `Vec`, so that ~24 GB host copy NEVER EXISTS. The
-/// caller then FREES the device buffer immediately after K4 (before tree2 — the phase that would
-/// OOM the DEVICE with `d_cols` still pinned), so `d_cols` resident never overlaps tree2. Net host
-/// peak at 2^25 falls to ~48 GB (the eval stash alone). BYTE-IDENTICAL: K4 reads the exact resident
-/// `d_cols` K1 produced (the `Resident` path), so the interaction columns / `claimed_sum` are
-/// bit-for-bit the flag-off result. Composes with `GATE_AIR_STREAM_COMMIT`/`GATE_AIR_FUSED_INTERP`
-/// (the eval-stash streaming that frees tree1 evals off the device — REQUIRED for the device to hold
-/// `d_cols` through K4) and with `GATE_AIR_ASYNC_STASH`. Takes precedence over `GATE_AIR_STREAM_MAIN`
-/// (whose host dehydrate is exactly the copy this removes).
-#[cfg(feature = "gpu-cuda")]
-pub fn stream_main_lowmem_enabled() -> bool {
-    std::env::var("GATE_AIR_STREAM_MAIN_LOWMEM").is_ok()
-}
-
-/// The K1 main-trace buffer as consumed by K4: either RESIDENT on the device (the default — the
-/// `CudaSlice` K1 returned, held live through tree1 + K4) or DEHYDRATED to a host `Vec<u32>` (under
-/// `GATE_AIR_STREAM_MAIN`, so the ~24 GB device buffer is freed across the K4-alloc / tree2 phases).
-/// `gpu_gen_interaction_device` resolves either into a live device buffer for its kernel loop.
-/// LOWMEM sole owner of the ~24 GB pool-allocated main-trace buffer. Holds the raw pool `*mut u32`
-/// (from `cuda_mem_pool_allocate_zeroes_uint32`) and frees it EXACTLY ONCE via
-/// `cuda_mem_pool_free_uint32` (→ `cudaFreeAsync` into `g_mem_pool`) on Drop — the pool tree2 draws
-/// from, so the freed buffer is directly reusable. The cudarc `CudaSlice` wrappers used by K1/K4 are
-/// always leaked (never dropped), so this is the one and only owner; there is no cudarc `cuMemFree`
-/// on the pool pointer (which would abort).
-#[cfg(feature = "gpu-cuda")]
-pub struct PooledBuf {
-    ptr: *mut u32,
-    len: usize,
-}
-#[cfg(feature = "gpu-cuda")]
-unsafe impl Send for PooledBuf {}
-#[cfg(feature = "gpu-cuda")]
-unsafe impl Sync for PooledBuf {}
-#[cfg(feature = "gpu-cuda")]
-impl Drop for PooledBuf {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // Pool free (size-safe: takes only the pointer). Returns the block to `g_mem_pool`.
-            unsafe { cuda_mem_pool_free_uint32(self.ptr) };
-            self.ptr = std::ptr::null_mut();
-        }
-    }
-}
-
-#[cfg(feature = "gpu-cuda")]
-pub enum MainTrace {
-    /// The K1 device buffer, still resident (flag OFF). K4 reads it in place; nothing is freed here.
-    /// cudarc-owned (`cuMemAlloc`/`cuMemFree`).
-    Resident(cudarc::driver::CudaSlice<u32>),
-    /// LOWMEM (`GATE_AIR_STREAM_MAIN_LOWMEM`): the K1 device buffer allocated from NitrooZK's
-    /// `cudaMemPool_t` and owned by a `PooledBuf` so `free_after_k4` returns it to that pool
-    /// (`cudaFreeAsync`) — the pool tree2 allocates from, so the freed 24 GB is directly reusable by
-    /// tree2 (unlike a cudarc `cuMemFree`, which returns the block to the driver, not the pool). K4
-    /// reads it in place via a leaked cudarc wrapper; the `PooledBuf` stays the sole owner.
-    ResidentPooled(PooledBuf),
-    /// The K1 main trace D2H-copied to the host, its device buffer freed (flag ON,
-    /// `GATE_AIR_STREAM_MAIN`). K4 rehydrates a fresh device copy for its kernel loop, then frees it.
-    Dehydrated(Vec<u32>),
-}
+pub struct MainTrace(cudarc::driver::CudaSlice<u32>);
 
 #[cfg(feature = "gpu-cuda")]
 impl MainTrace {
-    /// Wrap K1's device buffer, DEHYDRATING it to the host + freeing the device buffer when
-    /// `GATE_AIR_STREAM_MAIN` is set, else keeping it resident. Call AFTER the tree1 commit (which
-    /// borrows into the resident buffer) and BEFORE the K4 interaction allocs / tree2 commit.
+    /// Wrap K1's resident device buffer. Call AFTER the tree1 commit (which borrows into the resident
+    /// buffer) and BEFORE the K4 interaction allocs / tree2 commit.
     pub fn from_k1(d_cols: cudarc::driver::CudaSlice<u32>) -> Result<Self, String> {
-        // LOWMEM (host-peak + device-OOM fix): keep `d_cols` RESIDENT on the device across K4 rather
-        // than dehydrating a duplicate ~24 GB host `Vec`. `d_cols` is a cudarc wrapper over a NitrooZK
-        // POOL allocation (see `gpu_gen_main_trace_device_d`); `leak()` it (cudarc forgets the pointer,
-        // never `cuMemFree`s it — that would abort on a pool pointer) and re-own the raw pointer as a
-        // `PooledBuf`, whose Drop (`free_after_k4`) pool-frees via `cuda_mem_pool_free_uint32` ->
-        // `cudaFreeAsync`, the pool tree2 reuses. Takes precedence over `GATE_AIR_STREAM_MAIN`.
-        if stream_main_lowmem_enabled() {
-            let len = {
-                use cudarc::driver::DeviceSlice;
-                d_cols.len()
-            };
-            let ptr = d_cols.leak() as *mut u32; // cudarc no longer owns/frees this pool pointer
-            return Ok(MainTrace::ResidentPooled(PooledBuf { ptr, len }));
-        }
-        if stream_main_enabled() {
-            use cudarc::driver::DeviceSlice;
-            let dev = cuda_device()?;
-            let mut host = vec![0u32; d_cols.len()];
-            // PAGEABLE D2H of the whole main trace, then drop the CudaSlice to free the device
-            // buffer (~24 GB at 2^25). The eval columns are byte-identical to the resident buffer.
-            dev.dtoh_sync_copy_into(&d_cols, &mut host)
-                .map_err(|e| format!("dtoh stream-main dehydrate: {e}"))?;
-            drop(d_cols); // free the ~24 GB device buffer — no longer resident for K4-alloc / tree2
-            Ok(MainTrace::Dehydrated(host))
-        } else {
-            Ok(MainTrace::Resident(d_cols))
-        }
+        Ok(MainTrace(d_cols))
     }
 
-    /// Free the underlying device/host main-trace buffer NOW, after K4 has consumed it and BEFORE the
-    /// tree2 commit. Call this instead of relying on `drop` at end-of-prove.
-    ///
-    /// LOWMEM device-OOM fix: under `GATE_AIR_STREAM_MAIN_LOWMEM` the `ResidentPooled` variant OWNS the
-    /// sole K1 `d_cols` buffer as a `PooledBuf` allocated from NitrooZK's `cudaMemPool_t` (~24 GB at
-    /// 2^25, kept resident across K4). Consuming `self` here drops that `PooledBuf`, whose Drop calls
-    /// `cuda_mem_pool_free_uint32` -> `cudaFreeAsync` INTO the pool, so the freed 24 GB lands on the
-    /// pool free-list and tree2's `cudaMallocFromPoolAsync` can immediately reuse it. (An earlier
-    /// attempt that used cudarc's `cuMemFree` returned the block to the DRIVER, which the pool cannot
-    /// reuse -> tree2 OOMed; box-confirmed.) We then SYNCHRONIZE the device so the deferred
-    /// `cudaFreeAsync` completes and the block is on the pool free-list BEFORE tree2's first alloc.
-    /// BYTE-IDENTICAL: the free happens only AFTER K4 has read the resident buffer, so the interaction
-    /// columns / `claimed_sum` are unaffected. `Dehydrated` frees the host `Vec`; the default flag-off
-    /// `Resident` `cuMemFree`s the cudarc buffer (unchanged from before this fix).
+    /// Free the underlying device main-trace buffer NOW, after K4 has consumed it and BEFORE the
+    /// tree2 commit. Call this instead of relying on `drop` at end-of-prove. The resident `CudaSlice`
+    /// (`cuMemFree`) is dropped at the end of this scope; we then SYNCHRONIZE so the free settles
+    /// before tree2's first alloc.
     pub fn free_after_k4(self) -> Result<(), String> {
-        // `self` is consumed here: `ResidentPooled`'s `PooledBuf` (pool free), `Resident`'s
-        // `CudaSlice` (`cuMemFree`), or `Dehydrated`'s host `Vec`, is dropped at the end of this scope.
         drop(self);
-        // Settle the free before tree2's first pool alloc so the freed 24 GB is on the pool free-list.
         let dev = cuda_device()?;
         dev.synchronize()
             .map_err(|e| format!("sync after main-trace free: {e}"))?;
@@ -2296,14 +2044,10 @@ impl MainTrace {
 /// upload) plus the `claimed_sum` (mixed into the channel in main.rs exactly as the
 /// CPU `gen_main_interaction` sum was).
 ///
-/// `main` is the SAME column-major main trace K1 produced earlier in this base proof — either the
-/// resident device buffer (default) or, under `GATE_AIR_STREAM_MAIN`, the host-dehydrated copy that
-/// K4 rehydrates here (H2D into a fresh device buffer AFTER the small scratch allocs, so the peak is
-/// scratch + one rehydrated copy; the buffer is freed again before returning so the pin never
-/// overlaps tree2). Either way K4 reads it via `COL(c)` — no re-simulation (K0/K1 are NOT re-run).
-/// The buffer is only read here (the K4 `logup_col_gen` kernel reads it and writes its own
-/// `d_num`/`d_denom`/`d_inter` scratch), so the interaction columns + `claimed_sum` are
-/// byte-identical to the resident path. Reuses the EXACT validated `INTERACTION_KERNEL` source.
+/// `main` is the SAME column-major main trace K1 produced earlier in this base proof — the resident
+/// device buffer, read here via `COL(c)` (no re-simulation; K0/K1 are NOT re-run). The buffer is
+/// only read here (the K4 `logup_col_gen` kernel reads it and writes its own `d_num`/`d_denom`/
+/// `d_inter` scratch). Reuses the EXACT validated `INTERACTION_KERNEL` source.
 #[cfg(feature = "gpu-cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gen_interaction_device(
@@ -2347,8 +2091,6 @@ pub fn gpu_gen_interaction_device(
     // K4 reads the main-trace columns from the buffer K1 already produced (`main`, passed in by the
     // caller). No K0/K1 re-run, no re-upload of gates/x_states/off_lo/off_hi, no histogram/rep
     // scratch — those were only needed to repopulate the main trace, which now lives in `main`.
-    // Under `GATE_AIR_STREAM_MAIN` the trace is host-dehydrated; it is REHYDRATED below, AFTER the
-    // small interaction-scratch allocs, so the device peak is scratch + one rehydrated main copy.
     let block = 256u32;
 
     // ---- K4 interaction pipeline (verbatim launches from gpu_gen_interaction) ----
@@ -2381,41 +2123,8 @@ pub fn gpu_gen_interaction_device(
         .alloc_zeros::<u32>(4 * padded_rows)
         .map_err(|e| format!("alloc denom: {e}"))?;
 
-    // Resolve the main trace into a live device buffer for the kernel loop. Resident: borrow K1's
-    // buffer in place (byte-for-byte the previous behavior). Dehydrated (`GATE_AIR_STREAM_MAIN`):
-    // REHYDRATE a fresh device copy via H2D NOW — after the small scratch allocs above (`d_inter` /
-    // `d_num` / `d_denom`, ~3 GB), so those never contended with the ~24 GB main buffer that was
-    // freed at the tree1->K4 boundary. The rehydrated buffer holds the exact committed main-trace
-    // bytes, so `COL(c)` reads and the resulting interaction columns are byte-identical. `_rehydrated`
-    // OWNS the fresh buffer: it is dropped (freed) at end of scope, BEFORE tree2 commits, so the
-    // ~24 GB pin never overlaps tree2.
-    // LOWMEM `ResidentPooled`: build a NON-OWNING cudarc `CudaSlice` view over the pool pointer so the
-    // K4 launches can address it, then `leak()` it (below) so cudarc never frees the pool buffer — the
-    // `PooledBuf` inside `MainTrace::ResidentPooled` stays the sole owner (freed to the pool by
-    // `free_after_k4`). The view reads the exact resident bytes K1 produced, so K4 output is
-    // byte-identical to the `Resident` path.
-    let _pooled_view: Option<cudarc::driver::CudaSlice<u32>> = match main {
-        MainTrace::ResidentPooled(pb) => Some(unsafe {
-            // SAFETY: `pb.ptr` is a valid `pb.len`-u32 pool allocation on the shared primary context,
-            // live for the whole K4 call (owned by `main`, dropped only after K4 returns).
-            dev.upgrade_device_ptr::<u32>(pb.ptr as cudarc::driver::sys::CUdeviceptr, pb.len)
-        }),
-        _ => None,
-    };
-    let _rehydrated: Option<cudarc::driver::CudaSlice<u32>> = match main {
-        MainTrace::Dehydrated(host) => Some(
-            // `htod_sync_copy` copies from the `&[u32]` slice directly (no host-side clone of the
-            // ~24 GB buffer), synchronously, into a fresh device allocation.
-            dev.htod_sync_copy(&host[..])
-                .map_err(|e| format!("htod stream-main rehydrate: {e}"))?,
-        ),
-        _ => None,
-    };
-    let d_cols: &cudarc::driver::CudaSlice<u32> = match main {
-        MainTrace::Resident(d) => d,
-        MainTrace::ResidentPooled(_) => _pooled_view.as_ref().unwrap(),
-        MainTrace::Dehydrated(_) => _rehydrated.as_ref().unwrap(),
-    };
+    // K4 reads K1's resident device buffer in place (byte-for-byte the previous behavior).
+    let d_cols: &cudarc::driver::CudaSlice<u32> = &main.0;
 
     let grid = (padded_rows as u32).div_ceil(block);
     let cfg = LaunchConfig {
@@ -2506,14 +2215,6 @@ pub fn gpu_gen_interaction_device(
     }
 
     dev.synchronize().map_err(|e| format!("sync (K4): {e}"))?;
-
-    // LOWMEM: the K4 kernels are done reading `d_cols`. `_pooled_view` is a cudarc `CudaSlice` built
-    // via `upgrade_device_ptr` over the POOL-owned buffer; `leak()` it so cudarc's Drop does NOT
-    // `cuMemFree` the pool pointer (the `PooledBuf` in `MainTrace::ResidentPooled` is the sole owner
-    // and pool-frees it in `free_after_k4`). Without this leak we'd double-free the pool buffer.
-    if let Some(view) = _pooled_view {
-        let _ = view.leak();
-    }
 
     // Device-to-device handoff: 28 interaction columns straight to CudaBackend.
     let domain = CanonicCoset::new(log_n_rows).circle_domain();

@@ -3327,28 +3327,6 @@ fn main() -> Result<()> {
                 }
             }
 
-            // tree0 EVICTION on the SHARDED path: NOT IMPLEMENTED — genuine cross-shard fork.
-            // On the production (Some(dp)) path tree0 is committed as MaybeOwned::Borrowed(dp.tree0),
-            // a reference into the SHARED, cross-shard-reused Arc<BaseProverPrecompute> (each shard
-            // re-commits the same tree0). Two hard blockers:
-            //   1. MaybeOwned has Deref but NO DerefMut, and dp.tree0 is behind an Arc — the columns
-            //      prove_ex reads (commitment_scheme.trees[0] == the borrow) CANNOT be mutated here.
-            //   2. Even if they could, dehydrating them would free the shared precompute's device
-            //      buffers + re-key to sentinels, so the NEXT shard's commit_tree(Borrowed(dp.tree0))
-            //      would reuse freed/staged columns → corruption across shards.
-            // Resolving this needs an explicit decision (per-shard clone of tree0, or
-            // rehydrate-tree0-at-shard-end, or scope eviction to single-shard). Until then, fail LOUD
-            // rather than silently no-op (no silent fallback): the eviction win is delivered on the
-            // single-shot path (the 2^26 fit test), which uses the inline OWNED tree0 above.
-            #[cfg(feature = "cuda")]
-            assert!(
-                !stwo::prover::backend::cuda::fused_commit::evict_tree0_enabled(),
-                "GATE_AIR_EVICT_TREE0 is not supported on the sharded base-proof path: tree0 is a \
-                 borrowed reference into the shared cross-shard BaseProverPrecompute and cannot be \
-                 evicted without breaking multi-shard reuse. Use the single-shot path, or resolve \
-                 the per-shard-copy / rehydrate-at-shard-end fork first."
-            );
-
             let public_claim = pack_public_claim(&[]);
             prover_channel.mix_felts(&public_claim);
 
@@ -3413,24 +3391,9 @@ fn main() -> Result<()> {
                     }
                 }
                 .map_err(|e| anyhow::anyhow!(e))?;
-                // Fix (b) (`GATE_AIR_FUSED_INTERP`): same as the single-proof path — feed the 19
-                // borrowed `d_cols` eval views as `CircleCoefficients` via `extend_polys` (skip the
-                // batched interpolate) so the per-column-interpolate commit path handles them without
-                // the second main-trace resident copy; `small_main` (different size) stays on
-                // `extend_evals`. Order is 19 main THEN small_main, matching the flag-off path.
-                if std::env::var("GATE_AIR_FUSED_INTERP").is_ok() {
-                    use stwo::prover::poly::circle::CircleCoefficients;
-                    let main_polys: Vec<CircleCoefficients<ProverBackend>> = main_dev
-                        .into_iter()
-                        .map(|e| CircleCoefficients::new(e.values))
-                        .collect();
-                    tree_builder.extend_polys(main_polys);
-                    tree_builder.extend_evals(to_prover(small_main));
-                } else {
-                    let mut main_dev = main_dev;
-                    main_dev.extend(to_prover(small_main));
-                    tree_builder.extend_evals(main_dev);
-                }
+                let mut main_dev = main_dev;
+                main_dev.extend(to_prover(small_main));
+                tree_builder.extend_evals(main_dev);
                 d_main_cols = Some(d_cols);
             } else {
                 let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
@@ -3445,10 +3408,8 @@ fn main() -> Result<()> {
             }
             tree_builder.commit(prover_channel);
 
-            // GATE_AIR_STREAM_MAIN (default OFF): dehydrate the ~24 GB main-trace device buffer to
-            // the host + free it now that the tree1 commit is done, so it is not resident for K4's
-            // interaction allocs or the tree2 commit. K4 rehydrates it only for its kernel loop.
-            // Flag OFF: kept resident (byte-for-byte the previous path). See `MainTrace::from_k1`.
+            // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
+            // See `MainTrace::from_k1`.
             #[cfg(feature = "cuda")]
             let mut main_k1: Option<gpu_tracegen::MainTrace> = match d_main_cols.take() {
                 Some(d_cols) => {
@@ -3474,8 +3435,6 @@ fn main() -> Result<()> {
                 let main = main_k1
                     .as_ref()
                     .expect("K1 main-trace buffer must exist on the GPU path");
-                // Composes with GATE_AIR_BOUNDARY_TRIM (option-0) if the coordinator enables it.
-                stwo::prover::backend::cuda::fused_commit::boundary_trim_if_enabled();
                 let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
                     main,
                     n_gates as u32,
@@ -3490,11 +3449,9 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            // K4 done: FREE the main trace NOW (before tree2), not at end-of-shard. Under
-            // GATE_AIR_STREAM_MAIN_LOWMEM this `cuMemFree`s the ~24 GB resident `d_cols` DEVICE buffer
-            // AND synchronizes so tree2's pool can reserve it (else tree2 OOMs the card); under plain
-            // GATE_AIR_STREAM_MAIN it frees the dehydrated HOST copy early. `free_after_k4` consumes
-            // the buffer explicitly. Flag OFF: `main_k1` is None → no-op.
+            // K4 done: FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before tree2), not at
+            // end-of-shard, and synchronize so tree2's pool can reserve it. `free_after_k4` consumes
+            // the buffer explicitly.
             #[cfg(feature = "cuda")]
             if let Some(m) = main_k1.take() {
                 m.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
@@ -3574,17 +3531,7 @@ fn main() -> Result<()> {
                 interaction.extend(small_interaction);
                 tree_builder.extend_evals(to_prover(interaction));
             }
-            // Option (a) — arm the interaction (tree2) staging scope for this commit ONLY. Under
-            // GATE_AIR_STREAM_INTERACTION this makes `evaluate_polynomials` host-stage the OWNED
-            // interaction eval columns (dehydrate + free their device buffers) so the composition
-            // kernel row-tiles tree2 instead of holding it whole-resident. The arm flag scopes the
-            // staging to THIS commit (never tree0/tree1); flag OFF => no-op (staging only fires when
-            // GATE_AIR_STREAM_INTERACTION is set), so the arm/disarm is byte-identical off the flag.
-            #[cfg(feature = "cuda")]
-            stwo::prover::backend::cuda::fused_commit::arm_interaction_commit(true);
             tree_builder.commit(prover_channel);
-            #[cfg(feature = "cuda")]
-            stwo::prover::backend::cuda::fused_commit::arm_interaction_commit(false);
 
             let components = build_components(
                 log_n_rows,
@@ -4261,18 +4208,6 @@ fn main() -> Result<()> {
             (bases, None)
         };
 
-        // BASE->RECURSION BOUNDARY: all base proving is now COMPLETE — in the pipeline branch every
-        // GPU producer thread has been `.join()`-ed (above, before `bases` was materialized) and in
-        // the sequential branch the eager `make_base` loop has returned. So no thread will stage or
-        // rehydrate a column from the CUDA pinned host pool after this point. The fold recursion that
-        // follows runs entirely on the CPU/SimdBackend and does NOT use the GPU pinned pool. Release
-        // the process-lifetime pinned host free-list (accumulated across all base shards, ~12 GB/commit
-        // high-water × N shards, never returned to the OS by `PinnedPool.give`/`clear_stash`) back to
-        // the OS now, so the host RAM it holds does not stack on top of the recursion's own footprint
-        // and OOM-kill the process. Pure reclaim of dead recycled buffers → byte-identical proof.
-        #[cfg(feature = "cuda")]
-        stwo::prover::backend::cuda::fused_commit::free_pinned_host_pools();
-
         // ---- Bottom layer + fold + root verification ----
         // The bases (`(Proof<QM31>, GateAirLeafParams)` in shard order) are materialized above.
         // Prove one standalone leaf per base (`prove_gate_air_leaf`), fold the leaves via
@@ -4514,48 +4449,6 @@ fn main() -> Result<()> {
         t_phase.elapsed().as_secs_f64()
     );
 
-    // tree0 EVICTION (GATE_AIR_EVICT_TREE0, default OFF): the tree0 commit is done and tree0's four
-    // FULL-DOMAIN preprocessed columns (enabler/shot_id/pc/pc_in_prog, ~4×512 MiB at 2^26) are now
-    // resident-but-UNREAD until composition/quotient+OODS in prove_ex. Host-stage them (D2H + free)
-    // to drop ~2 GiB off the tree2-commit peak. The composition/quotient (quotient.rs is_staged →
-    // rehydrate_block), OODS (poly.rs is_staged → rehydrate_owned), decommit (column.rs
-    // host_batch_get) and the composition kernel (cuda_component_prover.rs stash-key passthrough)
-    // are all per-column is_staged-guarded and tree-agnostic, so a staged tree0 column is rehydrated
-    // transparently — no new wiring. This is the OWNED single-shot tree0 (built inline just above),
-    // so eviction is proof-scoped and safe (no shared cross-shard precompute here).
-    //
-    // SAFETY GUARD: eviction is INCOMPATIBLE with GATE_AIR_STREAM_COMMIT (stream_tree1). The tree1
-    // commit that runs next calls fused_commit::clear_stash() at its head (poly.rs), which would WIPE
-    // tree0's just-staged stash entries before prove_ex rehydrates them → the readers would then see
-    // is_staged()==false and dereference the freed sentinel device_ptr (corruption). Fail LOUD rather
-    // than silently corrupt: require the two flags not be combined until the clear_stash-vs-tree0
-    // ordering is resolved.
-    #[cfg(feature = "cuda")]
-    if stwo::prover::backend::cuda::fused_commit::evict_tree0_enabled() {
-        assert!(
-            std::env::var("GATE_AIR_STREAM_COMMIT").is_err(),
-            "GATE_AIR_EVICT_TREE0 is currently incompatible with GATE_AIR_STREAM_COMMIT: the tree1 \
-             commit's clear_stash() would wipe tree0's staged entries before prove_ex reads them. \
-             Resolve the clear_stash-vs-tree0 ordering before combining these flags."
-        );
-        // tree0 is trees[0], the OWNED inline tree just committed above. Stage its full-domain
-        // columns (eval length == max over tree0's columns) via the exported helper.
-        if let Some(stwo::core::utils::MaybeOwned::Owned(tree0)) =
-            commitment_scheme.trees.first_mut()
-        {
-            let max_size = tree0
-                .polynomials
-                .iter()
-                .map(|p| p.evals.values.size)
-                .max()
-                .unwrap_or(0);
-            stwo::prover::backend::cuda::fused_commit::evict_tree0_columns_at_size(
-                tree0.polynomials.iter_mut().map(|p| &mut p.evals.values),
-                max_size,
-            );
-        }
-    }
-
     // Public claim (empty for gate_air; the boundary is reconstructed by the verifier).
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
@@ -4616,29 +4509,9 @@ fn main() -> Result<()> {
             }
             stwo::stwo_cuda::cuda_mem_probe("PROBE1b_after_K1_trim");
         }
-        // Fix (b) (`GATE_AIR_FUSED_INTERP`): the 188 `main_dev` columns are BORROWED views into
-        // `d_cols` holding UN-interpolated base-domain evals (see `gpu_gen_main_trace_device`). Feed
-        // them as `CircleCoefficients` via `extend_polys` so tree1's batched in-place interpolate is
-        // SKIPPED (that interpolate would clobber the borrowed views AND double main-trace residency
-        // — the OOM at 2^25). The CudaBackend commit's fused per-column-interpolate path handles them
-        // (copy-to-temp + per-column b2n), leaving `d_cols` intact for K4. The tiny `small_main`
-        // columns stay on the interpolating `extend_evals` path (they are a DIFFERENT size — 2^9 /
-        // 2^16 / program-table — so they never share the borrowed main group). Column ORDER is 188
-        // main THEN small_main, byte-identical to the flag-off `main_dev.extend(small_main)` order.
-        // Off-flag: legacy `extend_evals` over 188+small_main, byte-for-byte unchanged.
-        if std::env::var("GATE_AIR_FUSED_INTERP").is_ok() {
-            use stwo::prover::poly::circle::CircleCoefficients;
-            let main_polys: Vec<CircleCoefficients<ProverBackend>> = main_dev
-                .into_iter()
-                .map(|e| CircleCoefficients::new(e.values))
-                .collect();
-            tree_builder.extend_polys(main_polys);
-            tree_builder.extend_evals(to_prover(small_main));
-        } else {
-            let mut main_dev = main_dev;
-            main_dev.extend(to_prover(small_main));
-            tree_builder.extend_evals(main_dev);
-        }
+        let mut main_dev = main_dev;
+        main_dev.extend(to_prover(small_main));
+        tree_builder.extend_evals(main_dev);
         d_main_cols = Some(d_cols);
     } else {
         let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
@@ -4669,19 +4542,8 @@ fn main() -> Result<()> {
         "gate-air: [phase] tree1 commit (NTT+Merkle) {:.3}s",
         t_phase.elapsed().as_secs_f64()
     );
-    // T1 sub-timer report (grep `[T1]`): decomposes the tree1 commit into NTT / dehydrate D2H /
-    // reclaim barrier / build_leaves H2D / absorb. Prints only under GATE_AIR_T1_TIMERS/PROVE_EX_TIMERS.
-    #[cfg(feature = "cuda")]
-    if stwo::prover::backend::cuda::fused_commit::t1_timers_on() {
-        stwo::prover::backend::cuda::fused_commit::t1_report("tree1 commit");
-    }
-
-    // GATE_AIR_STREAM_MAIN (device-capacity fix, default OFF): the tree1 commit (which borrowed into
-    // the resident K1 buffer) is done, so DEHYDRATE the ~24 GB main-trace device buffer to the host
-    // and FREE it now. It is no longer resident for the K4 interaction allocs (`d_inter` etc.) or the
-    // tree2 commit — the two phases that OOM at 2^25 with it pinned. K4 rehydrates it (H2D) only for
-    // its kernel loop and frees it again before tree2. Flag OFF: kept resident (byte-for-byte the
-    // previous path). See `MainTrace::from_k1` / `gpu_gen_interaction_device`.
+    // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
+    // See `MainTrace::from_k1` / `gpu_gen_interaction_device`.
     #[cfg(feature = "cuda")]
     let mut main_k1: Option<gpu_tracegen::MainTrace> = match d_main_cols.take() {
         Some(d_cols) => {
@@ -4689,8 +4551,6 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    #[cfg(feature = "cuda")]
-    stwo::stwo_cuda::cuda_mem_probe("PROBE3_after_stream_main_dehydrate");
 
     // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
     let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
@@ -4722,17 +4582,6 @@ fn main() -> Result<()> {
         let main = main_k1
             .as_ref()
             .expect("K1 main-trace buffer must exist on the GPU path");
-        // OPTION-0 (GATE_AIR_BOUNDARY_TRIM, default OFF): one-shot pool defrag at the tree1->K4
-        // boundary. The streamed tree1 commit just finished; the CUDA pool caches ~23.5 GiB of freed
-        // tree1 eval segments (Part-A notrim), which block the fresh contiguous 3 GiB d_inter alloc
-        // below at 2^25. This releases the cached (already-freed) segments to the OS ONCE so d_inter
-        // fits. Composes with (does NOT require) GATE_AIR_STREAM_MAIN, which additionally removes the
-        // ~24 GB main pin. Live buffers (tree0, twiddles) untouched → byte-identical.
-        stwo::prover::backend::cuda::fused_commit::boundary_trim_if_enabled();
-        // MEM PROBE 3b: AFTER the boundary trim, BEFORE the interaction (K4) allocs. PROBE3 above is
-        // measured BEFORE the trim, so it does not show whether the trim reclaimed the pool's
-        // cached-freed tree1 segments. This reading is the true free entering the K4/tree2 phase.
-        stwo::stwo_cuda::cuda_mem_probe("PROBE3b_after_boundary_trim");
         let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
             main,
             n_gates as u32,
@@ -4747,12 +4596,10 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    // K4 has consumed the main trace; FREE it NOW (before tree2), not at end-of-prove. Under
-    // GATE_AIR_STREAM_MAIN_LOWMEM this `cuMemFree`s the ~24 GB `d_cols` DEVICE buffer that was kept
-    // resident across K4 AND synchronizes so the freed memory is reservable by tree2's pool (the
-    // device would OOM at 2^25 with it pinned); under plain GATE_AIR_STREAM_MAIN it frees the ~24 GB
-    // dehydrated HOST copy early. `free_after_k4` consumes the buffer explicitly (drop alone returns
-    // it to the driver but not to tree2's pool without the sync). Flag OFF: `main_k1` is None → no-op.
+    // K4 has consumed the main trace; FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before
+    // tree2), not at end-of-prove, and synchronize so the freed memory is reservable by tree2's pool
+    // (the device would OOM at 2^25 with it pinned). `free_after_k4` consumes the buffer explicitly
+    // (drop alone returns it to the driver but not to tree2's pool without the sync).
     #[cfg(feature = "cuda")]
     if let Some(m) = main_k1.take() {
         m.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
@@ -4940,16 +4787,7 @@ fn main() -> Result<()> {
         interaction.extend(small_interaction);
         tree_builder.extend_evals(to_prover(interaction));
     }
-    // Option (a) — arm the interaction (tree2) staging scope for this commit ONLY. Under
-    // GATE_AIR_STREAM_INTERACTION this makes `evaluate_polynomials` host-stage the OWNED
-    // interaction eval columns (dehydrate + free their device buffers) so the tree2 commit does not
-    // hold all 28 eval columns resident (and the composition kernel row-tiles tree2). The arm flag
-    // scopes the staging to THIS commit (never tree0/tree1); flag OFF => no-op, so byte-identical.
-    #[cfg(feature = "cuda")]
-    stwo::prover::backend::cuda::fused_commit::arm_interaction_commit(true);
     tree_builder.commit(prover_channel);
-    #[cfg(feature = "cuda")]
-    stwo::prover::backend::cuda::fused_commit::arm_interaction_commit(false);
     eprintln!(
         "gate-air: [phase] tree2 commit (NTT+Merkle) {:.3}s",
         t_phase.elapsed().as_secs_f64()
@@ -4999,12 +4837,6 @@ fn main() -> Result<()> {
     // the pool's high-water reservation across composition/quotient, the phases with no earlier probe).
     #[cfg(feature = "cuda")]
     stwo::stwo_cuda::cuda_mem_probe("PROBE6_after_prove_ex");
-    // T2 sub-timer report (grep `[T2]`): the prove_ex staged-consumer rehydrate H2D vs kernel-compute
-    // split for OODS + quotient. Prints only under GATE_AIR_T1_TIMERS/PROVE_EX_TIMERS.
-    #[cfg(feature = "cuda")]
-    if stwo::prover::backend::cuda::fused_commit::t1_timers_on() {
-        stwo::prover::backend::cuda::fused_commit::t2_report("prove_ex");
-    }
 
     // ---- Full-proof byte-identity fingerprint (read-only), gated by GATE_AIR_PROOF_HASH ----
     // Deterministic SHA-256 over the serde-serialized ExtendedStarkProof (commitments,
