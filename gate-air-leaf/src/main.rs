@@ -2822,9 +2822,8 @@ fn assert_tree0_matches_rebuild(pc: &BaseProverPrecompute, rows0: &[Row], n_gate
 /// SOUNDNESS (base pp-root pin, step 1): recompute the CANONICAL base gate_air preprocessed (tree0)
 /// root at BUILD TIME purely from the trusted PUBLIC config — the program table, `k`, `n_gates`,
 /// `shots_per_shard`, the shard-invariant row shape, the boundary layout, `rc_log = rc_log_size(k *
-/// n_gates)`, and the base blowup. This is the value the base-fanning unpacker BAKES as a constant
-/// (`config.base_preprocessed_root`, leaf.rs) so the trusted final verifier's canonical-unpacker-root
-/// check pins every base to a canonical preprocessed trace (positional pc, in-range rc table).
+/// n_gates)`, and the base blowup. The canonical base preprocessed (tree0) root a base proof commits,
+/// recomputed from the trusted PUBLIC shape so it can be compared against a forgeable proof value.
 ///
 /// It must NOT read `base_extended.proof` (the prover's `commitments[0]` — a forgeable value). tree0
 /// is SHARD-INVARIANT (every preprocessed column is positional / shape-derived, see
@@ -2837,6 +2836,7 @@ fn assert_tree0_matches_rebuild(pc: &BaseProverPrecompute, rows0: &[Row], n_gate
 /// re-derived via a fresh `CommitmentSchemeProver` + `tree_builder().commit()` and asserted equal, so
 /// a column-order / blowup / lifting / sort divergence aborts before the canonical constant is baked.
 /// Compiled out of `--release` (byte-identical, pays nothing).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn canonical_base_preprocessed_root(
     program: &ProgramTable,
@@ -2916,68 +2916,10 @@ fn canonical_base_preprocessed_root(
     canonical
 }
 
-/// TRUSTED FINAL VERIFIER (step 3) for the base-fanning recursion. Independently checks the single
+/// TRUSTED FINAL VERIFIER (step 3) for the LEAF/R1/R2 recursion. Independently checks the single
 /// published root-verification proof `rv` against a CANONICAL unpacker circuit recomputed here from
-/// the TRUSTED PUBLIC `(n, config)` — never from any prover-supplied value — closing the base
-/// pp-root soundness hole:
-///
-///   1. Recompute the canonical base-node roots for the `base_fan_group_sizes(n, b)` groups via
-///      `base_node_root_for_arity` (public, arity-derived — NOT the prover's reported `bn.preprocessed_root`).
-///   2. Recompute the canonical unpacker `CircuitConfig` (`base_fan_unpacker_verify_config`) — its
-///      `preprocessed_root` is the canonical unpacker root, built through the SAME shared builder the
-///      prover used but with a `NoValue` witness, so it is byte-identical to the honest proof's
-///      preprocessed root. Because the child roots (base tree0, base-node, R2/short) are BAKED as
-///      constants in that circuit, this canonical root PINS them: a proof whose unpacker baked a
-///      forged child root has a different preprocessed root and is REJECTED here.
-///   3. `verify_circuit` the proof against that canonical config, with the CALLER-COMMITTED outputs
-///      (`rv.leaf_outputs`, the per-base `H_i`) as public data — NOT values lifted from the proof.
-///
-/// `zk_n_padding` must equal the prover's blinding `n_padding` (the root PCS `n_queries`) so the
-/// recomputed circuit's component sizes match; `None` for an unblinded (test) proof. Modeled on
-/// `privacy_circuit_verify::verify_recursive_circuit`.
-fn verify_gate_air_root(
-    rv: &recursive_aggregate::RootVerificationOutput,
-    config: &leaf::BaseFanConfig,
-    n: usize,
-    log_blowup_factor: u32,
-    zk_n_padding: Option<usize>,
-) -> anyhow::Result<()> {
-    use circuit_verifier::verify::{verify_circuit, CircuitPublicData};
-    use recursive_aggregate::{base_fan_group_sizes, base_fan_unpacker_verify_config};
-
-    let b = config.b;
-    // (1) Canonical base-node roots for each group (public, arity-derived — never prover-reported).
-    let base_node_roots: Vec<_> = base_fan_group_sizes(n, b)
-        .into_iter()
-        .map(|arity| leaf::base_node_root_for_arity(config, arity))
-        .collect();
-
-    // (2) Canonical unpacker verify config recomputed from trusted public params (NoValue), sharing
-    //     the prover's builder ⇒ byte-identical preprocessed root/shape.
-    let verify_config = base_fan_unpacker_verify_config(
-        n,
-        b,
-        &config.agg,
-        &base_node_roots,
-        log_blowup_factor,
-        zk_n_padding,
-    );
-
-    // (3) Verify the published proof with the CALLER-COMMITTED per-base outputs.
-    let output_values: Vec<SecureField> = rv.leaf_outputs.iter().flatten().copied().collect();
-    verify_circuit(
-        verify_config,
-        rv.proof.clone(),
-        CircuitPublicData { output_values },
-    )
-    .map(|_| ())
-    .map_err(|e| anyhow::anyhow!("trusted gate_air root verification failed: {e}"))
-}
-
-/// TRUSTED FINAL VERIFIER (step 3) for the LEAF/R1/R2 recursion — the leaf-topology mirror of
-/// [`verify_gate_air_root`]. Independently checks the single published root-verification proof `rv`
-/// against a CANONICAL unpacker circuit recomputed here from the TRUSTED PUBLIC `(n, config)` — never
-/// from any prover-supplied value — closing the base pp-root soundness hole for the leaf/R1/R2 arm:
+/// the TRUSTED PUBLIC `(n, config)` — never from any prover-supplied value — closing the base pp-root
+/// soundness hole for the leaf/R1/R2 arm:
 ///
 ///   1. Recompute the canonical unpacker `CircuitConfig` (`leaf_r1r2_unpacker_verify_config`) — its
 ///      `preprocessed_root` is the canonical LeafR1R2 unpacker root, built through the SAME shared
@@ -3203,15 +3145,14 @@ fn main() -> Result<()> {
         use circuits_stark_verifier::proof::{Proof, ProofConfig};
         use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
         use leaf::{
-            build_recursion_precompute, derive_aggregate_config, derive_base_fanning_config,
-            prove_base_node, prove_gate_air_leaf, BaseFanConfig, GateAirLeafParams,
+            build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
+            GateAirLeafParams,
         };
         use recursive_aggregate::AggregateOutput;
         use recursive_aggregate::{
-            base_fan_group_sizes, prove_root_verification, prove_root_verification_leaves,
-            recursive_aggregate_prove, recursive_aggregate_prove_leaves,
-            recursive_aggregate_prove_leaves_streaming, AggregateConfig, BaseFanBottom, BaseOutput,
-            FoldMode, LeafBottom, PoolSet, RecursionPrecompute, TopologyConfig, TreeProof, ZkBlind,
+            prove_root_verification_leaves, recursive_aggregate_prove_leaves,
+            recursive_aggregate_prove_leaves_streaming, AggregateConfig, LeafBottom, PoolSet,
+            RecursionPrecompute, TopologyConfig, TreeProof, ZkBlind,
         };
         use stwo::core::fields::qm31::QM31;
         use stwo::core::proof::ExtendedStarkProof;
@@ -3718,9 +3659,7 @@ fn main() -> Result<()> {
         let (
             base_precompute,
             cfg,
-            b,
-            base_fan_cfg,
-            mut leaf_cfg,
+            leaf_cfg,
             recursion_pre,
             boundary_log_size,
             leaf_program,
@@ -3728,9 +3667,7 @@ fn main() -> Result<()> {
         ): (
             Option<std::sync::Arc<BaseProverPrecompute>>,
             ProofConfig,
-            usize,
-            Option<BaseFanConfig>,
-            Option<AggregateConfig>,
+            AggregateConfig,
             RecursionPrecompute,
             u32,
             leaf::ProgramRows,
@@ -3742,7 +3679,7 @@ fn main() -> Result<()> {
         // block inside `BaseProverPrecompute::new`): program table, rows, boundary, row/rc log sizes.
         // `total_pc = k*n_gates` and `preprocessed_root` are PUBLIC (never a proof field).
         let shape_program0 = build_program_table(&gates, shots_per_shard, k);
-        let (shape_rows0, shape_boundary0) = build_rows(&gates, &shard_case_sets[0], k)?;
+        let (shape_rows0, _shape_boundary0) = build_rows(&gates, &shard_case_sets[0], k)?;
         let shape_real_rows0 = shape_rows0.len();
         let shape_padded_rows0 =
             shape_real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
@@ -3777,20 +3714,10 @@ fn main() -> Result<()> {
             }
             v
         };
-        // The base preprocessed root is a WITNESS in the leaf/base-node statement
-        // (`GateAirStatement::new` GUESSES it — circuit_statement.rs), so its VALUE never enters any
-        // preprocessed trace nor any leaf/R1/R2 `CircuitPrecompute` (all built from `NoValue` shapes,
-        // where the guessed root's value is ignored). We therefore give `shape_params` a byte-irrelevant
-        // ZERO placeholder here and do NOT run the (GPU-heavy) `canonical_base_preprocessed_root`
-        // recompute on this CPU thread — keeping this thread pure-CPU so it truly overlaps the GPU base
-        // precompute on the main thread. The CANONICAL value is plugged into the config AFTER the join:
-        //   - LeafR1R2 (default): `AggregateConfig.base_preprocessed_root` is set post-join from the
-        //     already-built `pc.tree0.commitment.root()` (byte-identical to the old recompute). That
-        //     field is unread by the LeafR1R2 unpacker (it bakes `leaf_preprocessed_root` instead), so
-        //     this is a well-formedness value only; still set to the true canonical root.
-        //   - BaseFanning (below): its base-node circuit BAKES the base root as a preprocessed constant,
-        //     so its `CircuitPrecompute` genuinely depends on it — that branch recomputes the canonical
-        //     root here (on this thread) and passes it in, unchanged from before.
+        // The base preprocessed root is a WITNESS in the leaf statement (`GateAirStatement::new`
+        // GUESSES it — circuit_statement.rs), so its VALUE never enters any preprocessed trace nor any
+        // leaf/R1/R2 `CircuitPrecompute` (all built from `NoValue` shapes, where the guessed root's
+        // value is ignored). We therefore give `shape_params` a byte-irrelevant ZERO placeholder here.
         let placeholder_base_pp_root: HashValue<SecureField> =
             HashValue(std::array::from_fn(|_| U32Wrapper::new_unsafe(SecureField::zero())));
         let shape_params = GateAirLeafParams {
@@ -3803,65 +3730,26 @@ fn main() -> Result<()> {
             program: leaf_program.clone(),
             nonce: leaf_nonce,
         };
-        // Base-fanning arity `b`: how many bases (shards) group under one base-node (base-fanning
-        // mode). Under LeafR1R2 the bottom is one leaf per base (b is unused there).
-        let b = topo.base_fan_arity;
-
-        // Derive the recursion config + its up-front `RecursionPrecompute` for the active FoldMode.
-        // The heavy `CircuitPrecompute` builds happen HERE (in parallel with the GPU precompute).
+        // Derive the recursion config + its up-front `RecursionPrecompute`. The heavy
+        // `CircuitPrecompute` builds happen HERE (in parallel with the GPU precompute).
         let t_cfg = Instant::now();
-        let (base_fan_cfg, leaf_cfg, recursion_pre): (
-            Option<BaseFanConfig>,
-            Option<AggregateConfig>,
-            RecursionPrecompute,
-        ) = match topo.fold_mode {
-            FoldMode::BaseFanning => {
-                // BaseFanning's base-node circuit BAKES the base root as a preprocessed CONSTANT, so its
-                // `CircuitPrecompute` genuinely depends on the canonical value — recompute it here (still
-                // on this CPU thread; base_fanning is the non-default path and keeps its old behavior).
-                let canonical_base_pp_root = canonical_base_preprocessed_root(
-                    &shape_program0,
-                    &shape_rows0,
-                    shape_padded_rows0,
-                    shape_log_n_rows0,
-                    n_gates,
-                    shape_rc_log0,
-                    &shape_boundary0,
-                    base0_config,
-                );
-                let (config, pre) = derive_base_fanning_config(
-                    &cfg,
-                    &shape_params,
-                    b,
-                    topo.fold_arity,
-                    recursion_log_blowup,
-                    canonical_base_pp_root,
-                );
-                eprintln!(
-                    "gate-air: base-fanning config + precompute built up front in {:.1}s (b={b}, node target qm31_ops={})",
-                    t_cfg.elapsed().as_secs_f64(),
-                    config.agg.node_target_padding_sizes.qm31_ops,
-                );
-                (Some(config), None, pre)
-            }
-            FoldMode::LeafR1R2 => {
-                let (agg, shapes) = derive_aggregate_config(
-                    &cfg,
-                    &shape_params,
-                    topo.fold_arity,
-                    recursion_log_blowup,
-                    leaf_log_blowup,
-                );
-                let pre = build_recursion_precompute(shapes);
-                eprintln!(
-                    "gate-air: leaf/R1/R2 config + precompute built up front in {:.1}s (node target qm31_ops={})",
-                    t_cfg.elapsed().as_secs_f64(),
-                    agg.node_target_padding_sizes.qm31_ops,
-                );
-                (None, Some(agg), pre)
-            }
+        let (leaf_cfg, recursion_pre) = {
+            let (agg, shapes) = derive_aggregate_config(
+                &cfg,
+                &shape_params,
+                topo.fold_arity,
+                recursion_log_blowup,
+                leaf_log_blowup,
+            );
+            let pre = build_recursion_precompute(shapes);
+            eprintln!(
+                "gate-air: leaf/R1/R2 config + precompute built up front in {:.1}s (node target qm31_ops={})",
+                t_cfg.elapsed().as_secs_f64(),
+                agg.node_target_padding_sizes.qm31_ops,
+            );
+            (agg, pre)
         };
-            Ok((cfg, b, base_fan_cfg, leaf_cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce))
+            Ok((cfg, leaf_cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce))
         });
 
             // --- MAIN THREAD (GPU): base precompute build. ---
@@ -3926,8 +3814,6 @@ fn main() -> Result<()> {
             // --- JOIN: both precomputes complete here, before any proving. ---
             let (
                 cfg,
-                b,
-                base_fan_cfg,
                 leaf_cfg,
                 recursion_pre,
                 boundary_log_size,
@@ -3939,8 +3825,6 @@ fn main() -> Result<()> {
             Ok((
                 base_precompute,
                 cfg,
-                b,
-                base_fan_cfg,
                 leaf_cfg,
                 recursion_pre,
                 boundary_log_size,
@@ -3948,43 +3832,6 @@ fn main() -> Result<()> {
                 leaf_nonce,
             ))
         })?;
-
-        // --- LeafR1R2: plug the CANONICAL base preprocessed root into the config, post-join. ---
-        // The CPU thread built the LeafR1R2 config with a ZERO placeholder for `base_preprocessed_root`
-        // (that field is a well-formedness value only — the LeafR1R2 unpacker bakes `leaf_preprocessed_root`
-        // instead — but we still populate the true canonical value). The GPU base precompute already
-        // committed the base tree0 on the main thread, so `pc.tree0.commitment.root()` IS the canonical
-        // base preprocessed root (built from the trusted PUBLIC program/gates, same `build_tree0_columns`
-        // + blowup as `canonical_base_preprocessed_root`), available here for free — no redundant GPU
-        // tree0 commit. If the base precompute was DISABLED (`GATE_AIR_NO_BASE_PRECOMPUTE`), fall back to
-        // recomputing the canonical root from the public shape.
-        if let Some(cfg_leaf) = leaf_cfg.as_mut() {
-            let base_pp_root: HashValue<SecureField> = match base_precompute.as_deref() {
-                Some(pc) => pc.tree0.commitment.root().into(),
-                None => {
-                    // GATE_AIR_NO_BASE_PRECOMPUTE (LeafR1R2): recompute the shape + canonical root here.
-                    let program0 = build_program_table(&gates, shots_per_shard, k);
-                    let (rows0, boundary0) = build_rows(&gates, &shard_case_sets[0], k)?;
-                    let real_rows0 = rows0.len();
-                    let padded_rows0 = real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
-                    let log_n_rows0 = padded_rows0.ilog2();
-                    let rc_log0 = rc_log_size(k * n_gates);
-                    let base0_config =
-                        leaf::leaf_pcs_config(log_n_rows0.max(rc_log0), topo.base_log_blowup);
-                    canonical_base_preprocessed_root(
-                        &program0,
-                        &rows0,
-                        padded_rows0,
-                        log_n_rows0,
-                        n_gates,
-                        rc_log0,
-                        &boundary0,
-                        base0_config,
-                    )
-                }
-            };
-            cfg_leaf.base_preprocessed_root = base_pp_root;
-        }
 
         let base_precompute_ref = base_precompute.as_deref();
         let recursion_pre_ref = &recursion_pre;
@@ -4162,8 +4009,7 @@ fn main() -> Result<()> {
 
         // `make_base` turns one shard's base-proof tuple into a `(Proof<QM31>, GateAirLeafParams)`
         // base. Same params construction + proof_from_stark_proof as before; the per-leaf circuit
-        // wrap is now deferred to `prove_base_node` (which proves one base-node over a GROUP of
-        // these bases). Base `i` == shard `i`.
+        // wrap is done later by `prove_gate_air_leaf`. Base `i` == shard `i`.
         let make_base = |base: &BaseShardOutput| -> (Proof<QM31>, GateAirLeafParams) {
             let (
                 extended_i,
@@ -4191,19 +4037,19 @@ fn main() -> Result<()> {
             (p, params_i)
         };
 
-        // Materialize every base in shard order (shared by both FoldModes). Base-node grouping / leaf
-        // proving + the fold + root-verify happen in the FoldMode dispatch AFTER this.
+        // Materialize every base in shard order. Leaf proving + the fold + root-verify happen AFTER
+        // this.
         //
-        // BASE↔LEAF OVERLAP (LeafR1R2 + pipeline only), "hide the fold behind base-proving" (Model 1):
+        // BASE↔LEAF OVERLAP (pipeline only), "hide the fold behind base-proving" (Model 1):
         // each leaf verifies exactly ONE base, so as bases arrive from the GPU producer channel we feed
         // them into `recursive_aggregate_prove_leaves_streaming`, which WRAPS each base into a leaf AND
         // folds the whole tree (level-0 leaf→R1 layer + shared R2 up-tree fold) PROGRESSIVELY on the CPU
         // `pools` — so GPU base-proving overlaps with BOTH the CPU leaf-wrap AND the fold (no separate
         // fold tail). The leaf/R1/R2 config + precompute are already built up front (`leaf_cfg` /
-        // `recursion_pre`). base_fanning (groups b bases per node, needs them together) and the
-        // non-pipeline path keep the old "materialize all bases, then wrap/group" flow. Overlap yields
-        // the already-folded `(leaves, AggregateOutput)`; the other paths yield `bases`.
-        let overlap_leaves = pipeline && matches!(topo.fold_mode, FoldMode::LeafR1R2);
+        // `recursion_pre`). The non-pipeline path keeps the "materialize all bases, then wrap" flow.
+        // Pipeline yields the already-folded `(leaves, AggregateOutput)`; the non-pipeline path yields
+        // `bases`.
+        let overlap_leaves = pipeline;
         let (bases, overlapped_fold): (
             Vec<(Proof<QM31>, GateAirLeafParams)>,
             Option<(Vec<TreeProof>, AggregateOutput)>,
@@ -4309,9 +4155,7 @@ fn main() -> Result<()> {
                     // `wrap` closure (make_base + prove_gate_air_leaf) runs INSIDE its pool workers, so
                     // GPU base-proving overlaps BOTH the leaf-wrap and the fold. Leaf i = shard i
                     // (index-tagged), byte-identical to the sequential wrap+fold.
-                    let agg = leaf_cfg
-                        .as_ref()
-                        .expect("leaf_cfg present when overlap_leaves");
+                    let agg = &leaf_cfg;
                     let pre = recursion_pre_ref;
                     let make_base_ref = &make_base;
                     let pools_ref = &pools;
@@ -4429,161 +4273,16 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         stwo::prover::backend::cuda::fused_commit::free_pinned_host_pools();
 
-        // ---- Bottom layer + fold + root verification, dispatched on FoldMode ----
-        // The bases (`(Proof<QM31>, GateAirLeafParams)` in shard order) are materialized identically
-        // above for both modes. Only the BOTTOM layer + the config it is built against + the unpacker
-        // differ; the shared up-tree R2 fold (`recursive_aggregate_prove`) is identical.
-        //   - BaseFanning (default): group `b` bases per base-node (`prove_base_node`), fold the
-        //     base-nodes, unpack via `BaseFanBottom` / `prove_root_verification` — the current path,
-        //     behavior-unchanged.
-        //   - LeafR1R2: prove one standalone leaf per base (`prove_gate_air_leaf`, b=1), fold the
-        //     leaves via `recursive_aggregate_prove_leaves` (level-0 R1 layer + shared R2 fold), unpack
-        //     via `LeafBottom` / `prove_root_verification_leaves`.
-        // Both branches bind `base_nodes` (the fold's height-1 inputs), `out`, and `rv` for the shared
-        // fingerprint block below.
-        let (base_nodes, out, rv) = match topo.fold_mode {
-            FoldMode::BaseFanning => {
-                // Config + precompute already built up front from PUBLIC params (canonical base root
-                // recomputed there, NOT from the proof's `commitments[0]`).
-                let config =
-                    base_fan_cfg.expect("base_fan_cfg present under FoldMode::BaseFanning");
-                let config_ref = &config;
-
-                // Group `n_shards_bases` bases (in shard order) into base-nodes per
-                // `base_fan_group_sizes`, prove one base-node per group, and collect the fold input
-                // (base-nodes) + the unpacker hints (all base outputs in shard order + the per-group
-                // reported base-node roots).
-                //
-                // POOL-PARALLEL: base-nodes are independent + deterministic, so we dispatch one job
-                // per group across the recursion `pools` (mirroring the R1 leaf-node layer in
-                // `recursive_aggregate_prove_leaves`: pre-slice groups in order, build one job per
-                // group, `pools.map` which preserves input order). Each job owns its `group` and only
-                // shares an immutable `config_ref` (no shared mutable state), so this changes only
-                // wall time, not the proofs — the outputs are collected in the same shard order the
-                // serial loop produced.
-                let group_and_prove_base_nodes = |bases: Vec<(Proof<QM31>, GateAirLeafParams)>| -> (
-                    Vec<TreeProof>,
-                    Vec<BaseOutput>,
-                    Vec<HashValue<QM31>>,
-                ) {
-                    let sizes = base_fan_group_sizes(bases.len(), b);
-                    // Pre-slice the bases into contiguous, shard-ordered groups (one per base-node),
-                    // exactly as the serial loop's iterator consumed them.
-                    let mut it = bases.into_iter();
-                    let groups: Vec<Vec<(Proof<QM31>, GateAirLeafParams)>> = sizes
-                        .iter()
-                        .map(|&m| (0..m).map(|_| it.next().unwrap()).collect())
-                        .collect();
-                    // One job per group, dispatched pool-parallel. `pools.map` assigns jobs
-                    // round-robin and returns results in input (shard) order.
-                    let jobs: Vec<_> = groups
-                        .into_iter()
-                        .enumerate()
-                        .map(|(g, group)| {
-                            move || {
-                                let m = group.len();
-                                let tn = Instant::now();
-                                let (bn, outs) = prove_base_node(group, config_ref);
-                                eprintln!(
-                                    "gate-air: MEASURE t_base_node[{g}] (arity {m})={:.3}s",
-                                    tn.elapsed().as_secs_f64()
-                                );
-                                (bn, outs)
-                            }
-                        })
-                        .collect();
-                    let results: Vec<(TreeProof, Vec<BaseOutput>)> = pools.map(jobs);
-                    // Flatten in shard order (identical to the serial loop's push order).
-                    let mut base_nodes: Vec<TreeProof> = Vec::with_capacity(results.len());
-                    let mut all_base_outputs: Vec<BaseOutput> = Vec::new();
-                    let mut base_node_roots: Vec<HashValue<QM31>> = Vec::new();
-                    for (bn, outs) in results {
-                        base_node_roots.push(bn.preprocessed_root.clone());
-                        base_nodes.push(bn);
-                        all_base_outputs.extend(outs);
-                    }
-                    (base_nodes, all_base_outputs, base_node_roots)
-                };
-
-                let tg = Instant::now();
-                let (base_nodes, all_base_outputs, base_node_roots) =
-                    group_and_prove_base_nodes(bases);
-                eprintln!(
-                    "gate-air: {} base-node(s) proved in {:.1}s",
-                    base_nodes.len(),
-                    tg.elapsed().as_secs_f64()
-                );
-                let tf = Instant::now();
-                let out = recursive_aggregate_prove(
-                    base_nodes.clone(),
-                    &config.agg,
-                    recursion_pre_ref,
-                    &pools,
-                );
-                eprintln!(
-                    "gate-air: folded to root in {:.1}s ({} levels)",
-                    tf.elapsed().as_secs_f64(),
-                    out.n_levels
-                );
-                eprintln!("gate-air: multiverifier fold OK");
-
-                // Root verification with the single zk-blinding (the only published proof). The
-                // unpacker's bottom is the base-fanning bottom: all bases in shard order + `b` + the
-                // per-group reported base-node roots.
-                let zk = ZkBlind {
-                    seed: [7u8; 32],
-                    n_padding: config.agg.node_pcs_config.fri_config.n_queries,
-                };
-                let bottom = BaseFanBottom {
-                    bases: all_base_outputs,
-                    b,
-                    base_node_roots,
-                };
-                let t = Instant::now();
-                let rv = prove_root_verification(
-                    &out.root,
-                    &bottom,
-                    &config.agg,
-                    recursion_log_blowup,
-                    Some(zk),
-                );
-                eprintln!(
-                    "gate-air: root verification OK in {:.1}s (trace 2^{}, {} leaf outputs unpacked + zk-blinded)",
-                    t.elapsed().as_secs_f64(),
-                    rv.trace_log_size,
-                    rv.leaf_outputs.len()
-                );
-
-                // TRUSTED FINAL VERIFY (step 3): check the published proof against a canonical unpacker
-                // circuit recomputed here from the trusted public `(n, config)` — the real soundness
-                // anchor. Replaces the old fingerprint-only "self-verify" claim: the canonical unpacker
-                // root PINS every baked child root (incl. the canonical base tree0 root), and the
-                // per-base outputs are taken from `rv.leaf_outputs` (caller-committed), not the proof.
-                let n_bases = rv.leaf_outputs.len();
-                eprintln!(
-                    "gate-air: MEASURE prove_window (precompute->root-verify, excl startup+trusted-verify)={:.1}s",
-                    t_prove_window.elapsed().as_secs_f64()
-                );
-                let tv = Instant::now();
-                verify_gate_air_root(
-                    &rv,
-                    &config,
-                    n_bases,
-                    recursion_log_blowup,
-                    Some(config.agg.node_pcs_config.fri_config.n_queries),
-                )
-                .expect("trusted gate_air root verification failed");
-                eprintln!(
-                    "gate-air: TRUSTED root verify OK in {:.1}s (canonical unpacker root, {} caller-committed outputs)",
-                    tv.elapsed().as_secs_f64(),
-                    n_bases,
-                );
-                (base_nodes, out, rv)
-            }
-            FoldMode::LeafR1R2 => {
+        // ---- Bottom layer + fold + root verification ----
+        // The bases (`(Proof<QM31>, GateAirLeafParams)` in shard order) are materialized above.
+        // Prove one standalone leaf per base (`prove_gate_air_leaf`), fold the leaves via
+        // `recursive_aggregate_prove_leaves` (level-0 R1 layer + shared R2 fold), and unpack via
+        // `LeafBottom` / `prove_root_verification_leaves`. Binds `base_nodes` (the fold's height-1
+        // inputs), `out`, and `rv` for the shared fingerprint block below.
+        let (base_nodes, out, rv) = {
                 // Config + precompute already built up front from PUBLIC params (reused whether or not
                 // the pipeline overlap wrapped leaves early).
-                let agg = leaf_cfg.expect("leaf_cfg present under FoldMode::LeafR1R2");
+                let agg = leaf_cfg;
 
                 // Leaves + folded root. Under the pipeline overlap (Model 1, "hide the fold behind
                 // base-proving"), the coordinator ALREADY wrapped every leaf AND folded the whole tree
@@ -4698,7 +4397,6 @@ fn main() -> Result<()> {
                 // The fold's height-1 inputs are the leaves themselves under LeafR1R2 (b=1); expose
                 // them as `base_nodes` for the shared fingerprint block.
                 (leaves, out, rv)
-            }
         };
         // Root verification already ran inside the mode branch above (`rv`, `out`, `base_nodes` bound).
 
@@ -5620,7 +5318,7 @@ mod tests {
     }
 
     /// Proves ONE tiny gate_air base STARK on the CPU (SimdBackend) for `(gates, cases, k)`, returning
-    /// the circuit-form base `Proof<QM31>` + its `GateAirLeafParams` (what `prove_base_node` consumes).
+    /// the circuit-form base `Proof<QM31>` + its `GateAirLeafParams` (what `prove_gate_air_leaf` consumes).
     /// Replicates the `--recurse` single-base CPU prove sequence (tree0 commit → witness/interaction
     /// gen → prove_ex → proof_from_stark_proof) for a self-contained test.
     fn prove_tiny_base(
@@ -5811,175 +5509,9 @@ mod tests {
         (circuit_proof, params, cfg, canonical_base_pp_root)
     }
 
-    /// End-to-end base-fanning correctness gate (test i): prove `N` tiny gate_air bases on SimdBackend,
-    /// group them into base-nodes (arity `b`), fold with R2, prove the root verification (unpack +
-    /// self-verify). A green run means: every base verified in-circuit inside its base-node, every
-    /// base-node + R2 node verified in-circuit by its parent (the fold), and the root proof verified
-    /// in-circuit + reconstructed the tree from the base hints (the final `verify_circuit` sanity
-    /// check in `prove_root_verification`). This replaces the removed cairo smoke tests as the
-    /// recursion guard.
-    #[test]
-    fn base_fanning_end_to_end() {
-        // RUN-GUARD (laptop-safety): env-gated to GATE_AIR_HEAVY_RECURSION so plain `cargo test` never
-        // executes a real recursion prove/verify on a laptop (it can spike RAM / run for minutes). This
-        // guard does NOT change the base-fanning PROVING path — with the guard set the body below runs
-        // verbatim; it only prevents an accidental heavy run. Run it on the CPU VM with the guard set.
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
-            eprintln!(
-                "base_fanning_end_to_end: SKIPPED (recursion prove/verify). Set \
-                 GATE_AIR_HEAVY_RECURSION=1 to run."
-            );
-            return;
-        }
-        // Option A: single-base-node root, no R2. `b >= n_bases` so all `n_bases` bases
-        // fold into ONE base-node that IS the root — `recursive_aggregate_prove` builds NO R2 node.
-        // With `single_base_node=true` the config pads the base-node to its OWN natural target (~2^17
-        // with the toy 1-query base PCS, vs the R2-driven ~2^22 of the production fixed point), so the
-        // base-node proof + the root-verify are both small → the full prove → fold(trivial) → verify →
-        // self-verify roundtrip. It validates the base-fanning-specific WIRING: `b` bases folded into one
-        // base-node, the base-node fold-hash (`build_gate_air_base_node_circuit`), and the unpacker
-        // reconstructing that base-node from `b` bases + binding it to the self-verified root
-        // (`prove_root_verification`'s final `verify_circuit` sanity check). The R2 up-tree fold is the
-        // shared multiverifier path, covered byte-identically by recursive_aggregate's topology unit
-        // tests (6/6) + the CircuitStatement multiverifier regression (7/7); its full at-scale exercise
-        // is the env-gated `base_fanning_end_to_end_with_r2` heavy variant (box only).
-        //
-        // b=2, N=2 → base_fan_group_sizes(2,2) = [2]: ONE base-node folding 2 bases = the root.
-        // Recursion blowup 1 (smallest lift) keeps the base-node + root-verify proofs minimal.
-        // fold_arity = the TopologyConfig default (unused here: single-base-node builds no R2 node).
-        base_fanning_roundtrip(
-            2,
-            2,
-            true,
-            1,
-            recursive_aggregate::TopologyConfig::default().fold_arity,
-        );
-    }
-
-    /// HEAVY (box-only): the full base-fanning roundtrip WITH a real R2 up-tree fold — exercises the
-    /// base-node ↔ R2 interface at scale. R2 verifies FOLD_ARITY node-proofs so the node trace floors
-    /// at ~2^22 (~several GB–28 GB depending on blowup); OOMs a laptop, so it is env-gated to
-    /// GATE_AIR_HEAVY_RECURSION=1 (run on the CPU VM). Plain `cargo test` compiles + SKIPS it.
-    #[test]
-    fn base_fanning_end_to_end_with_r2() {
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
-            eprintln!(
-                "base_fanning_end_to_end_with_r2: SKIPPED (heavy: R2 node ~2^22). Set \
-                 GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the with-R2 roundtrip."
-            );
-            return;
-        }
-        // b=2, N=3 → [2,1]: a full-b + a short base-node folded by an R2 node into the root.
-        // fold_arity = the TopologyConfig default (the production R2 arity the heavy path exercises).
-        base_fanning_roundtrip(
-            2,
-            3,
-            false,
-            3,
-            recursive_aggregate::TopologyConfig::default().fold_arity,
-        );
-    }
-
-    /// The base-fanning prove→fold→verify→self-verify roundtrip over `n_bases` bases at base-fan arity
-    /// `b`, using the TOY per-base PCS from `prove_tiny_base`. `single_base_node` selects the config
-    /// mode: `true` requires `b >= n_bases` (one base-node root, no R2 — laptop-safe); `false` allows
-    /// an R2 up-tree fold (heavy). Shared by the laptop test + the env-gated heavy variant.
-    fn base_fanning_roundtrip(
-        b: usize,
-        n_bases: usize,
-        single_base_node: bool,
-        log_blowup_factor: u32,
-        fold_arity: usize,
-    ) {
-        use circuits_stark_verifier::proof::Proof;
-        use leaf::{derive_base_fanning_config_ex, prove_base_node, GateAirLeafParams};
-        use recursive_aggregate::{
-            base_fan_group_sizes, prove_root_verification, recursive_aggregate_prove,
-            BaseFanBottom, BaseOutput, PoolSet, TreeProof,
-        };
-
-        if single_base_node {
-            assert!(
-                b >= n_bases,
-                "single-base-node mode needs b >= n_bases (one base-node root)"
-            );
-        }
-
-        let (gates, cases, k) = nop_fixture(4, 2, 1);
-
-        // Prove one shared tiny base shape; reuse it for all N bases (identical bases are fine — the
-        // fold/unpack don't require distinctness). The base config/params shape is shard-invariant.
-        let (proof0, params0, cfg, canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
-        let (config, pre) = derive_base_fanning_config_ex(
-            &cfg,
-            &params0,
-            b,
-            fold_arity,
-            log_blowup_factor,
-            single_base_node,
-            canonical_base_pp_root,
-        );
-
-        // Build N (proof, params) bases (clone the shared one).
-        let make_base =
-            || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
-
-        // Group into base-nodes per base_fan_group_sizes and prove each.
-        let sizes = base_fan_group_sizes(n_bases, b);
-        let mut base_nodes: Vec<TreeProof> = Vec::new();
-        let mut all_base_outputs: Vec<BaseOutput> = Vec::new();
-        let mut base_node_roots = Vec::new();
-        let mut made = 0usize;
-        for &m in &sizes {
-            let group: Vec<(Proof<QM31>, GateAirLeafParams)> =
-                (0..m).map(|_| make_base()).collect();
-            made += m;
-            let (bn, outs) = prove_base_node(group, &config);
-            base_node_roots.push(bn.preprocessed_root.clone());
-            base_nodes.push(bn);
-            all_base_outputs.extend(outs);
-        }
-        assert_eq!(made, n_bases);
-        assert_eq!(all_base_outputs.len(), n_bases);
-        assert_eq!(base_node_roots.len(), sizes.len());
-
-        // Fold the base-nodes. In single-base-node mode there is exactly one, so this is a no-op fold
-        // (that base-node IS the root); otherwise it builds the R2 up-tree fold. ONE pool caps RAM.
-        let cores = std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(2);
-        let pools = PoolSet::new(1, cores.max(1));
-        let out = recursive_aggregate_prove(base_nodes, &config.agg, &pre, &pools);
-
-        // Root verification: unpack from the bases (no zk-blinding in the test).
-        let bottom = BaseFanBottom {
-            bases: all_base_outputs,
-            b,
-            base_node_roots,
-        };
-        let rv = prove_root_verification(&out.root, &bottom, &config.agg, log_blowup_factor, None);
-        assert_eq!(
-            rv.leaf_outputs.len(),
-            n_bases,
-            "root exposes one H_i per base"
-        );
-
-        // TRUSTED FINAL VERIFY (step 3): check `rv` against a canonical unpacker circuit recomputed
-        // from trusted public `(n, config)` — canonical base-node roots (arity-derived), canonical
-        // unpacker root (pins every baked child root incl. the canonical base tree0 root), and the
-        // caller-committed `rv.leaf_outputs`. `None` blinding matches the unblinded test proof above.
-        verify_gate_air_root(&rv, &config, n_bases, log_blowup_factor, None)
-            .expect("trusted gate_air root verification failed (roundtrip)");
-
-        eprintln!(
-            "gate-air: base_fanning roundtrip OK (b={b}, N={n_bases}, single_base_node={single_base_node}, groups={sizes:?}, n_levels={}, root trace 2^{}) [trusted verify OK]",
-            out.n_levels, rv.trace_log_size
-        );
-    }
-
-    /// The LEAF/R1/R2 (`FoldMode::LeafR1R2`) prove→fold→verify→self-verify roundtrip over `n_leaves`
-    /// standalone gate_air leaves, using the toy per-base PCS from `prove_tiny_base`. Mirrors
-    /// `base_fanning_roundtrip` but for the leaf topology: one leaf per base (`prove_gate_air_leaf`),
+    /// The LEAF/R1/R2 prove→fold→verify→self-verify roundtrip over `n_leaves`
+    /// standalone gate_air leaves, using the toy per-base PCS from `prove_tiny_base`: one leaf per base
+    /// (`prove_gate_air_leaf`),
     /// a level-0 leaf-verifying (R1) layer + shared R2 up-tree fold (`recursive_aggregate_prove_leaves`),
     /// and the leaf unpacker (`prove_root_verification_leaves` / `LeafBottom`). `n_leaves == 1` is a
     /// lone-leaf root (no R1, no R2 — laptop-safe); `n_leaves >= 2` builds the level-0 R1 layer (and, at
