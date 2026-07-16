@@ -36,9 +36,9 @@
 //!
 //! THREAD-PER-EXECUTION (survives via a closed-form ts).
 //! -----------------------------------------------------
-//! `ts` is a CLOSED FORM in the pc: for an access to addr `a` in rep `r` at gate `g`, the pc is
-//! `pc = r*n_gates + g` and `ts = pc*TS_STRIDE + slot` (slot from the access role). This depends only
-//! on (r, g, slot) — NOT on any running per-address counter — so the thread-per-EXECUTION split holds:
+//! `ts` is a CLOSED FORM in the pc: for an access in rep `r` at gate `g`, the pc is
+//! `pc = r*n_gates + g` and `ts = pc + 1` (shared by all accesses of the step). This depends only
+//! on (r, g) — NOT on any running per-address counter — so the thread-per-EXECUTION split holds:
 //!   * `prog_slot_meta` — one-thread prepass: per gate-slot the program constant `prev_gate` = the
 //!     gate index of the PREVIOUS access to this addr within one pass (or a sentinel if none), so K1
 //!     can compute `prev_ts` (the predecessor's closed-form ts) without a serial history. See the
@@ -46,8 +46,8 @@
 //!   * K0 `gate_sim_states` — thread-per-SHOT, VALUE-ONLY: snapshots the 512-qubit state (32 limbs)
 //!     at every (shot, rep) boundary (linear-in-k value chain). Seeds K1's per-execution value chain.
 //!   * K1 `gate_sim` — thread-per-EXECUTION: thread `(shot, rep)` loads its rep-boundary state, walks
-//!     the rep's n_gates gates for v_before/v_after, and fills ts (closed form) + prev_ts + the two
-//!     rc limbs, and bumps the rc histogram.
+//!     the rep's n_gates gates for v_before/v_after, and fills prev_ts + the single rc diff `d`
+//!     (ts = pc + 1 is closed-form, not emitted), and bumps the rc histogram.
 //! Parallelism is n_shots·k. Row(shot,rep,g) = (shot*k+rep)*n_gates+g is the same contiguous per-shot
 //! block; only how ts/prev_ts/rc are produced changed.
 //!
@@ -357,7 +357,6 @@ pub const GATE_SIM_KERNEL: &str = r#"
 #define OP_NOT 1u
 #define OP_CNOT 2u
 #define OP_TOFFOLI 3u
-#define TS_STRIDE 3u
 #define SLOT_CTRL_A 1u
 #define SLOT_CTRL_B 2u
 #define SLOT_TARGET 3u
@@ -549,8 +548,9 @@ extern "C" __global__ void gate_sim_states(
 
 // K1: THREAD-PER-EXECUTION. One thread per (shot, rep). exec = shot*k + rep. Seeds a local 512-state
 // from K0's rep-boundary snapshot (so this execution starts exactly where simulate_shot was entering
-// rep `rep`), processes the rep's n_gates gates for v_before/v_after, and fills ts (closed form
-// pc*TS_STRIDE+slot), prev_ts (from slot_meta's cyclic-predecessor constants), and the two rc limbs.
+// rep `rep`), processes the rep's n_gates gates for v_before/v_after, and fills prev_ts (from
+// slot_meta's cyclic-predecessor constants) and the per-access rc value `d`. ts is the closed form
+// `pc + 1` (shared by all accesses of a step, not emitted); `d = ts - prev_ts - 1 = pc - prev_ts`.
 // `off_lo` is repurposed to carry rep_states and `off_hi` to carry slot_meta (both formerly-unused arg
 // slots — keeps the launch tuple at 8 pointers + 4 scalars, cudarc's cap). `qdecode` stays UNUSED;
 // `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM over `d` (atomic bumps); `rc_hi` INERT.
@@ -674,8 +674,7 @@ extern "C" __global__ void gate_sim(
 // Padding rows [real_rows, padded_rows) match `Row::padding()` = ALL ZERO (AccessCols::inactive()
 // is addr=ts=prev_ts=v=0; is_* = 0; ab=fire=delta=0). `cols` is pre-zeroed by the caller, so there
 // is nothing to write. Kept as a no-op stub so the Rust launch glue (get_func "fill_padding") and
-// its shard-loop call site do not need to change. (Old encoding wrote mask=1 on 3 columns; the new
-// AccessCols::inactive() has no such non-zero field.)
+// its shard-loop call site do not need to change.
 extern "C" __global__ void fill_padding(
     unsigned* __restrict__ cols,
     unsigned long padded_rows,
@@ -699,7 +698,7 @@ pub const TRACE_COLUMNS: usize = 19;
 /// NOTE (padding): real rows [0, n_shots*k*n_gates) are written by the kernel; padding rows stay
 /// zero here — the caller must set the 3 read-block `mask` columns = 1 for padding rows to match
 /// `Row::padding` (TODO; the byte-identity test compares real rows + histograms first).
-#[cfg(feature = "gpu-cuda")]
+#[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn gpu_gen_main_trace(
     gates_flat: &[u32],
     x_states: &[u32],
@@ -782,7 +781,7 @@ pub fn gpu_gen_main_trace(
         .map_err(|e| format!("launch gate_sim: {e}"))?;
     }
 
-    // Populate padding rows (mask columns = 1) to match Row::padding().
+    // Padding rows match Row::padding() = all-zero; `cols` is pre-zeroed, so fill_padding is a no-op.
     let real_rows = (n_shots as u64) * (k as u64) * (n_gates as u64);
     let n_pad = (padded_rows as u64).saturating_sub(real_rows);
     if n_pad > 0 {
@@ -1178,7 +1177,7 @@ extern "C" __global__ void logup_col_gen(
 // K4b: value = num · denom^{-1}; running sum onto previous logup column.
 // `inter` holds the N_INTERACTION_COLS (20) interaction columns, column-major (logup col k coord j = (k*4+j)).
 extern "C" __global__ void logup_finalize_col(
-    unsigned rep_index,
+    unsigned col_k,
     unsigned long padded_rows,
     const unsigned* __restrict__ num,
     const unsigned* __restrict__ denom,
@@ -1190,15 +1189,15 @@ extern "C" __global__ void logup_finalize_col(
     qm31 den  = { { denom[row*4+0], denom[row*4+1] }, { denom[row*4+2], denom[row*4+3] } };
     qm31 value = qm31_mul(nume, qm31_inv(den));
     qm31 prev = { {0u,0u}, {0u,0u} };
-    if (rep_index > 0u) {
-        unsigned long b = (unsigned long)(rep_index - 1u) * 4u;
+    if (col_k > 0u) {
+        unsigned long b = (unsigned long)(col_k - 1u) * 4u;
         prev.a.a = inter[(b+0)*padded_rows+row];
         prev.a.b = inter[(b+1)*padded_rows+row];
         prev.b.a = inter[(b+2)*padded_rows+row];
         prev.b.b = inter[(b+3)*padded_rows+row];
     }
     qm31 acc = qm31_add(value, prev);
-    unsigned long b = (unsigned long)rep_index * 4u;
+    unsigned long b = (unsigned long)col_k * 4u;
     inter[(b+0)*padded_rows+row] = acc.a.a;
     inter[(b+1)*padded_rows+row] = acc.a.b;
     inter[(b+2)*padded_rows+row] = acc.b.a;
@@ -1329,8 +1328,7 @@ extern "C" __global__ void ps_add_offsets(unsigned* out, const unsigned* scanned
 /// TRACE_COLUMNS × padded_rows), the drawn `z` and `alpha_powers` (each QM31 → 4 M31, length
 /// GATE_REL_WIDTH), and dims. Returns (interaction_cols [N_INTERACTION_COLS × padded_rows,
 /// column-major], claimed_sum [4 M31]).
-#[cfg(feature = "gpu-cuda")]
-#[allow(clippy::too_many_arguments)]
+#[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gen_interaction(
     cols: &[u32],
@@ -1965,7 +1963,7 @@ pub fn gpu_gen_main_trace_device_d(
         .map_err(|e| format!("launch gate_sim: {e}"))?;
     }
 
-    // Populate padding rows (mask columns = 1) to match Row::padding().
+    // Padding rows match Row::padding() = all-zero; `cols` is pre-zeroed, so fill_padding is a no-op.
     let real_rows = (n_shots as u64) * (k as u64) * (n_gates as u64);
     let n_pad = (padded_rows as u64).saturating_sub(real_rows);
     if n_pad > 0 {
@@ -2039,7 +2037,7 @@ impl MainTrace {
 }
 
 /// Device-resident K4: run `gpu_gen_interaction`'s pipeline using the REAL drawn
-/// `LookupElements` (z/alpha recovered via `extract_z_alpha`) and return the 24
+/// `LookupElements` (z/alpha recovered via `extract_z_alpha`) and return the 20
 /// interaction columns as `CircleEvaluation<CudaBackend>` (device-resident, no host
 /// upload) plus the `claimed_sum` (mixed into the channel in main.rs exactly as the
 /// CPU `gen_main_interaction` sum was).
@@ -2216,7 +2214,7 @@ pub fn gpu_gen_interaction_device(
 
     dev.synchronize().map_err(|e| format!("sync (K4): {e}"))?;
 
-    // Device-to-device handoff: 28 interaction columns straight to CudaBackend.
+    // Device-to-device handoff: 20 interaction columns straight to CudaBackend.
     let domain = CanonicCoset::new(log_n_rows).circle_domain();
     let cols: Vec<_> = (0..N_INTERACTION_COLS)
         .map(|c| d2d_column(&d_inter, c * padded_rows, padded_rows, domain))

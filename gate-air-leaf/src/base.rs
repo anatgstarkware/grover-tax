@@ -1043,9 +1043,8 @@ pub(crate) type BaseShardOutput = (
 
 // Per-shard base proof: same trace-gen + commit + prove_ex pipeline as the single proof, but over
 // this shard's shots. Returns the distinct ExtendedStarkProof plus the claim / nonce / log_n_rows the
-// leaf needs. Extracted verbatim from the former `prove_base_shard` closure in `main.rs`; the closure
-// captures (`gates`, `k`, `n_gates`, `topo`, `rc_lo_index`) are now explicit params. `rc_lo_index` is
-// used only under `#[cfg(feature = "cuda")]`, hence the unused-variable allowance on the CPU build.
+// leaf needs. `rc_lo_index` is used only under `#[cfg(feature = "cuda")]`, hence the unused-variable
+// allowance on the CPU build.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub(crate) fn prove_base_shard(
@@ -1057,358 +1056,357 @@ pub(crate) fn prove_base_shard(
     topo: &recursive_aggregate::TopologyConfig,
     rc_lo_index: &RcIndex,
 ) -> Result<BaseShardOutput> {
-            let shard_samples = shard_cases.len();
-            let (rows, boundary) = build_rows(gates, shard_cases, k)?;
-            let real_rows = rows.len();
-            let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
-            let log_n_rows = padded_rows.ilog2();
-            // Dynamic rc-table log-size = ceil(log2(k*n_gates)); <= log_n_rows (never raises the floor).
-            let rc_log = rc_log_size(k * gates.len());
-            let max_log_size = tree0_max_log_size(
+    let shard_samples = shard_cases.len();
+    let (rows, boundary) = build_rows(gates, shard_cases, k)?;
+    let real_rows = rows.len();
+    let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
+    let log_n_rows = padded_rows.ilog2();
+    // Dynamic rc-table log-size = ceil(log2(k*n_gates)); <= log_n_rows (never raises the floor).
+    let rc_log = rc_log_size(k * gates.len());
+    let max_log_size = tree0_max_log_size(
+        log_n_rows,
+        rc_log,
+        program_log_size(gates.len()),
+        boundary.log_size,
+    );
+    let base_blowup: u32 = topo.base_log_blowup;
+    let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
+
+    // Twiddles: shared by reference from the precompute, else built fresh per shard.
+    let owned_twiddles = if precompute.is_none() {
+        Some(ProverBackend::precompute_twiddles(
+            CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        ))
+    } else {
+        None
+    };
+    // MULTI-GPU: the device-resident precompute parts (twiddles/tree0/N3) for THIS thread's
+    // device. On device 0 these are the eager fields (byte-identical to before); on device
+    // n != 0 they are the lazily-built per-device replica. `None` (no-precompute fallback)
+    // leaves `dp` None and uses `owned_twiddles` / the per-shard rebuild, unchanged.
+    #[cfg(feature = "cuda")]
+    let dp = precompute.map(|pc| pc.device_parts());
+    #[cfg(feature = "cuda")]
+    let twiddles = match &dp {
+        Some(dp) => dp.twiddles,
+        None => owned_twiddles.as_ref().unwrap(),
+    };
+    #[cfg(not(feature = "cuda"))]
+    let twiddles = match precompute {
+        Some(pc) => &pc.twiddles,
+        None => owned_twiddles.as_ref().unwrap(),
+    };
+    // N1 program table: shared from the precompute (constant multiplicity across shards), else
+    // rebuilt. `shard_samples == shots_per_shard` for every shard, so the multiplicity matches.
+    let owned_program = if precompute.is_none() {
+        Some(build_program_table(gates, shard_samples, k))
+    } else {
+        None
+    };
+    let program: &ProgramTable = match precompute {
+        Some(pc) => &pc.program,
+        None => owned_program.as_ref().unwrap(),
+    };
+
+    let prover_channel = &mut Blake2sM31Channel::default();
+    let channel_salt = 0u32;
+    prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
+    config.mix_into(prover_channel);
+    let mut commitment_scheme = CommitmentSchemeProver::<
+        ProverBackend,
+        Blake2sM31MerkleChannel,
+    >::new(config, twiddles);
+
+    // Tree 0: reuse the precomputed commitment (re-mix the SAME root into THIS shard's
+    // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way. Under
+    // multi-GPU the reused tree0 is THIS device's replica (`dp.tree0`); its root is identical
+    // to device 0's (shard-invariant), so the transcript mix is unchanged.
+    #[cfg(feature = "cuda")]
+    match &dp {
+        Some(dp) => {
+            commitment_scheme.commit_tree(MaybeOwned::Borrowed(dp.tree0), prover_channel);
+        }
+        None => {
+            let pp = build_tree0_columns(
+                program,
+                &rows,
+                padded_rows,
                 log_n_rows,
+                n_gates,
                 rc_log,
-                program_log_size(gates.len()),
-                boundary.log_size,
+                &boundary,
             );
-            let base_blowup: u32 = topo.base_log_blowup;
-            let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
-
-            // Twiddles: shared by reference from the precompute, else built fresh per shard.
-            let owned_twiddles = if precompute.is_none() {
-                Some(ProverBackend::precompute_twiddles(
-                    CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
-                        .circle_domain()
-                        .half_coset,
-                ))
-            } else {
-                None
-            };
-            // MULTI-GPU: the device-resident precompute parts (twiddles/tree0/N3) for THIS thread's
-            // device. On device 0 these are the eager fields (byte-identical to before); on device
-            // n != 0 they are the lazily-built per-device replica. `None` (no-precompute fallback)
-            // leaves `dp` None and uses `owned_twiddles` / the per-shard rebuild, unchanged.
-            #[cfg(feature = "cuda")]
-            let dp = precompute.map(|pc| pc.device_parts());
-            #[cfg(feature = "cuda")]
-            let twiddles = match &dp {
-                Some(dp) => dp.twiddles,
-                None => owned_twiddles.as_ref().unwrap(),
-            };
-            #[cfg(not(feature = "cuda"))]
-            let twiddles = match precompute {
-                Some(pc) => &pc.twiddles,
-                None => owned_twiddles.as_ref().unwrap(),
-            };
-            // N1 program table: shared from the precompute (constant multiplicity across shards), else
-            // rebuilt. `shard_samples == shots_per_shard` for every shard, so the multiplicity matches.
-            let owned_program = if precompute.is_none() {
-                Some(build_program_table(gates, shard_samples, k))
-            } else {
-                None
-            };
-            let program: &ProgramTable = match precompute {
-                Some(pc) => &pc.program,
-                None => owned_program.as_ref().unwrap(),
-            };
-
-            let prover_channel = &mut Blake2sM31Channel::default();
-            let channel_salt = 0u32;
-            prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
-            config.mix_into(prover_channel);
-            let mut commitment_scheme = CommitmentSchemeProver::<
-                ProverBackend,
-                Blake2sM31MerkleChannel,
-            >::new(config, twiddles);
-            // commitment_scheme.set_store_polynomials_coefficients();  // disabled: barycentric OODS path
-
-            // Tree 0: reuse the precomputed commitment (re-mix the SAME root into THIS shard's
-            // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way. Under
-            // multi-GPU the reused tree0 is THIS device's replica (`dp.tree0`); its root is identical
-            // to device 0's (shard-invariant), so the transcript mix is unchanged.
-            #[cfg(feature = "cuda")]
-            match &dp {
-                Some(dp) => {
-                    commitment_scheme.commit_tree(MaybeOwned::Borrowed(dp.tree0), prover_channel);
-                }
-                None => {
-                    let pp = build_tree0_columns(
-                        program,
-                        &rows,
-                        padded_rows,
-                        log_n_rows,
-                        n_gates,
-                        rc_log,
-                        &boundary,
-                    );
-                    let mut tree_builder = commitment_scheme.tree_builder();
-                    tree_builder.extend_evals(to_prover(pp));
-                    tree_builder.commit(prover_channel);
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            match precompute {
-                Some(pc) => {
-                    commitment_scheme.commit_tree(MaybeOwned::Borrowed(&pc.tree0), prover_channel);
-                }
-                None => {
-                    // Old path: build the (size-sorted) preprocessed columns, then interpolate + LDE +
-                    // Merkle-commit them inline (the shard-invariant work this precompute eliminates).
-                    let pp = build_tree0_columns(
-                        program,
-                        &rows,
-                        padded_rows,
-                        log_n_rows,
-                        n_gates,
-                        rc_log,
-                        &boundary,
-                    );
-                    let mut tree_builder = commitment_scheme.tree_builder();
-                    tree_builder.extend_evals(to_prover(pp));
-                    tree_builder.commit(prover_channel);
-                }
-            }
-
-            let public_claim = pack_public_claim(&[]);
-            prover_channel.mix_felts(&public_claim);
-
-            #[cfg(feature = "cuda")]
-            let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
-
-            // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
-            let rc_table = build_rc_table(&rows, rc_log);
-
-            // Tree 1: main trace + program witness + boundary witness + rc multiplicity.
-            let small_main = {
-                let mut v = generate_program_witness(program);
-                v.extend(generate_boundary_witness(&boundary));
-                v.extend(generate_rc_witness(&rc_table));
-                v
-            };
             let mut tree_builder = commitment_scheme.tree_builder();
-            // Holds K1's column-major main-trace device buffer so K4 (interaction) can
-            // reuse it instead of re-running K0/K1. `None` on the CPU path.
-            #[cfg(feature = "cuda")]
-            let mut d_main_cols: Option<cudarc::driver::CudaSlice<u32>> = None;
-            #[cfg(feature = "cuda")]
-            if gpu_tracegen {
-                // N3: gate list + RcIndex offsets are shard-invariant. On the reuse path they are
-                // already device-resident in the precompute (uploaded once); only this shard's
-                // `x_states` is uploaded here. On the fallback path they're uploaded per shard.
-                let mut x_states = Vec::with_capacity(shard_cases.len() * N_LIMBS);
-                for c in shard_cases {
-                    let bytes =
-                        hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
-                    x_states.extend_from_slice(&state_to_limbs(&bytes));
-                }
-                let (main_dev, _qd, _lo, _hi, d_cols) = match &dp {
-                    // Multi-GPU: use THIS device's N3 buffers (device 0's eager d_*, or the per-device
-                    // replica) — feeding device-0 buffers to a device-n kernel would be an illegal
-                    // cross-device access.
-                    Some(dp) => gpu_tracegen::gpu_gen_main_trace_device_d(
-                        dp.d_gates,
-                        &x_states,
-                        dp.d_off_lo,
-                        dp.d_off_hi,
-                        k as u32,
-                        n_gates as u32,
-                        shard_samples as u32,
-                        padded_rows,
-                        log_n_rows,
-                    ),
-                    None => {
-                        let (gates_flat, _x, off_lo, off_hi) =
-                            gpu_flat_inputs(gates, shard_cases, rc_lo_index, rc_lo_index)?;
-                        gpu_tracegen::gpu_gen_main_trace_device(
-                            &gates_flat,
-                            &x_states,
-                            &off_lo,
-                            &off_hi,
-                            k as u32,
-                            n_gates as u32,
-                            shard_samples as u32,
-                            padded_rows,
-                            log_n_rows,
-                        )
-                    }
-                }
-                .map_err(|e| anyhow::anyhow!(e))?;
-                let mut main_dev = main_dev;
-                main_dev.extend(to_prover(small_main));
-                tree_builder.extend_evals(main_dev);
-                d_main_cols = Some(d_cols);
-            } else {
-                let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
-                main_trace.extend(small_main);
-                tree_builder.extend_evals(to_prover(main_trace));
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
-                main_trace.extend(small_main);
-                tree_builder.extend_evals(to_prover(main_trace));
-            }
+            tree_builder.extend_evals(to_prover(pp));
             tree_builder.commit(prover_channel);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    match precompute {
+        Some(pc) => {
+            commitment_scheme.commit_tree(MaybeOwned::Borrowed(&pc.tree0), prover_channel);
+        }
+        None => {
+            // Old path: build the (size-sorted) preprocessed columns, then interpolate + LDE +
+            // Merkle-commit them inline (the shard-invariant work this precompute eliminates).
+            let pp = build_tree0_columns(
+                program,
+                &rows,
+                padded_rows,
+                log_n_rows,
+                n_gates,
+                rc_log,
+                &boundary,
+            );
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals(to_prover(pp));
+            tree_builder.commit(prover_channel);
+        }
+    }
 
-            // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
-            // See `MainTrace::from_k1`.
-            #[cfg(feature = "cuda")]
-            let mut main_k1: Option<gpu_tracegen::MainTrace> = match d_main_cols.take() {
-                Some(d_cols) => {
-                    Some(gpu_tracegen::MainTrace::from_k1(d_cols).map_err(|e| anyhow::anyhow!(e))?)
-                }
-                None => None,
-            };
+    let public_claim = pack_public_claim(&[]);
+    prover_channel.mix_felts(&public_claim);
 
-            let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
-            prover_channel.mix_u64(interaction_pow_nonce);
-            let elements = LookupElements::draw(prover_channel);
+    #[cfg(feature = "cuda")]
+    let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
 
-            #[cfg(feature = "cuda")]
-            {
-                gate_air_cuda_kernel::register();
-                let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
-                gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
-            }
+    // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
+    let rc_table = build_rc_table(&rows, rc_log);
 
-            // Interaction traces.
-            #[cfg(feature = "cuda")]
-            let main_interaction_device = if gpu_tracegen {
-                let main = main_k1
-                    .as_ref()
-                    .expect("K1 main-trace buffer must exist on the GPU path");
-                let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
-                    main,
+    // Tree 1: main trace + program witness + boundary witness + rc multiplicity.
+    let small_main = {
+        let mut v = generate_program_witness(program);
+        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_rc_witness(&rc_table));
+        v
+    };
+    let mut tree_builder = commitment_scheme.tree_builder();
+    // Holds K1's column-major main-trace device buffer so K4 (interaction) can
+    // reuse it instead of re-running K0/K1. `None` on the CPU path.
+    #[cfg(feature = "cuda")]
+    let mut d_main_cols: Option<cudarc::driver::CudaSlice<u32>> = None;
+    #[cfg(feature = "cuda")]
+    if gpu_tracegen {
+        // N3: gate list + RcIndex offsets are shard-invariant. On the reuse path they are
+        // already device-resident in the precompute (uploaded once); only this shard's
+        // `x_states` is uploaded here. On the fallback path they're uploaded per shard.
+        let mut x_states = Vec::with_capacity(shard_cases.len() * N_LIMBS);
+        for c in shard_cases {
+            let bytes =
+                hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
+            x_states.extend_from_slice(&state_to_limbs(&bytes));
+        }
+        let (main_dev, _qd, _lo, _hi, d_cols) = match &dp {
+            // Multi-GPU: use THIS device's N3 buffers (device 0's eager d_*, or the per-device
+            // replica) — feeding device-0 buffers to a device-n kernel would be an illegal
+            // cross-device access.
+            Some(dp) => gpu_tracegen::gpu_gen_main_trace_device_d(
+                dp.d_gates,
+                &x_states,
+                dp.d_off_lo,
+                dp.d_off_hi,
+                k as u32,
+                n_gates as u32,
+                shard_samples as u32,
+                padded_rows,
+                log_n_rows,
+            ),
+            None => {
+                let (gates_flat, _x, off_lo, off_hi) =
+                    gpu_flat_inputs(gates, shard_cases, rc_lo_index, rc_lo_index)?;
+                gpu_tracegen::gpu_gen_main_trace_device(
+                    &gates_flat,
+                    &x_states,
+                    &off_lo,
+                    &off_hi,
+                    k as u32,
                     n_gates as u32,
+                    shard_samples as u32,
                     padded_rows,
                     log_n_rows,
-                    real_rows as u64,
-                    (k * n_gates) as u64,
-                    &elements,
                 )
-                .map_err(|e| anyhow::anyhow!(e))?;
-                Some((cols, claimed))
-            } else {
-                None
-            };
-            // K4 done: FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before tree2), not at
-            // end-of-shard, and synchronize so tree2's pool can reserve it. `free_after_k4` consumes
-            // the buffer explicitly.
-            #[cfg(feature = "cuda")]
-            if let Some(m) = main_k1.take() {
-                m.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
             }
-            #[cfg(feature = "cuda")]
-            let (main_interaction, main_sum) = if let Some((_, claimed)) = &main_interaction_device
-            {
-                (Vec::new(), *claimed)
-            } else {
-                gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements)
-            };
-            #[cfg(not(feature = "cuda"))]
-            let (main_interaction, main_sum) =
-                gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-            // H_P binding (Fork A): program supply now carries an internal (-mult, TAG_PROGRAM) AND a
-            // public (+mult, TAG_PROGRAM_PUB) term, paired into one batch => still 4 interaction cols.
-            let (program_interaction, program_sum) =
-                gen_program_interaction(program, &elements.program);
-            let (boundary_interaction, boundary_sum) =
-                gen_boundary_interaction(&boundary, &elements.qubitmem);
-            // rc supply: -multiplicity / combine(TAG_RC, val).
-            let (rc_interaction, rc_sum) = {
-                let el = elements.rc.clone();
-                gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
-                    el.combine(&[ptag(TAG_RC), pack_seq(&rc_table.val, vec_row)])
-                })
-            };
+        }
+        .map_err(|e| anyhow::anyhow!(e))?;
+        let mut main_dev = main_dev;
+        main_dev.extend(to_prover(small_main));
+        tree_builder.extend_evals(main_dev);
+        d_main_cols = Some(d_cols);
+    } else {
+        let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+        main_trace.extend(small_main);
+        tree_builder.extend_evals(to_prover(main_trace));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
+        main_trace.extend(small_main);
+        tree_builder.extend_evals(to_prover(main_trace));
+    }
+    tree_builder.commit(prover_channel);
 
-            // Phase-3 x/y binding + H_P program binding (Fork A): the base is NOT internally balanced.
-            //   - boundary re-keys y to TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]);
-            //   - program supply adds a public P_pub = Σ mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
-            //     (its internal -mult/TAG_PROGRAM term cancels main's program demand).
-            // So the base's claimed sums net to B + P_pub (not 0). The leaf's public_logup_sum supplies
-            // −B (over guessed x/y) AND −P_pub (over guessed program Vars), so the verifier balance
-            // forces guessed x/y == committed AND guessed program == committed. rc demand (main) and rc
-            // supply (rc_sum) cancel, contributing 0. (stwo's native verify does NOT require
-            // Σ claimed_sums == 0; this is a prover self-check.)
-            // Prover self-check (DEBUG-ONLY, compiled out in --release): the base's claimed LogUp sums
-            // must net to the public terms B + P_pub. Pure tripwire — `b_public`/`p_pub` feed nothing
-            // downstream (only `claimed_sums` below is mixed), so gating changes no committed value
-            // (release byte-identical). Per-shard cost (two small-table scans) is thus paid only in
-            // debug. CI coverage: `tests::shard_claimed_sums_net_to_public` (CPU/Simd fixture); this
-            // runtime check additionally guards each run's real secret shot data in debug builds.
-            #[cfg(debug_assertions)]
-            {
-                let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-                let p_pub = program_public_term(program, &elements.program);
-                if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
-                    bail!("shard claimed sums do not net to the public terms B + P_pub");
-                }
-            }
+    // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
+    // See `MainTrace::from_k1`.
+    #[cfg(feature = "cuda")]
+    let mut main_k1: Option<gpu_tracegen::MainTrace> = match d_main_cols.take() {
+        Some(d_cols) => {
+            Some(gpu_tracegen::MainTrace::from_k1(d_cols).map_err(|e| anyhow::anyhow!(e))?)
+        }
+        None => None,
+    };
 
-            let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
-            prover_channel.mix_felts(&claimed_sums);
+    let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
+    prover_channel.mix_u64(interaction_pow_nonce);
+    let elements = LookupElements::draw(prover_channel);
 
-            // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
-            let small_interaction = {
-                let mut v = program_interaction;
-                v.extend(boundary_interaction);
-                v.extend(rc_interaction);
-                v
-            };
-            let mut tree_builder = commitment_scheme.tree_builder();
-            #[cfg(feature = "cuda")]
-            if let Some((main_dev, _)) = main_interaction_device {
-                let mut interaction = main_dev;
-                interaction.extend(to_prover(small_interaction));
-                tree_builder.extend_evals(interaction);
-            } else {
-                let mut interaction = main_interaction;
-                interaction.extend(small_interaction);
-                tree_builder.extend_evals(to_prover(interaction));
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let mut interaction = main_interaction;
-                interaction.extend(small_interaction);
-                tree_builder.extend_evals(to_prover(interaction));
-            }
-            tree_builder.commit(prover_channel);
+    #[cfg(feature = "cuda")]
+    {
+        gate_air_cuda_kernel::register();
+        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+        gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
+    }
 
-            let components = build_components(
-                log_n_rows,
-                program.log_size,
-                boundary.log_size,
-                rc_log,
-                &elements,
-                main_sum,
-                program_sum,
-                boundary_sum,
-                rc_sum,
-            );
-            let prover_refs = components.prover_refs();
-            let extended = prove_ex::<ProverBackend, Blake2sM31MerkleChannel>(
-                &prover_refs,
-                prover_channel,
-                commitment_scheme,
-                false,
-            )?;
+    // Interaction traces.
+    #[cfg(feature = "cuda")]
+    let main_interaction_device = if gpu_tracegen {
+        let main = main_k1
+            .as_ref()
+            .expect("K1 main-trace buffer must exist on the GPU path");
+        let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
+            main,
+            n_gates as u32,
+            padded_rows,
+            log_n_rows,
+            real_rows as u64,
+            (k * n_gates) as u64,
+            &elements,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        Some((cols, claimed))
+    } else {
+        None
+    };
+    // K4 done: FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before tree2), not at
+    // end-of-shard, and synchronize so tree2's pool can reserve it. `free_after_k4` consumes
+    // the buffer explicitly.
+    #[cfg(feature = "cuda")]
+    if let Some(m) = main_k1.take() {
+        m.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
+    }
+    #[cfg(feature = "cuda")]
+    let (main_interaction, main_sum) = if let Some((_, claimed)) = &main_interaction_device
+    {
+        (Vec::new(), *claimed)
+    } else {
+        gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let (main_interaction, main_sum) =
+        gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
+    // H_P binding (Fork A): program supply now carries an internal (-mult, TAG_PROGRAM) AND a
+    // public (+mult, TAG_PROGRAM_PUB) term, paired into one batch => still 4 interaction cols.
+    let (program_interaction, program_sum) =
+        gen_program_interaction(program, &elements.program);
+    let (boundary_interaction, boundary_sum) =
+        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    // rc supply: -multiplicity / combine(TAG_RC, val).
+    let (rc_interaction, rc_sum) = {
+        let el = elements.rc.clone();
+        gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
+            el.combine(&[ptag(TAG_RC), pack_seq(&rc_table.val, vec_row)])
+        })
+    };
 
-            // Per-shard boundary (x->y per shard shot) for the leaf's GateAirStatement + output hash.
-            let mut shard_boundary = Vec::with_capacity(shard_cases.len());
-            for case in shard_cases {
-                let x = state_to_limbs(&hex::decode(&case.x_hex)?);
-                let y = state_to_limbs(&hex::decode(&case.y_hex)?);
-                shard_boundary.push((x, y));
-            }
-            let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
-            Ok((
-                extended,
-                claim,
-                interaction_pow_nonce,
-                channel_salt,
-                log_n_rows,
-                program.log_size,
-                shard_boundary,
-                (n_gates * k) as u32,
-            ))
+    // Phase-3 x/y binding + H_P program binding (Fork A): the base is NOT internally balanced.
+    //   - boundary re-keys y to TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]);
+    //   - program supply adds a public P_pub = Σ mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
+    //     (its internal -mult/TAG_PROGRAM term cancels main's program demand).
+    // So the base's claimed sums net to B + P_pub (not 0). The leaf's public_logup_sum supplies
+    // −B (over guessed x/y) AND −P_pub (over guessed program Vars), so the verifier balance
+    // forces guessed x/y == committed AND guessed program == committed. rc demand (main) and rc
+    // supply (rc_sum) cancel, contributing 0. (stwo's native verify does NOT require
+    // Σ claimed_sums == 0; this is a prover self-check.)
+    // Prover self-check (DEBUG-ONLY, compiled out in --release): the base's claimed LogUp sums
+    // must net to the public terms B + P_pub. Pure tripwire — `b_public`/`p_pub` feed nothing
+    // downstream (only `claimed_sums` below is mixed), so gating changes no committed value
+    // (release byte-identical). Per-shard cost (two small-table scans) is thus paid only in
+    // debug. CI coverage: `tests::shard_claimed_sums_net_to_public` (CPU/Simd fixture); this
+    // runtime check additionally guards each run's real secret shot data in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+        let p_pub = program_public_term(program, &elements.program);
+        if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+            bail!("shard claimed sums do not net to the public terms B + P_pub");
+        }
+    }
+
+    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    prover_channel.mix_felts(&claimed_sums);
+
+    // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
+    let small_interaction = {
+        let mut v = program_interaction;
+        v.extend(boundary_interaction);
+        v.extend(rc_interaction);
+        v
+    };
+    let mut tree_builder = commitment_scheme.tree_builder();
+    #[cfg(feature = "cuda")]
+    if let Some((main_dev, _)) = main_interaction_device {
+        let mut interaction = main_dev;
+        interaction.extend(to_prover(small_interaction));
+        tree_builder.extend_evals(interaction);
+    } else {
+        let mut interaction = main_interaction;
+        interaction.extend(small_interaction);
+        tree_builder.extend_evals(to_prover(interaction));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let mut interaction = main_interaction;
+        interaction.extend(small_interaction);
+        tree_builder.extend_evals(to_prover(interaction));
+    }
+    tree_builder.commit(prover_channel);
+
+    let components = build_components(
+        log_n_rows,
+        program.log_size,
+        boundary.log_size,
+        rc_log,
+        &elements,
+        main_sum,
+        program_sum,
+        boundary_sum,
+        rc_sum,
+    );
+    let prover_refs = components.prover_refs();
+    let extended = prove_ex::<ProverBackend, Blake2sM31MerkleChannel>(
+        &prover_refs,
+        prover_channel,
+        commitment_scheme,
+        false,
+    )?;
+
+    // Per-shard boundary (x->y per shard shot) for the leaf's GateAirStatement + output hash.
+    let mut shard_boundary = Vec::with_capacity(shard_cases.len());
+    for case in shard_cases {
+        let x = state_to_limbs(&hex::decode(&case.x_hex)?);
+        let y = state_to_limbs(&hex::decode(&case.y_hex)?);
+        shard_boundary.push((x, y));
+    }
+    let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    Ok((
+        extended,
+        claim,
+        interaction_pow_nonce,
+        channel_salt,
+        log_n_rows,
+        program.log_size,
+        shard_boundary,
+        (n_gates * k) as u32,
+    ))
 }
