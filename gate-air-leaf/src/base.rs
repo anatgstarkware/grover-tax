@@ -932,8 +932,8 @@ pub(crate) fn assert_tree0_matches_rebuild(pc: &BaseProverPrecompute, rows0: &[R
 }
 /// SOUNDNESS (base pp-root pin, step 1): recompute the CANONICAL base gate_air preprocessed (tree0)
 /// root at BUILD TIME purely from the trusted PUBLIC config — the program table, `k`, `n_gates`,
-/// `shots_per_shard`, the shard-invariant row shape, the boundary layout, `rc_log = rc_log_size(k *
-/// n_gates)`, and the base blowup. The canonical base preprocessed (tree0) root a base proof commits,
+/// `shots_per_shard`, the shard-invariant row shape, the boundary layout, `rc_log = RC_LOG` (the fixed
+/// production rc log-size), and the base blowup. The canonical base preprocessed (tree0) root a base proof commits,
 /// recomputed from the trusted PUBLIC shape so it can be compared against a forgeable proof value.
 ///
 /// It must NOT read `base_extended.proof` (the prover's `commitments[0]` — a forgeable value). tree0
@@ -1061,8 +1061,14 @@ pub(crate) fn prove_base_shard(
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
-    // Dynamic rc-table log-size = ceil(log2(k*n_gates)); <= log_n_rows (never raises the floor).
-    let rc_log = rc_log_size(k * gates.len());
+    // Fixed rc-table log-size = RC_LOG (<= log_n_rows, so it never raises the floor). Prove-entry
+    // tripwire: the fixed [0,2^RC_LOG) table must contain every honest `d = pc - prev_ts`, whose max
+    // is k*n_gates - 1; a run big enough to overflow it (k ≳ 8000) needs a wider rc table.
+    debug_assert!(
+        (k * gates.len()).next_power_of_two().ilog2() <= RC_LOG,
+        "rc: k·n_gates log2 exceeds RC_LOG={RC_LOG}; k≳8000 needs a wider rc table"
+    );
+    let rc_log = RC_LOG;
     let max_log_size = tree0_max_log_size(
         log_n_rows,
         rc_log,

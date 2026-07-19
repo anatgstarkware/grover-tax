@@ -19,8 +19,8 @@
 //!   * rc DIFF: a SINGLE range-check column per access — `d = pc - prev_ts` (25-bit, no limb split).
 //!     Layout is now ACCESS_BLOCK = 4 (addr,prev_ts,v,d), TRACE_COLUMNS = 19 (see `cell_at`/
 //!     `ACCESS_BLOCK` in main.rs).
-//!   * rc HISTOGRAM: a single `2^rc_log` multiplicity histogram over `d` (rc_log = rc_log_size(
-//!     k*n_gates), DYNAMIC per run). Each ACTIVE access bumps `hist[d] += 1` (one bump/access).
+//!   * rc HISTOGRAM: a single `2^RC_LOG` multiplicity histogram over `d` (rc_log = RC_LOG, the FIXED
+//!     production rc log-size). Each ACTIVE access bumps `hist[d] += 1` (one bump/access).
 //!     Emitted into the (formerly unused) `rc_lo` device arg. NOTE: on the
 //!     PRODUCTION path the rc multiplicity WITNESS column is built ON THE HOST from the always-present
 //!     CPU `rows` (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is
@@ -333,9 +333,9 @@ fn launch_k0_states(
 ///   program order, and wrap = 1 iff that predecessor is in the PREVIOUS rep (0 iff the same rep). K1
 ///   turns them into `prev_ts` (the predecessor's closed-form ts, or 0 at the program-wide first access).
 /// - `cols`:    TRACE_COLUMNS * padded_rows, column-major (col c at cols[c*padded_rows + row]), u32
-/// - `rc_hist` (repurposed rc_lo): the 2^rc_log rc-table MULTIPLICITY HISTOGRAM over `d` (K1 atomically
-///   bumps hist[d] once per active access). Caller must zero it and size it to at least `1 << rc_log`
-///   (rc_log = rc_log_size(k*n_gates)). NB: production uses the HOST-built rc multiplicity witness
+/// - `rc_hist` (repurposed rc_lo): the 2^RC_LOG rc-table MULTIPLICITY HISTOGRAM over `d` (K1 atomically
+///   bumps hist[d] once per active access). Caller must zero it and size it to at least `1 << RC_LOG`
+///   (the FIXED production rc log-size). NB: production uses the HOST-built rc multiplicity witness
 ///   (main.rs build_rc_table); this histogram feeds only the k1 diagnostic.
 /// Scalars: k, n_gates, n_shots, padded_rows (shot_rows = k*n_gates computed in-kernel).
 /// NOTE: caller must zero `cols` first; padding rows [n_shots*shot_rows, padded_rows) stay 0
@@ -370,7 +370,7 @@ pub const GATE_SIM_KERNEL: &str = r#"
 //   * ts is PINNED to the preprocessed pc: ts == pc + 1 (AIR constraint). Closed form in (rep, gate) —
 //     no running counter.
 //   * prev_ts < ts is proved by range-checking the single diff `d = ts - prev_ts - 1` looked up as
-//     (TAG_RC, d) into the DYNAMIC rc supply table (d ∈ [0, 2^rc_log_size(k*n_gates))).
+//     (TAG_RC, d) into the FIXED rc supply table (d ∈ [0, 2^RC_LOG)).
 //
 // CLOSED-FORM ts + prev_ts (thread-per-EXECUTION survives): ts is closed form in the pc. prev_ts is
 // the closed-form ts of the PREVIOUS access to the same addr in cyclic program order. `prog_slot_meta`
@@ -712,10 +712,10 @@ pub fn gpu_gen_main_trace(
     let mut d_cols = dev
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    // rc multiplicity histogram over the single diff `d ∈ [0, 2^rc_log)`. Sized DYNAMICALLY to
-    // `1 << rc_log_size(k*n_gates)` (NOT a fixed 2^16) — the kernel bumps `rc_hist[d]` with d up to
-    // total_pc-1, so the buffer must cover [0,2^rc_log).
-    let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
+    // rc multiplicity histogram over the single diff `d ∈ [0, 2^RC_LOG)`. Sized to the FIXED
+    // `1 << RC_LOG` (production rc log-size) — the kernel bumps `rc_hist[d]` with d up to
+    // total_pc-1, so the buffer must cover [0,2^RC_LOG).
+    let rc_hist_len = 1usize << crate::RC_LOG;
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
         .map_err(|e| format!("alloc rc_hist: {e}"))?;
@@ -797,8 +797,8 @@ pub fn k1_byte_identity(
             real_rows
         ));
     }
-    // Dynamic rc supply-table log-size: rc_log_size(total_pc) with total_pc = k*n_gates.
-    let rc_log = crate::rc_log_size(k * n_gates);
+    // Fixed rc supply-table log-size: RC_LOG (the production rc log-size).
+    let rc_log = crate::RC_LOG;
     let cpu_rc = crate::build_rc_table(&rows, rc_log);
 
     // Host-prep the flat GPU inputs (mirror state_to_limbs / the gate fields / RcIndex offsets).
@@ -1855,12 +1855,12 @@ pub fn gpu_gen_main_trace_device_d(
     let mut d_cols = dev
         .alloc_zeros::<u32>(cols_len)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    // rc multiplicity histogram over the single diff `d`. Sized DYNAMICALLY to `1 << rc_log_size(
-    // k*n_gates)` — the K1 kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must
-    // cover [0,2^rc_log) or the kernel writes out of bounds on real (large-k) runs. Production ignores
-    // the returned histogram (the multiplicity witness is host-built), but the device buffer must
-    // still be correctly sized so the atomic bumps stay in bounds.
-    let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
+    // rc multiplicity histogram over the single diff `d`. Sized to the FIXED `1 << RC_LOG` — the K1
+    // kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must cover [0,2^RC_LOG) or the
+    // kernel writes out of bounds on real (large-k) runs. Production ignores the returned histogram
+    // (the multiplicity witness is host-built), but the device buffer must still be correctly sized
+    // so the atomic bumps stay in bounds.
+    let rc_hist_len = 1usize << crate::RC_LOG;
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
         .map_err(|e| format!("alloc rc_hist: {e}"))?;

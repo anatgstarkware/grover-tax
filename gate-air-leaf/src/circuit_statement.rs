@@ -31,7 +31,7 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::leaf::ProgramRows;
 use crate::{
-    pp_id, preprocessed_column_ids, rc_log_size, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
+    pp_id, preprocessed_column_ids, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
     TAG_PROGRAM, TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
 };
 
@@ -462,10 +462,13 @@ pub struct GateAirStatement<Value: IValue> {
     program: ProgramVars,
     /// Shared hiding nonce Vars (2 words), folded into H_P. Identical across all leaves.
     nonce: [Var; 2],
-    /// Log sizes needed to reproduce the DYNAMIC preprocessed column order.
+    /// Log sizes needed to reproduce the preprocessed column order.
     main_log_size: u32,
     program_log_size: u32,
     boundary_log_size: u32,
+    /// The rc supply-table log-size `R`, a TRUSTED construction input (production: `RC_LOG`; tests: the
+    /// test's chosen value). NEVER read from the proof — see the soundness note in `new`.
+    rc_log: u32,
 }
 
 /// Per-slot program Vars (mirrors `ProgramRows`). `slot`/`multiplicity` are pinned constants;
@@ -486,23 +489,30 @@ impl<Value: IValue> GateAirStatement<Value> {
         main_log_size: u32,
         program_log_size: u32,
         boundary_log_size: u32,
+        rc_log: u32,
         preprocessed_root: HashValue<QM31>,
         boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
         total_pc: u32,
         program: ProgramRows,
         nonce: [u32; 2],
     ) -> Self {
-        // Component order: main, program, boundary, rc. The rc component's OWN log_size is the DYNAMIC
-        // R = ceil(log2(k*n_gates)) = rc_log_size(total_pc) — the native size of its [0,2^R) supply
-        // table (R <= main_log_size; the table is lifted in the committed tree but its component
-        // log_size is R, not main). SOUNDNESS-CRITICAL: R is DERIVED here from the PUBLIC `total_pc`
-        // the leaf already binds (= k*n_gates), NEVER read from the proof — a prover-supplied, inflated
-        // R would enlarge the table and admit out-of-range `d` (forging prev_ts >= ts => stale read).
-        // The same R sizes the `gate_rc_val` preprocessed column (get_preprocessed_column_ids below),
-        // so R is bound by BOTH the transcript (component_log_sizes) AND the preprocessed root (the
-        // canonical member-only [0,2^R) table contents). LOUD guard: 2^R < p (R <= 30); R = ceil(log2(
-        // total_pc)) <= 25 for our k range, so this holds with margin.
-        let rc_log = rc_log_size(total_pc as usize);
+        // Component order: main, program, boundary, rc. The rc component's OWN log_size is `R = rc_log`,
+        // the native size of its [0,2^R) supply table (R <= main_log_size; the table is lifted in the
+        // committed tree but its component log_size is R, not main).
+        //
+        // SOUNDNESS-CRITICAL: R is a FIXED TRUSTED CONSTRUCTION INPUT — the fixed public `RC_LOG`
+        // constant in production (a value the verifier knows, so it is trivially unforgeable), or a
+        // test-chosen value in a self-contained test (which builds both the base and this statement, so
+        // R is trusted and consistent within the test). R is NEVER derived from `total_pc` and NEVER
+        // read from the proof: a prover-supplied, inflated R would enlarge the table and admit
+        // out-of-range `d` (forging prev_ts >= ts => stale read). Soundness holds because
+        // `RC_LOG >= ceil(log2(total_pc))` for the honest k range (k ≲ 8000; the base prove-entry
+        // debug_assert enforces it), and a WIDER rc range still contains every honest `d = pc - prev_ts`
+        // — a wider (but still trusted) range never admits a forgery. The same R sizes the `gate_rc_val`
+        // preprocessed column (get_preprocessed_column_ids below), so the leaf still binds R by BOTH the
+        // transcript (component_log_sizes) AND the preprocessed root (the canonical member-only [0,2^R)
+        // table contents). `total_pc` is retained for its public program-size binding role. LOUD guard:
+        // 2^R < p (R <= 30); production R = RC_LOG = 25, so this holds with margin.
         assert!(
             rc_log <= 30,
             "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)"
@@ -602,6 +612,7 @@ impl<Value: IValue> GateAirStatement<Value> {
             main_log_size,
             program_log_size,
             boundary_log_size,
+            rc_log,
         }
     }
 
@@ -653,10 +664,10 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         &self.component_log_sizes
     }
     fn get_preprocessed_column_ids(&self) -> Vec<PreProcessedColumnId> {
-        // rc_log DERIVED from the public `total_pc` (never a proof field) — same value used for the rc
-        // component log_size in `new`, so the gate_rc_val column is sized/ordered consistently and
+        // rc_log = the trusted construction input `R` (never a proof field) — same value used for the
+        // rc component log_size in `new`, so the gate_rc_val column is sized/ordered consistently and
         // bound by the preprocessed root.
-        let rc_log = rc_log_size(self.total_pc as usize);
+        let rc_log = self.rc_log;
         preprocessed_column_ids(
             self.main_log_size,
             self.program_log_size,

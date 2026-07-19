@@ -49,6 +49,10 @@ pub struct GateAirLeafParams {
     pub main_log_size: u32,
     pub program_log_size: u32,
     pub boundary_log_size: u32,
+    /// The rc supply-table log-size `R` this base was proved with — a TRUSTED construction value the
+    /// leaf statement must reuse (production: `RC_LOG`; tests: the test's chosen value). The base
+    /// prover's `R` and this MUST be equal (see `GateAirStatement::new`); NEVER read from the proof.
+    pub rc_log: u32,
     pub preprocessed_root: HashValue<QM31>,
     pub boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     pub total_pc: u32,
@@ -122,6 +126,7 @@ pub fn emit_one_base<Value: IValue>(
         params.main_log_size,
         params.program_log_size,
         params.boundary_log_size,
+        params.rc_log,
         params.preprocessed_root.clone(),
         params.boundary.clone(),
         params.total_pc,
@@ -304,7 +309,7 @@ pub fn derive_aggregate_config(
 
 /// Builds the leaf/R1/R2 [`RecursionPrecompute`] from the shapes carried out of
 /// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Honors
-/// `GATE_AIR_NO_PRECOMPUTE=1` -> all `None` (rebuild-per-prove).
+/// `RECURSION_NO_PRECOMPUTE=1` -> all `None` (rebuild-per-prove).
 pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecompute {
     let AggregateShapes {
         leaf_pp,
@@ -316,7 +321,7 @@ pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecomput
         node_pp,
         node_root,
     } = shapes;
-    let no_precompute = std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok();
+    let no_precompute = std::env::var("RECURSION_NO_PRECOMPUTE").is_ok();
     if no_precompute {
         return RecursionPrecompute {
             node_precompute: None,

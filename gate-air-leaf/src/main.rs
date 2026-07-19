@@ -75,44 +75,22 @@ const LIMB_BITS: usize = 16;
 const N_LIMBS: usize = N_QUBITS / LIMB_BITS; // 32
 const STATE_BYTES: usize = N_QUBITS / 8; // 64
 
-// Log-size of the ts-ordering range-check (rc) supply table. The table is a SINGLE block enumerating
-// EXACTLY [0, 2^RC_LOG_SIZE) with `val[i] = i` — one lookup per access checks `d ∈ [0, 2^RC_LOG_SIZE)`.
-// RC_LOG_SIZE is DYNAMIC (not a fixed const): `RC_LOG_SIZE = ceil(log2(k*n_gates)) = ceil(log2(total_pc))`
-// (`rc_log_size(total_pc)` below). This is the smallest power-of-two bound that still contains every
-// honest `d`: `d_max = k*n_gates - 1 < 2^RC_LOG_SIZE` (completeness, NO slack) and `2^RC_LOG_SIZE < p`
-// (RC_LOG_SIZE <= 25 for k <= 2000, n_gates ~2547, so the field subtraction cannot wrap). Because
-// rc_log <= log_n_rows (`k*n_gates <= samples*k*n_gates`), the rc column is never the largest committed
-// column, so it does NOT raise the twiddle/FRI domain floor (the `.max(rc_log)` sites reduce to
-// log_n_rows). It also sizes the GPU rc-multiplicity histogram.
-
-/// Dynamic rc-table log-size: `ceil(log2(total_pc))` where `total_pc = k*n_gates`. The rc table
-/// enumerates exactly `[0, 2^rc_log_size)`, which contains every honest `d = pc - prev_ts` since
-/// `d_max = total_pc - 1 < 2^ceil(log2(total_pc))`.
+/// Production log-size of the ts-ordering range-check (rc) supply table: a SINGLE block enumerating
+/// exactly `[0, 2^RC_LOG)` with `val[i] = i`, so one lookup per access checks
+/// `d = pc - prev_ts ∈ [0, 2^RC_LOG)`.
 ///
-/// FLOORED AT `LOG_N_LANES` (the SIMD lane log-count): the rc table is a committed SIMD column and is
-/// range-summed by a `LogupTraceGenerator`, both of which require at least one full SIMD lane
-/// (`>= 2^LOG_N_LANES` rows). A raw `ceil(log2(total_pc))` below `LOG_N_LANES` (only possible for TINY
-/// fixtures with `total_pc < 2^LOG_N_LANES = 16`) underflows those SIMD ops. For ANY real run
-/// (`total_pc = k*n_gates >= 2547 >> 16`) `ceil(log2(total_pc)) >= LOG_N_LANES` already, so the floor
-/// is a NO-OP — the dynamic-rc_log property (rc_log = ceil(log2(k*n_gates)) <= log_n_rows, no eval-
-/// domain inflation) is fully preserved. Widening the range to `[0, 2^LOG_N_LANES)` for a tiny fixture
-/// stays SOUND: honest `d <= total_pc - 1` is still contained, and `2^LOG_N_LANES = 16 << p` so the
-/// field subtraction still cannot wrap (the forward-DAG / no-stale-read argument holds). The floor
-/// lives in this ONE function so the prover and the in-circuit verifier (both call `rc_log_size`)
-/// derive the identical R with no separate constant.
-pub(crate) fn rc_log_size(total_pc: usize) -> u32 {
-    (total_pc as u32)
-        .next_power_of_two()
-        .ilog2()
-        .max(LOG_N_LANES as u32)
-        // FIXED rc=25 POLICY (intentional — NOT a stale experiment): pin the rc table to 2^25 for
-        // ALL k so every curve point runs at the k=8000 target's rc size (dynamic rc = 25 at
-        // k≈8000). Makes the whole curve directly represent the k=8000-relevant per-shard cost.
-        // SOUND (a wider rc range still contains every honest d = pc - prev_ts); BYTE-CHANGING vs the
-        // dynamic-rc proofs (so fingerprints differ from the dynamic set — expected). No-op at
-        // k ≳ 6600 where dynamic rc ≥ 25 already.
-        .max(25)
-}
+/// FIXED at 2^25 — sized to the k≈8000 benchmark target so every curve point carries that rc cost.
+/// This is the PUBLIC production `R`: a fixed constant both the prover and the in-circuit verifier
+/// know (trivially unforgeable — never read from a proof). The rc log-size is a per-construction
+/// INPUT (`R`) threaded into the base prover + `GateAirStatement`; production passes `RC_LOG`, while
+/// each unit test picks its own (small) `R` so its traces stay tiny and fast (mirrors stwo-cairo's
+/// `Seq` column: `MAX_SEQUENCE_LOG_SIZE` const + per-instance `Seq::new(log_size)`).
+///
+/// SOUND wherever every honest `d` fits `[0, 2^RC_LOG)`: `d_max = k*n_gates - 1 < 2^RC_LOG` — i.e.
+/// `k ≲ 8000` in production. The base prove-entry `debug_assert` fails loudly on a run that would
+/// overflow it. `RC_LOG >= LOG_N_LANES` so the SIMD ops never underflow and `2^RC_LOG < p` so the
+/// field subtraction cannot wrap. `rc_log <= log_n_rows`, so rc never raises the FRI floor.
+pub(crate) const RC_LOG: u32 = 25;
 
 /// Log-size of the tree-0 twiddle / eval (committed) domain: the MAX over every committed column's
 /// log-size (`main` = `log_n_rows`, the `rc` membership table = `rc_log`, the `program` table, the
@@ -720,8 +698,8 @@ fn qubit_bit(bytes: &[u8], addr: usize) -> u32 {
 // ts-ordering range-check (rc) supply table
 // ----------------------------------------------------------------------------
 //
-// The rc table is a SINGLE dynamic 2^RC_LOG_SIZE-row supply table enumerating EXACTLY the range
-// [0, 2^RC_LOG_SIZE) with `val[i] = i` (RC_LOG_SIZE = rc_log_size(total_pc) = ceil(log2(k*n_gates))).
+// The rc table is a SINGLE 2^R-row supply table enumerating EXACTLY the range [0, 2^R) with
+// `val[i] = i`, where R = the trusted construction input `rc_log` (production: RC_LOG = 25).
 // There is NO `pos` selector and NO two-block split — one value column, one lookup per access. The
 // membership count is exactly 2^RC_LOG_SIZE (a full power-of-two block), so there are NO padding rows
 // beyond the genuine members; if the caller ever pads it stays a genuine member (val=0). The main
@@ -897,7 +875,7 @@ impl FrameworkEval for ProgramTableEval {
 /// ts-ordering range-check table (supply side). `val` is preprocessed (the table membership,
 /// val[i]=i over [0,2^log_size)); `multiplicity` is witness (count of real `d` lookups landing on
 /// this row). Emits -multiplicity / combine(TAG_RC, val) — one term/row => 1 batch => 4 interaction
-/// columns. `log_size` is DYNAMIC (= rc_log_size(total_pc) = ceil(log2(k*n_gates))).
+/// columns. `log_size` is the trusted construction input `R = rc_log` (production: RC_LOG = 25).
 #[derive(Clone)]
 struct RcTableEval {
     log_size: u32,
@@ -936,11 +914,13 @@ const N_PREPROCESSED_COLS: usize = 9;
 /// Each preprocessed column paired with its log_size, in a fixed canonical listing order, then
 /// STABLE-sorted ascending by size. The committed preprocessed tree MUST be size-sorted (stwo's
 /// lifted Merkle sorts each tree's columns by length, and the in-circuit verifier does NOT re-sort
-/// the preprocessed tree). The sizes are DYNAMIC: `gate_pc_in_prog` is sized with the main trace,
+/// the preprocessed tree). Column sizes: `gate_pc_in_prog` is sized with the main trace,
 /// `gate_prog_slot` with the program table, `gate_bnd_*` with the boundary table, and the rc table
-/// column `gate_rc_val` at the DYNAMIC `rc_log` (= ceil(log2(k*n_gates)); <= main_log_size).
-/// SOUNDNESS: `rc_log` MUST be derived from the public (k, n_gates) both sides trust (never read from
-/// the proof) — it sizes the [0,2^rc_log) membership table pinned by the preprocessed root.
+/// column `gate_rc_val` at the trusted construction input `rc_log` (production: RC_LOG = 25;
+/// <= main_log_size).
+/// SOUNDNESS: `rc_log` MUST be a FIXED TRUSTED value both sides know (production: the public constant
+/// RC_LOG), never read from the proof — it sizes the [0,2^rc_log) membership table pinned by the
+/// preprocessed root.
 fn preprocessed_columns_sorted(
     main_log_size: u32,
     program_log_size: u32,
@@ -2125,7 +2105,7 @@ fn prove_folded(
     use base::BaseShardOutput;
 
     // All FREE topology params in one place, honoring the existing env sweep knobs (BASE_BLOWUP,
-    // BASE_FAN_ARITY, GATE_AIR_SHARD_SHOTS). Defaults reproduce the current production values, so
+    // BASE_FAN_ARITY, RECURSION_SHARD_SHOTS). Defaults reproduce the current production values, so
     // this is a byte-identical no-op. Threaded through the derive/prove calls below; the base
     // blowup, fold arity, base-fan arity, and shots-per-shard are all read off it.
     let topo = TopologyConfig::from_env();
@@ -2224,7 +2204,7 @@ fn prove_folded(
     let shape_padded_rows0 =
         shape_real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let shape_log_n_rows0 = shape_padded_rows0.ilog2();
-    let shape_rc_log0 = rc_log_size(k * n_gates);
+    let shape_rc_log0 = RC_LOG;
     // `cfg` (base circuit ProofConfig): the PCS sized from row/rc log (matches the old `base0_config`
     // read off the proved base, which used `base0_log_n_rows.max(base0_rc_log)`).
     let base0_config = leaf::leaf_pcs_config(
@@ -2264,6 +2244,7 @@ fn prove_folded(
         main_log_size: shape_log_n_rows0,
         program_log_size: shape_program0.log_size,
         boundary_log_size,
+        rc_log: RC_LOG,
         preprocessed_root: placeholder_base_pp_root,
         boundary: shape_boundary_pairs,
         total_pc: (k * n_gates) as u32,
@@ -2305,7 +2286,7 @@ fn prove_folded(
                 let real_rows0 = rows0.len();
                 let padded_rows0 = real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
                 let log_n_rows0 = padded_rows0.ilog2();
-                let rc_log0 = rc_log_size(k * n_gates);
+                let rc_log0 = RC_LOG;
                 let max_log_size0 = tree0_max_log_size(
                     log_n_rows0,
                     rc_log0,
@@ -2384,7 +2365,7 @@ fn prove_folded(
     //
     // SOUNDNESS GATE (pending, on-box, NOT run here — laptop only): the streaming path must
     // yield a recursion_fingerprint BYTE-IDENTICAL to the sequential path for the same fixture
-    // (e.g. k1-n4 samples=4 GATE_AIR_SHARD_SHOTS=2, GATE_AIR_PIPELINE set vs unset). That
+    // (e.g. k1-n4 samples=4 RECURSION_SHARD_SHOTS=2, GATE_AIR_PIPELINE set vs unset). That
     // one-flag diff is the trust gate before this path is used in anger.
     let pipeline = env_flag_default_on("GATE_AIR_PIPELINE") && n_shards > 1;
 
@@ -2574,6 +2555,7 @@ fn prove_folded(
             main_log_size: *log_n_rows_i,
             program_log_size: *prog_log_i,
             boundary_log_size,
+            rc_log: RC_LOG,
             preprocessed_root: pp_root_i,
             boundary: boundary_i.clone(),
             total_pc: *total_pc_i,
@@ -2956,7 +2938,7 @@ fn prove_folded(
     // The precompute optimization only changes HOW each node/leaf's tree0 is built, never WHAT.
     // So the leaf proofs, every internal node proof (folded into `out.root`), and the root
     // proof must be byte-identical between precompute ON (default) and OFF
-    // (GATE_AIR_NO_PRECOMPUTE=1). `Proof<QM31>` is purely Vec/array/struct of QM31 (no maps),
+    // (RECURSION_NO_PRECOMPUTE=1). `Proof<QM31>` is purely Vec/array/struct of QM31 (no maps),
     // so its `{:?}` Debug form is a deterministic, cross-process canonical encoding. We fold
     // every leaf proof + its output values, the root proof + its output values, and the
     // unpacked leaf outputs into one SHA-256 and print it for the two runs to compare.
@@ -2985,7 +2967,7 @@ fn prove_folded(
         hasher.update(format!("rv.proof={:?}", rv.proof).as_bytes());
         hasher.update(format!("rv.leaf_outputs={:?}", rv.leaf_outputs).as_bytes());
         let digest = hasher.finalize();
-        let mode = if std::env::var("GATE_AIR_NO_PRECOMPUTE").is_ok() {
+        let mode = if std::env::var("RECURSION_NO_PRECOMPUTE").is_ok() {
             "PRECOMPUTE_OFF"
         } else {
             "PRECOMPUTE_ON"
@@ -3062,9 +3044,9 @@ fn prove_monolithic(
         return Ok(());
     }
     // ---- Proving ----
-    // Dynamic rc-table log-size = ceil(log2(k*n_gates)); rc_log <= log_n_rows so the .max reduces to
-    // log_n_rows (the rc table never raises the FRI/twiddle domain floor).
-    let rc_log = rc_log_size(k * n_gates);
+    // Fixed rc-table log-size = RC_LOG; rc_log <= log_n_rows so the .max reduces to log_n_rows (the
+    // rc table never raises the FRI/twiddle domain floor).
+    let rc_log = RC_LOG;
     let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
     // SECURE base config (~96-bit) instead of PcsConfig::default() (which is a 13-bit TOY: blowup 1,
     // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
@@ -3531,6 +3513,7 @@ fn prove_monolithic(
                 log_n_rows,
                 program.log_size,
                 boundary_log_size,
+                RC_LOG,
                 pp_root.clone(),
                 boundary_xy.clone(),
                 total_pc,
@@ -3557,6 +3540,7 @@ fn prove_monolithic(
             log_n_rows,
             program.log_size,
             boundary_log_size,
+            RC_LOG,
             pp_root,
             boundary_xy,
             total_pc,
@@ -3722,6 +3706,12 @@ mod tests {
     use super::*;
     use stwo::core::fields::qm31::QM31;
 
+    /// The rc log-size (`R`) unit tests construct their bases + leaves with. Small (the SIMD minimum
+    /// `LOG_N_LANES`, not the production `RC_LOG = 25`) so test traces stay tiny and fast; every honest
+    /// `d = pc - prev_ts` in these tiny fixtures fits `[0, 2^TEST_RC_LOG)`. The base prover and the
+    /// verifying statement in a given test MUST both use this value (threaded explicitly, never derived).
+    const TEST_RC_LOG: u32 = LOG_N_LANES as u32;
+
     /// A tiny self-consistent fixture: an all-NOP circuit (every gate leaves the state unchanged, so
     /// `y == x`), `k` reps, `n_shots` shots. NOP gates still ACCESS their target qubit, so the
     /// memory-chain / rc-table / boundary / program machinery is fully exercised. Distinct targets
@@ -3759,6 +3749,7 @@ mod tests {
         gates: &[Gate],
         cases: &[TestCase],
         k: usize,
+        rc_log: u32,
     ) -> (
         Vec<Row>,
         BoundaryTable,
@@ -3775,7 +3766,7 @@ mod tests {
         let program = build_program_table(gates, cases.len(), k);
         let max_log_size = tree0_max_log_size(
             log_n_rows,
-            rc_log_size(k * gates.len()),
+            rc_log,
             program.log_size,
             boundary.log_size,
         );
@@ -3802,6 +3793,7 @@ mod tests {
         gates: &[Gate],
         cases: &[TestCase],
         k: usize,
+        rc_log: u32,
     ) -> (
         circuits_stark_verifier::proof::Proof<QM31>,
         leaf::GateAirLeafParams,
@@ -3824,7 +3816,8 @@ mod tests {
         let real_rows = rows.len();
         let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
         let log_n_rows = padded_rows.ilog2();
-        let rc_log = rc_log_size(k * n_gates);
+        // `rc_log` (R) is a test-chosen construction input: the base proof and the leaf statement fed
+        // this base MUST use the SAME R (see `GateAirLeafParams::rc_log`).
         let program = build_program_table(gates, cases.len(), k);
         let max_log_size =
             tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
@@ -3961,6 +3954,7 @@ mod tests {
             main_log_size: log_n_rows,
             program_log_size: program.log_size,
             boundary_log_size: boundary.log_size,
+            rc_log,
             preprocessed_root: pp_root,
             boundary: boundary_xy,
             total_pc,
@@ -4007,7 +4001,7 @@ mod tests {
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         // LeafR1R2 uses the leaf preprocessed root (not the base-fanning canonical base root), so the
         // recomputed canonical base pp root is unused here.
-        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
+        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let (config, shapes) = derive_aggregate_config(
             &cfg,
             &params0,
@@ -4061,14 +4055,14 @@ mod tests {
     /// (`prove_root_verification_leaves`'s final `verify_circuit` sanity check). The multi-leaf R1/R2
     /// path is exercised by the env-gated heavy variant + proving-utils' restored `smoke_cairo_tree`.
     ///
-    /// RUN-GUARD (laptop-safety): env-gated to GATE_AIR_HEAVY_RECURSION so plain `cargo test` never
+    /// RUN-GUARD (laptop-safety): env-gated to HEAVY_RECURSION so plain `cargo test` never
     /// executes a real recursion prove/verify on a laptop. Run it on the CPU VM with the guard set.
     #[test]
     fn leaf_r1r2_end_to_end() {
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+        if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
                 "leaf_r1r2_end_to_end: SKIPPED (recursion prove/verify). Set \
-                 GATE_AIR_HEAVY_RECURSION=1 to run."
+                 HEAVY_RECURSION=1 to run."
             );
             return;
         }
@@ -4081,14 +4075,14 @@ mod tests {
     }
 
     /// HEAVY (box-only): the LeafR1R2 roundtrip WITH the level-0 R1 layer + R2 up-tree fold. R2 floors
-    /// ~2^22 (several GB); OOMs a laptop, so env-gated to GATE_AIR_HEAVY_RECURSION=1. Plain `cargo test`
+    /// ~2^22 (several GB); OOMs a laptop, so env-gated to HEAVY_RECURSION=1. Plain `cargo test`
     /// compiles + SKIPS it.
     #[test]
     fn leaf_r1r2_end_to_end_with_r2() {
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+        if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
                 "leaf_r1r2_end_to_end_with_r2: SKIPPED (heavy: R1/R2 nodes ~2^22). Set \
-                 GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the with-R1/R2 roundtrip."
+                 HEAVY_RECURSION=1 on the CPU VM to run the with-R1/R2 roundtrip."
             );
             return;
         }
@@ -4111,7 +4105,7 @@ mod tests {
     /// invariant for "hide the fold behind base-proving". `k` is the default fold arity.
     ///
     /// HEAVY (box-only): builds real R1 (and, at `n > k`, R2) multiverifier nodes (~2^22, GBs) so it
-    /// OOMs a laptop; env-gated to GATE_AIR_HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
+    /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
     fn leaf_r1r2_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
         use circuits_stark_verifier::proof::Proof;
         use leaf::{
@@ -4124,7 +4118,7 @@ mod tests {
         };
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
-        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k);
+        let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let (config, shapes) = derive_aggregate_config(
             &cfg,
             &params0,
@@ -4200,10 +4194,10 @@ mod tests {
     /// r==1, ~2k+3}. Env-gated (heavy R1/R2 proving). Proves streaming == sequential byte-for-byte.
     #[test]
     fn leaf_r1r2_streaming_equiv_sweep() {
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+        if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
                 "leaf_r1r2_streaming_equiv_sweep: SKIPPED (heavy: real R1/R2 proving ~2^22). Set \
-                 GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the out-of-order equivalence sweep."
+                 HEAVY_RECURSION=1 on the CPU VM to run the out-of-order equivalence sweep."
             );
             return;
         }
@@ -4221,13 +4215,13 @@ mod tests {
     ///
     /// HEAVY (box-only): `derive_aggregate_config` builds the ~2^22 R1/R2 node preprocessed shapes
     /// (heavy REGARDLESS of leaf size — a node verifies `fold_arity` in-circuit STARK proofs), which
-    /// OOMs a laptop; env-gated to GATE_AIR_HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
+    /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
     #[test]
     fn leaf_r1r2_streaming_wrap_panic_propagates() {
-        if std::env::var("GATE_AIR_HEAVY_RECURSION").is_err() {
+        if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
                 "leaf_r1r2_streaming_wrap_panic_propagates: SKIPPED (heavy: config build ~2^22). \
-                 Set GATE_AIR_HEAVY_RECURSION=1 on the CPU VM to run the panic-propagation test."
+                 Set HEAVY_RECURSION=1 on the CPU VM to run the panic-propagation test."
             );
             return;
         }
@@ -4236,7 +4230,7 @@ mod tests {
         // Build the smallest valid LeafR1R2 config from a tiny base. No recursion PROVE runs (wrap
         // panics first), but the config build itself is the heavy part gated above.
         let (gates, cases, k) = nop_fixture(4, 2, 1);
-        let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k);
+        let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let fold_arity = recursive_aggregate::TopologyConfig::default().fold_arity;
         let (config, shapes) = leaf::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
         let pre = leaf::build_recursion_precompute(shapes);
@@ -4282,8 +4276,9 @@ mod tests {
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let n_gates = gates.len();
         let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
-            shard0_shape(&gates, &cases, k);
-        let rc_log = rc_log_size(k * n_gates);
+            shard0_shape(&gates, &cases, k, TEST_RC_LOG);
+        // Must match the R `shard0_shape` sized `config`/`max_log_size` with (same base construction).
+        let rc_log = TEST_RC_LOG;
         let pc = BaseProverPrecompute::new(
             config,
             max_log_size,
@@ -4308,8 +4303,8 @@ mod tests {
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let n_gates = gates.len();
         let (rows, boundary, program, padded_rows, log_n_rows, _max_log_size, _config) =
-            shard0_shape(&gates, &cases, k);
-        let rc_table = build_rc_table(&rows, rc_log_size(k * n_gates));
+            shard0_shape(&gates, &cases, k, TEST_RC_LOG);
+        let rc_table = build_rc_table(&rows, TEST_RC_LOG);
 
         // Draw the LogUp relation exactly as the prover does (salt=0, then config is mixed in the
         // real path; for a self-contained balance check the challenge just needs to be consistent
