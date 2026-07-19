@@ -1198,7 +1198,7 @@ pub(crate) fn prove_base_shard(
                 hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
             x_states.extend_from_slice(&state_to_limbs(&bytes));
         }
-        let (main_dev, _qd, _lo, _hi, d_cols) = match &dp {
+        let (main_dev, _lo, d_cols) = match &dp {
             // Multi-GPU: use THIS device's N3 buffers (device 0's eager d_*, or the per-device
             // replica) — feeding device-0 buffers to a device-n kernel would be an illegal
             // cross-device access.

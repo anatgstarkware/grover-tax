@@ -3154,7 +3154,7 @@ fn prove_monolithic(
         // Device K1: 191 main columns generated on the GPU, fed in as device-resident BaseFieldVecs.
         let (gates_flat, x_states, off_lo, off_hi) =
             gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_lo_index)?;
-        let (main_dev, _qd, _lo, _hi, d_cols) = gpu_tracegen::gpu_gen_main_trace_device(
+        let (main_dev, _lo, d_cols) = gpu_tracegen::gpu_gen_main_trace_device(
             &gates_flat,
             &x_states,
             &off_lo,
@@ -3170,17 +3170,6 @@ fn prove_monolithic(
             "gate-air: [phase] main_trace witness gen (GPU K1) {:.3}s",
             t_phase.elapsed().as_secs_f64()
         );
-        // MEM PROBE 1: right after K1 completes, before tree1 commit. d_main is resident here.
-        stwo::stwo_cuda::cuda_mem_probe("PROBE1_after_K1");
-        // HYPOTHESIS TEST (GATE_AIR_TRIM_AFTER_K1=1, default OFF): does returning pool-cached-freed
-        // K1 scratch to the driver free enough contiguous space for tree1 commit to proceed? One-shot
-        // sync + cudaMemPoolTrimTo(0). Only touches ALREADY-FREED pool segments; live d_main untouched.
-        if std::env::var("GATE_AIR_TRIM_AFTER_K1").is_ok() {
-            unsafe {
-                stwo::stwo_cuda::bindings::cuda_pool_trim();
-            }
-            stwo::stwo_cuda::cuda_mem_probe("PROBE1b_after_K1_trim");
-        }
         let mut main_dev = main_dev;
         main_dev.extend(to_prover(small_main));
         tree_builder.extend_evals(main_dev);
@@ -3204,10 +3193,6 @@ fn prove_monolithic(
         );
         tree_builder.extend_evals(to_prover(main_trace));
     }
-    // MEM PROBE 2: immediately before the tree1 commit loop (first tree1-column NTT/alloc). This is
-    // the driver+pool state ENTERING the LDE loop that OOMs at 2^25.
-    #[cfg(feature = "cuda")]
-    stwo::stwo_cuda::cuda_mem_probe("PROBE2_before_tree1");
     let t_phase = Instant::now();
     tree_builder.commit(prover_channel);
     eprintln!(
@@ -3438,10 +3423,6 @@ fn prove_monolithic(
         v.extend(rc_interaction);
         v
     };
-    // MEM PROBE 4: after free_after_k4 (main trace freed), immediately BEFORE the tree2 commit whose
-    // NTT (ifft.cu) is the 2^26 OOM site. This is the true free entering the failing tree2-eval alloc.
-    #[cfg(feature = "cuda")]
-    stwo::stwo_cuda::cuda_mem_probe("PROBE4_before_tree2_commit");
     let mut tree_builder = commitment_scheme.tree_builder();
     #[cfg(feature = "cuda")]
     if let Some((main_dev, _)) = main_interaction_device {
@@ -3488,11 +3469,6 @@ fn prove_monolithic(
         trace_gen_elapsed.as_secs_f64()
     );
 
-    // MEM PROBE 5: composition entry — resident set going INTO prove_ex (composition/OODS/quotient/
-    // FRI). At 2^25 this was the whole-prove high-water (LAST_STATE composition-entry ~26.6 GiB); the
-    // in-composition spike itself is caught by the smi sampler. This is the binding-phase reading.
-    #[cfg(feature = "cuda")]
-    stwo::stwo_cuda::cuda_mem_probe("PROBE5_composition_entry");
     let prove_start = Instant::now();
     // prove_ex (vs prove) yields the ExtendedStarkProof (proof + aux) the in-circuit verifier needs;
     // M2a validates it via the native verify below (`extended.proof`). M2d will keep `extended`
@@ -3505,10 +3481,6 @@ fn prove_monolithic(
         false,
     )?;
     let prove_elapsed = prove_start.elapsed();
-    // MEM PROBE 6: after prove_ex returns — post-composition/FRI settled state (pool_reserved reflects
-    // the pool's high-water reservation across composition/quotient, the phases with no earlier probe).
-    #[cfg(feature = "cuda")]
-    stwo::stwo_cuda::cuda_mem_probe("PROBE6_after_prove_ex");
 
     // ---- Full-proof byte-identity fingerprint (read-only), gated by GATE_AIR_PROOF_HASH ----
     // Deterministic SHA-256 over the serde-serialized ExtendedStarkProof (commitments,

@@ -21,7 +21,7 @@
 //!     `ACCESS_BLOCK` in main.rs).
 //!   * rc HISTOGRAM: a single `2^rc_log` multiplicity histogram over `d` (rc_log = rc_log_size(
 //!     k*n_gates), DYNAMIC per run). Each ACTIVE access bumps `hist[d] += 1` (one bump/access).
-//!     Emitted into the (formerly unused) `rc_lo` device arg (`rc_hi` arg stays inert). NOTE: on the
+//!     Emitted into the (formerly unused) `rc_lo` device arg. NOTE: on the
 //!     PRODUCTION path the rc multiplicity WITNESS column is built ON THE HOST from the always-present
 //!     CPU `rows` (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is
 //!     used ONLY by the `k1_byte_identity` diagnostic to cross-check the device histogram against CPU.
@@ -196,12 +196,7 @@ fn gate_sim_module(dev: &Arc<cudarc::driver::CudaDevice>) -> Result<(&'static st
         dev.load_ptx(
             ptx,
             "gate_sim_mod",
-            &[
-                "prog_slot_meta",
-                "gate_sim_states",
-                "gate_sim",
-                "fill_padding",
-            ],
+            &["prog_slot_meta", "gate_sim_states", "gate_sim"],
         )
         .map_err(|e| format!("load_ptx: {e}"))?;
         Ok(())
@@ -338,14 +333,13 @@ fn launch_k0_states(
 ///   program order, and wrap = 1 iff that predecessor is in the PREVIOUS rep (0 iff the same rep). K1
 ///   turns them into `prev_ts` (the predecessor's closed-form ts, or 0 at the program-wide first access).
 /// - `cols`:    TRACE_COLUMNS * padded_rows, column-major (col c at cols[c*padded_rows + row]), u32
-/// - `rc_lo` (repurposed): the 2^rc_log rc-table MULTIPLICITY HISTOGRAM over `d` (K1 atomically bumps
-///   hist[d] once per active access). Caller must zero it and size it to at least `1 << rc_log`
-///   (rc_log = rc_log_size(k*n_gates)). `rc_hi` (repurposed) is INERT (kept for arg-list
-///   compatibility). NB: production uses the HOST-built rc multiplicity witness (main.rs
-///   build_rc_table); this histogram feeds only the k1 diagnostic.
+/// - `rc_hist` (repurposed rc_lo): the 2^rc_log rc-table MULTIPLICITY HISTOGRAM over `d` (K1 atomically
+///   bumps hist[d] once per active access). Caller must zero it and size it to at least `1 << rc_log`
+///   (rc_log = rc_log_size(k*n_gates)). NB: production uses the HOST-built rc multiplicity witness
+///   (main.rs build_rc_table); this histogram feeds only the k1 diagnostic.
 /// Scalars: k, n_gates, n_shots, padded_rows (shot_rows = k*n_gates computed in-kernel).
 /// NOTE: caller must zero `cols` first; padding rows [n_shots*shot_rows, padded_rows) stay 0
-/// (`Row::padding()` is all-zero — `fill_padding` is a no-op stub).
+/// (`Row::padding()` is all-zero — no padding kernel needed).
 /// Launch order: `prog_slot_meta` (fills slot_meta, once) → K0 `gate_sim_states` (fills rep_states)
 /// → K1 `gate_sim` (consumes both).
 pub const GATE_SIM_KERNEL: &str = r#"
@@ -552,23 +546,20 @@ extern "C" __global__ void gate_sim_states(
 // slot_meta's cyclic-predecessor constants) and the per-access rc value `d`. ts is the closed form
 // `pc + 1` (shared by all accesses of a step, not emitted); `d = ts - prev_ts - 1 = pc - prev_ts`.
 // `off_lo` is repurposed to carry rep_states and `off_hi` to carry slot_meta (both formerly-unused arg
-// slots — keeps the launch tuple at 8 pointers + 4 scalars, cudarc's cap). `qdecode` stays UNUSED;
-// `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM over `d` (atomic bumps); `rc_hi` INERT.
+// slots). `rc_lo` is repurposed as the rc-table MULTIPLICITY HISTOGRAM over `d` (atomic bumps).
 extern "C" __global__ void gate_sim(
     const unsigned* __restrict__ gates,
     const unsigned* __restrict__ x_states,      // UNUSED by K1 (state comes from rep_states); compat
     const unsigned* __restrict__ rep_states,    // (was off_lo) n_shots*k*N_LIMBS rep-boundary states
     const unsigned* __restrict__ slot_meta,     // (was off_hi) n_gates*9 predecessor constants
     unsigned* __restrict__ cols,
-    unsigned* __restrict__ qdecode,             // UNUSED (kept for arg-list compatibility)
     unsigned* __restrict__ rc_hist,             // (was rc_lo) 2^rc_log rc multiplicity histogram over d
-    unsigned* __restrict__ rc_hi,               // INERT (kept for arg-list compatibility)
     unsigned k,
     unsigned n_gates,
     unsigned n_shots,
     unsigned long padded_rows)
 {
-    (void)x_states; (void)qdecode; (void)rc_hi;
+    (void)x_states;
 
     // THREAD-PER-EXECUTION: one thread per (shot, rep) = n_shots*k threads.
     unsigned long exec = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -673,15 +664,7 @@ extern "C" __global__ void gate_sim(
 
 // Padding rows [real_rows, padded_rows) match `Row::padding()` = ALL ZERO (AccessCols::inactive()
 // is addr=ts=prev_ts=v=0; is_* = 0; ab=fire=delta=0). `cols` is pre-zeroed by the caller, so there
-// is nothing to write. Kept as a no-op stub so the Rust launch glue (get_func "fill_padding") and
-// its shard-loop call site do not need to change.
-extern "C" __global__ void fill_padding(
-    unsigned* __restrict__ cols,
-    unsigned long padded_rows,
-    unsigned long real_rows)
-{
-    (void)cols; (void)padded_rows; (void)real_rows;
-}
+// is nothing to write (no padding kernel needed).
 "#;
 
 pub const TRACE_COLUMNS: usize = 19;
@@ -694,7 +677,7 @@ pub const TRACE_COLUMNS: usize = 19;
 ///   (kernel guards on a_active/b_active).
 /// - `x_states`: n_shots*32 initial limbs (state_to_limbs of each shot's x_hex).
 /// - `off_lo`/`off_hi`: 16 each (RcIndex offsets).
-/// Returns (cols [column-major, TRACE_COLUMNS*padded_rows], qdecode[512], rc_hist[2^rc_log], rc_hi[inert,1]).
+/// Returns (cols [column-major, TRACE_COLUMNS*padded_rows], rc_hist[2^rc_log]).
 /// NOTE (padding): real rows [0, n_shots*k*n_gates) are written by the kernel; padding rows stay
 /// zero here — the caller must set the 3 read-block `mask` columns = 1 for padding rows to match
 /// `Row::padding` (TODO; the byte-identity test compares real rows + histograms first).
@@ -708,7 +691,7 @@ pub fn gpu_gen_main_trace(
     n_gates: u32,
     n_shots: u32,
     padded_rows: usize,
-) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>), String> {
+) -> Result<(Vec<u32>, Vec<u32>), String> {
     use cudarc::driver::{LaunchAsync, LaunchConfig};
 
     let dev = cuda_device()?;
@@ -729,19 +712,13 @@ pub fn gpu_gen_main_trace(
     let mut d_cols = dev
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    let mut d_qd = dev
-        .alloc_zeros::<u32>(512)
-        .map_err(|e| format!("alloc qdecode: {e}"))?;
     // rc multiplicity histogram over the single diff `d ∈ [0, 2^rc_log)`. Sized DYNAMICALLY to
     // `1 << rc_log_size(k*n_gates)` (NOT a fixed 2^16) — the kernel bumps `rc_hist[d]` with d up to
-    // total_pc-1, so the buffer must cover [0,2^rc_log). `d_hi` stays inert (arg-list compat).
+    // total_pc-1, so the buffer must cover [0,2^rc_log).
     let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
         .map_err(|e| format!("alloc rc_hist: {e}"))?;
-    let mut d_hi = dev
-        .alloc_zeros::<u32>(1)
-        .map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
     let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, &d_gates, k, n_gates, n_shots)?;
@@ -750,7 +727,7 @@ pub fn gpu_gen_main_trace(
     // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
     launch_k0_states(&dev, &d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
     // K1: thread-per-EXECUTION — one thread per (shot, rep) = n_shots*k threads. rep_states seeds the
-    // value chain, slot_meta gives the closed-form ts; d_x/d_qd/d_lo/d_hi are UNUSED (arg compat).
+    // value chain, slot_meta gives the closed-form ts; d_x is UNUSED (arg compat).
     let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
@@ -758,8 +735,7 @@ pub fn gpu_gen_main_trace(
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    // 8 device pointers + 4 scalars = 12 args (cudarc launch tuple cap). off_lo slot = rep_states,
-    // off_hi slot = slot_meta.
+    // 6 device pointers + 4 scalars = 10 args. off_lo slot = rep_states, off_hi slot = slot_meta.
     unsafe {
         func.launch(
             cfg,
@@ -769,9 +745,7 @@ pub fn gpu_gen_main_trace(
                 &d_rep,
                 &d_slot,
                 &mut d_cols,
-                &mut d_qd,
                 &mut d_lo,
-                &mut d_hi,
                 k,
                 n_gates,
                 n_shots,
@@ -781,40 +755,15 @@ pub fn gpu_gen_main_trace(
         .map_err(|e| format!("launch gate_sim: {e}"))?;
     }
 
-    // Padding rows match Row::padding() = all-zero; `cols` is pre-zeroed, so fill_padding is a no-op.
-    let real_rows = (n_shots as u64) * (k as u64) * (n_gates as u64);
-    let n_pad = (padded_rows as u64).saturating_sub(real_rows);
-    if n_pad > 0 {
-        let fill = dev
-            .get_func("gate_sim_mod", "fill_padding")
-            .ok_or_else(|| "get_func fill_padding".to_string())?;
-        let pad_block = 256u32;
-        let pad_grid = (n_pad as u32).div_ceil(pad_block);
-        let pad_cfg = LaunchConfig {
-            grid_dim: (pad_grid, 1, 1),
-            block_dim: (pad_block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            fill.launch(pad_cfg, (&mut d_cols, padded_rows as u64, real_rows))
-                .map_err(|e| format!("launch fill_padding: {e}"))?;
-        }
-    }
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
     let mut cols = vec![0u32; TRACE_COLUMNS * padded_rows];
-    let mut qd = vec![0u32; 512];
     let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
-    let mut hi = vec![0u32; 1]; // inert
     dev.dtoh_sync_copy_into(&d_cols, &mut cols)
         .map_err(|e| format!("dtoh cols: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_qd, &mut qd)
-        .map_err(|e| format!("dtoh qdecode: {e}"))?;
     dev.dtoh_sync_copy_into(&d_lo, &mut lo)
         .map_err(|e| format!("dtoh rc_hist: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi)
-        .map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
-    Ok((cols, qd, lo, hi))
+    Ok((cols, lo))
 }
 
 /// P3.1 soundness gate: assert the GPU K1 trace (real rows + rc multiplicity histogram) is
@@ -871,8 +820,8 @@ pub fn k1_byte_identity(
         .collect();
     let off_hi = off_lo.clone();
 
-    // GPU. `hist` (2nd histogram return) is the rc multiplicity histogram; `qd`/`hi` are unused.
-    let (cols, _qd, hist, _hi) = gpu_gen_main_trace(
+    // GPU. `hist` (2nd return) is the rc multiplicity histogram.
+    let (cols, hist) = gpu_gen_main_trace(
         &gates_flat,
         &x_states,
         &off_lo,
@@ -1611,7 +1560,7 @@ pub fn k4_byte_identity(
         .map(|p| _rc_lo.offset[p] as u32)
         .collect();
     let off_hi = off_lo.clone(); // unused by the kernel; passed for arg-list compat.
-    let (main_cols, _qd, _lo, _hi) = gpu_gen_main_trace(
+    let (main_cols, _lo) = gpu_gen_main_trace(
         &gates_flat,
         &x_states,
         &off_lo,
@@ -1796,7 +1745,7 @@ fn d2d_column(
 
 /// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 19 main
 /// columns as `CircleEvaluation<CudaBackend>` (device-resident, no host upload),
-/// plus the qdecode/rc histogram copied to the host (tiny; the
+/// plus the rc histogram copied to the host (tiny; the
 /// multiplicity columns are still built + uploaded on the CPU path in main.rs),
 /// plus the raw column-major main-trace device buffer `d_cols` so the interaction
 /// path (K4) can REUSE it instead of re-running K0/K1 (no re-simulation, no
@@ -1827,8 +1776,6 @@ pub fn gpu_gen_main_trace_device(
                 stwo::prover::poly::BitReversedOrder,
             >,
         >,
-        Vec<u32>,
-        Vec<u32>,
         Vec<u32>,
         cudarc::driver::CudaSlice<u32>,
     ),
@@ -1886,8 +1833,6 @@ pub fn gpu_gen_main_trace_device_d(
             >,
         >,
         Vec<u32>,
-        Vec<u32>,
-        Vec<u32>,
         cudarc::driver::CudaSlice<u32>,
     ),
     String,
@@ -1910,21 +1855,15 @@ pub fn gpu_gen_main_trace_device_d(
     let mut d_cols = dev
         .alloc_zeros::<u32>(cols_len)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    let mut d_qd = dev
-        .alloc_zeros::<u32>(512)
-        .map_err(|e| format!("alloc qdecode: {e}"))?;
     // rc multiplicity histogram over the single diff `d`. Sized DYNAMICALLY to `1 << rc_log_size(
     // k*n_gates)` — the K1 kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must
     // cover [0,2^rc_log) or the kernel writes out of bounds on real (large-k) runs. Production ignores
     // the returned histogram (the multiplicity witness is host-built), but the device buffer must
-    // still be correctly sized so the atomic bumps stay in bounds. `d_hi` stays inert (arg compat).
+    // still be correctly sized so the atomic bumps stay in bounds.
     let rc_hist_len = 1usize << crate::rc_log_size((k as usize) * (n_gates as usize));
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
         .map_err(|e| format!("alloc rc_hist: {e}"))?;
-    let mut d_hi = dev
-        .alloc_zeros::<u32>(1)
-        .map_err(|e| format!("alloc rc_hi (inert): {e}"))?;
     let _ = (d_off_lo, d_off_hi); // RcIndex offsets unused (arg slots repurposed for rep_states/slot_meta).
 
     // Thread-per-execution scratch: rep-boundary states (K0 → K1) + closed-form ts constants.
@@ -1934,7 +1873,7 @@ pub fn gpu_gen_main_trace_device_d(
     // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
     launch_k0_states(&dev, d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
     // K1: thread-per-EXECUTION — one thread per (shot, rep). rep_states (off_lo slot) seeds the value
-    // chain; slot_meta (off_hi slot) gives the closed-form ts. d_x/d_qd/d_lo/d_hi are UNUSED (compat).
+    // chain; slot_meta (off_hi slot) gives the closed-form ts. d_x is UNUSED (compat).
     let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
@@ -1951,9 +1890,7 @@ pub fn gpu_gen_main_trace_device_d(
                 &d_rep,
                 &d_slot,
                 &mut d_cols,
-                &mut d_qd,
                 &mut d_lo,
-                &mut d_hi,
                 k,
                 n_gates,
                 n_shots,
@@ -1963,25 +1900,6 @@ pub fn gpu_gen_main_trace_device_d(
         .map_err(|e| format!("launch gate_sim: {e}"))?;
     }
 
-    // Padding rows match Row::padding() = all-zero; `cols` is pre-zeroed, so fill_padding is a no-op.
-    let real_rows = (n_shots as u64) * (k as u64) * (n_gates as u64);
-    let n_pad = (padded_rows as u64).saturating_sub(real_rows);
-    if n_pad > 0 {
-        let fill = dev
-            .get_func("gate_sim_mod", "fill_padding")
-            .ok_or_else(|| "get_func fill_padding".to_string())?;
-        let pad_block = 256u32;
-        let pad_grid = (n_pad as u32).div_ceil(pad_block);
-        let pad_cfg = LaunchConfig {
-            grid_dim: (pad_grid, 1, 1),
-            block_dim: (pad_block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            fill.launch(pad_cfg, (&mut d_cols, padded_rows as u64, real_rows))
-                .map_err(|e| format!("launch fill_padding: {e}"))?;
-        }
-    }
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
     // Device handoff: build the 19 CudaBackend columns from `d_cols` (column-major; column c at
@@ -1991,22 +1909,16 @@ pub fn gpu_gen_main_trace_device_d(
         .map(|c| d2d_column(&d_cols, c * padded_rows, padded_rows, domain))
         .collect();
 
-    // Histograms are tiny → keep them on host (the multiplicity columns are built
+    // Histogram is tiny → keep it on host (the multiplicity columns are built
     // + uploaded on the existing CPU path in main.rs).
-    let mut qd = vec![0u32; 512];
     let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
-    let mut hi = vec![0u32; 1]; // inert
-    dev.dtoh_sync_copy_into(&d_qd, &mut qd)
-        .map_err(|e| format!("dtoh qdecode: {e}"))?;
     dev.dtoh_sync_copy_into(&d_lo, &mut lo)
         .map_err(|e| format!("dtoh rc_hist: {e}"))?;
-    dev.dtoh_sync_copy_into(&d_hi, &mut hi)
-        .map_err(|e| format!("dtoh rc_hi (inert): {e}"))?;
     dev.synchronize().map_err(|e| format!("sync hist: {e}"))?;
     // SUCCESS handoff: return the resident `d_cols` device buffer so K4 reads it directly (no K0/K1
     // re-run); it is no longer touched here after the column build above. The buffer frees via cudarc
     // `cuMemFree` when the caller eventually drops it.
-    Ok((cols, qd, lo, hi, d_cols))
+    Ok((cols, lo, d_cols))
 }
 
 /// The K1 main-trace buffer as consumed by K4: RESIDENT on the device — the `CudaSlice` K1 returned,
