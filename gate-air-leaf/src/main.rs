@@ -3431,6 +3431,10 @@ fn normalize(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use stwo::core::fields::qm31::QM31;
+    // Serializes the GPU byte-identity tests (see Cargo.toml [dev-dependencies]); only referenced by
+    // the `cuda,diag` tests, so gate the import to match and avoid an unused-import warning elsewhere.
+    #[cfg(all(feature = "cuda", feature = "diag"))]
+    use serial_test::serial;
 
     /// The rc log-size (`R`) unit tests construct their bases + leaves with. Small (the SIMD minimum
     /// `LOG_N_LANES`, not the production `RC_LOG = 25`) so test traces stay tiny and fast; every honest
@@ -4358,6 +4362,7 @@ mod tests {
     /// `GATE_AIR_GPU_TEST=k1` prove-path flag) to a real test.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn k1_trace_identity() {
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let rc_lo = build_rc_lo();
@@ -4369,6 +4374,7 @@ mod tests {
     /// `gpu_tracegen::k4_byte_identity` harness (formerly `GATE_AIR_GPU_TEST=k4`) to a real test.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn k4_interaction_identity() {
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let rc_lo = build_rc_lo();
@@ -4383,6 +4389,7 @@ mod tests {
     /// `diag::base_proof_fingerprint`.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn base_precompute_identity() {
         use base::{prove_base_shard, BaseProverPrecompute};
         if std::env::var("HEAVY_RECURSION").is_err() {
@@ -4432,6 +4439,7 @@ mod tests {
     /// `build_recursion_precompute` used to return under the removed env flag.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn recursion_precompute_identity() {
         use circuits_stark_verifier::proof::Proof;
         use leaf::{
@@ -4499,6 +4507,7 @@ mod tests {
     /// `hiding_nonce()` (its fixed default is deterministic, so no override is needed here).
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn incircuit_self_verify() {
         use circuit_statement::{gate_air_components, GateAirStatement};
         use circuits::blake::HashValue;
@@ -4581,6 +4590,7 @@ mod tests {
     /// prover paths ONLY — no core verification is patched.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn gpu_vs_host_constraints_identity() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!("gpu_vs_host_constraints_identity: SKIPPED (GPU base prove). Set HEAVY_RECURSION=1 on the box.");
@@ -4607,6 +4617,7 @@ mod tests {
     /// `GATE_AIR_PROOF_HASH` cross-backend oracle. Uses the deterministic `hiding_nonce()` default.
     #[cfg(all(feature = "cuda", feature = "diag"))]
     #[test]
+    #[serial]
     fn full_proof_gpu_vs_simd_identity() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!("full_proof_gpu_vs_simd_identity: SKIPPED (GPU base prove). Set HEAVY_RECURSION=1 on the box.");

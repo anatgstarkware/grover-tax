@@ -44,9 +44,17 @@ circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits
 # Device-resident gate_air GPU constraint kernel (registers into the generic CudaBackend prover).
 gate-air-cuda-kernel = { path = "../gate-air-cuda-kernel", optional = true }
 
+# Test-only: serialize the GPU `cuda,diag` byte-identity tests. cargo runs tests in parallel threads,
+# and those tests concurrently load CUDA modules on the same device — a cudarc device-module-map race
+# (surfaced once the AOT fatbin load became fast enough to overlap). `#[serial]` makes them run one at
+# a time regardless of how they're invoked. Dev-only: never in the shipped prover.
+[dev-dependencies]
+serial_test = "3"
+
 [features]
-# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs, via cudarc/NVRTC). `gpu-cuda` gates the
-# module and pulls in the cudarc runtime (GPU box).
+# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs). Kernels are compiled AOT by build.rs (nvcc) from
+# cuda/*.cu into $OUT_DIR fatbins and loaded via cudarc. `gpu-cuda` gates the module, drives the
+# build.rs native compile (CARGO_FEATURE_GPU_CUDA), and pulls in the cudarc runtime (GPU box).
 gpu-cuda = ["dep:cudarc"]
 # Byte-identity / diagnostic hooks (GATE_AIR_GPU_TEST, GATE_AIR_PROOF_HASH, k1/k4 byte-identity
 # harnesses). Validation-only — production `cuda` builds deliberately do NOT pull this, so the
@@ -69,6 +77,9 @@ cuda = [
 ]
 
 # cudarc for the K1/K4 trace-gen launch glue (gpu_tracegen.rs). MUST match stwo's cudarc (0.11).
+# `nvrtc` is retained NOT for `compile_ptx` (kernels are now AOT fatbins) but for the `Ptx` type:
+# `Ptx` lives in cudarc's `nvrtc` module and `driver::load_ptx` takes it, so loading a fatbin via
+# `Ptx::from_file` still requires the `nvrtc` feature.
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
 
