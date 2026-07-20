@@ -1175,9 +1175,6 @@ pub(crate) fn prove_base_shard(
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
 
-    #[cfg(feature = "cuda")]
-    let gpu_tracegen = std::env::var("GATE_AIR_CPU_TRACEGEN").is_err();
-
     // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
     let rc_table = build_rc_table(&rows, rc_log);
 
@@ -1189,12 +1186,12 @@ pub(crate) fn prove_base_shard(
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
-    // Holds K1's column-major main-trace device buffer so K4 (interaction) can
-    // reuse it instead of re-running K0/K1. `None` on the CPU path.
+    // Holds K1's column-major main-trace device buffer so K4 (interaction) can reuse it instead of
+    // re-running K0/K1. GPU trace-gen is unconditional under `cuda` (the CPU-tracegen == GPU-tracegen
+    // byte-identity the old GATE_AIR_CPU_TRACEGEN A/B arm covered is now T1a/T1b); the CPU arm below
+    // survives only on the non-cuda (SimdBackend) build.
     #[cfg(feature = "cuda")]
-    let mut d_main_cols: Option<cudarc::driver::CudaSlice<u32>> = None;
-    #[cfg(feature = "cuda")]
-    if gpu_tracegen {
+    let d_main_cols: cudarc::driver::CudaSlice<u32> = {
         // N3: gate list + RcIndex offsets are shard-invariant. On the reuse path they are
         // already device-resident in the precompute (uploaded once); only this shard's
         // `x_states` is uploaded here. On the fallback path they're uploaded per shard.
@@ -1239,12 +1236,8 @@ pub(crate) fn prove_base_shard(
         let mut main_dev = main_dev;
         main_dev.extend(to_prover(small_main));
         tree_builder.extend_evals(main_dev);
-        d_main_cols = Some(d_cols);
-    } else {
-        let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
-        main_trace.extend(small_main);
-        tree_builder.extend_evals(to_prover(main_trace));
-    }
+        d_cols
+    };
     #[cfg(not(feature = "cuda"))]
     {
         let mut main_trace = generate_main_trace(&rows, padded_rows, log_n_rows);
@@ -1256,12 +1249,8 @@ pub(crate) fn prove_base_shard(
     // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
     // See `MainTrace::from_k1`.
     #[cfg(feature = "cuda")]
-    let mut main_k1: Option<gpu_tracegen::MainTrace> = match d_main_cols.take() {
-        Some(d_cols) => {
-            Some(gpu_tracegen::MainTrace::from_k1(d_cols).map_err(|e| anyhow::anyhow!(e))?)
-        }
-        None => None,
-    };
+    let main_k1: gpu_tracegen::MainTrace =
+        gpu_tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
 
     let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
     prover_channel.mix_u64(interaction_pow_nonce);
@@ -1274,14 +1263,11 @@ pub(crate) fn prove_base_shard(
         gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
     }
 
-    // Interaction traces.
+    // Interaction traces (device K4 unconditional under `cuda`; CPU arm survives only on non-cuda).
     #[cfg(feature = "cuda")]
-    let main_interaction_device = if gpu_tracegen {
-        let main = main_k1
-            .as_ref()
-            .expect("K1 main-trace buffer must exist on the GPU path");
+    let main_interaction_device = {
         let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
-            main,
+            &main_k1,
             n_gates as u32,
             padded_rows,
             log_n_rows,
@@ -1290,24 +1276,16 @@ pub(crate) fn prove_base_shard(
             &elements,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-        Some((cols, claimed))
-    } else {
-        None
+        (cols, claimed)
     };
     // K4 done: FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before tree2), not at
     // end-of-shard, and synchronize so tree2's pool can reserve it. `free_after_k4` consumes
     // the buffer explicitly.
     #[cfg(feature = "cuda")]
-    if let Some(m) = main_k1.take() {
-        m.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
-    }
+    main_k1.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
+    // GPU path: skip CPU interaction gen (the dominant cost); claimed_sum == CPU main_sum.
     #[cfg(feature = "cuda")]
-    let (main_interaction, main_sum) = if let Some((_, claimed)) = &main_interaction_device
-    {
-        (Vec::new(), *claimed)
-    } else {
-        gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements)
-    };
+    let main_sum = main_interaction_device.1;
     #[cfg(not(feature = "cuda"))]
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
@@ -1361,14 +1339,10 @@ pub(crate) fn prove_base_shard(
     };
     let mut tree_builder = commitment_scheme.tree_builder();
     #[cfg(feature = "cuda")]
-    if let Some((main_dev, _)) = main_interaction_device {
-        let mut interaction = main_dev;
+    {
+        let mut interaction = main_interaction_device.0;
         interaction.extend(to_prover(small_interaction));
         tree_builder.extend_evals(interaction);
-    } else {
-        let mut interaction = main_interaction;
-        interaction.extend(small_interaction);
-        tree_builder.extend_evals(to_prover(interaction));
     }
     #[cfg(not(feature = "cuda"))]
     {

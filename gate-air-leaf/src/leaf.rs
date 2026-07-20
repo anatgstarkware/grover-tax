@@ -308,8 +308,11 @@ pub fn derive_aggregate_config(
 }
 
 /// Builds the leaf/R1/R2 [`RecursionPrecompute`] from the shapes carried out of
-/// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Honors
-/// `RECURSION_NO_PRECOMPUTE=1` -> all `None` (rebuild-per-prove).
+/// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Precompute is
+/// UNCONDITIONAL in production. The precompute-ON == rebuild-per-prove byte-identity the old
+/// `RECURSION_NO_PRECOMPUTE` A/B control arm checked is now the `recursion_precompute_identity`
+/// test (T3), which constructs the all-`None` control precompute directly (the fields are `pub`)
+/// and compares the recursion fingerprint.
 pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecompute {
     let AggregateShapes {
         leaf_pp,
@@ -321,14 +324,6 @@ pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecomput
         node_pp,
         node_root,
     } = shapes;
-    let no_precompute = std::env::var("RECURSION_NO_PRECOMPUTE").is_ok();
-    if no_precompute {
-        return RecursionPrecompute {
-            node_precompute: None,
-            level1_precompute: None,
-            leaf_precompute: None,
-        };
-    }
     RecursionPrecompute {
         leaf_precompute: Some(Arc::new(CircuitPrecompute::new(leaf_pp, pcs, leaf_root))),
         level1_precompute: Some(Arc::new(CircuitPrecompute::new(
