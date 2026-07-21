@@ -70,6 +70,10 @@ mod leaf;
 mod base;
 // Re-export the moved base-prover items so main.rs's unqualified references resolve unchanged.
 use base::*;
+// Free topology params + the env-var knob layer (env parsing lives in this binary, not the
+// `recursive_aggregate` library which consumes the derived config).
+mod topology;
+use topology::TopologyConfig;
 
 // ----------------------------------------------------------------------------
 // Encoding constants
@@ -122,7 +126,7 @@ pub(crate) fn tree0_max_log_size(
 const INTERACTION_POW_BITS: u32 = 8;
 
 // Blowup factor for the BASE gate_air proof (the shard / "leaves") now lives in the unified
-// `recursive_aggregate::TopologyConfig` (`base_log_blowup`, default `BASE_LOG_BLOWUP`, env
+// `topology::TopologyConfig` (`base_log_blowup`, default `BASE_LOG_BLOWUP`, env
 // `BASE_BLOWUP`). The (n_queries, pow_bits) and lifting are derived from it via `leaf::leaf_pcs_config`
 // to a ~96-bit-secure config (pow + n_queries*blowup >= 96). Sweep knob: 1/2/3.
 
@@ -1928,15 +1932,15 @@ fn build_tree0_columns(
 
 
 
-/// TRUSTED FINAL VERIFIER (step 3) for the LEAF/R1/R2 recursion. Independently checks the single
+/// TRUSTED FINAL VERIFIER (step 3) for the leaf-recursion. Independently checks the single
 /// published root-verification proof `rv` against a CANONICAL unpacker circuit recomputed here from
 /// the TRUSTED PUBLIC `(n, config)` — never from any prover-supplied value — closing the base pp-root
-/// soundness hole for the leaf/R1/R2 arm:
+/// soundness hole for the leaf-recursion arm:
 ///
-///   1. Recompute the canonical unpacker `CircuitConfig` (`leaf_r1r2_unpacker_verify_config`) — its
-///      `preprocessed_root` is the canonical LeafR1R2 unpacker root, built through the SAME shared
+///   1. Recompute the canonical unpacker `CircuitConfig` (`unpacker_verify_config`) — its
+///      `preprocessed_root` is the canonical unpacker root, built through the SAME shared
 ///      builder the prover used but with a `NoValue` witness, so it is byte-identical to the honest
-///      proof's preprocessed root. The child roots (leaf tree0, R1/R2, short leaf-node / short root)
+///      proof's preprocessed root. The child roots (leaf tree0, level1/fold-node, short leaf-node / short root)
 ///      are BAKED as constants in that circuit, so this canonical root PINS them: a proof whose
 ///      unpacker baked a forged child root has a different preprocessed root and is REJECTED here. All
 ///      those child roots are canonical config-derived values already on `config` (never prover
@@ -1950,20 +1954,20 @@ fn build_tree0_columns(
 /// recomputed circuit's component sizes match; `None` for an unblinded (test) proof. Modeled on
 /// `privacy_circuit_verify::verify_recursive_circuit`.
 fn verify_gate_air_root_leaves(
-    rv: &recursive_aggregate::RootVerificationOutput,
+    rv: &recursive_aggregate::root_prover::RootVerificationOutput,
     config: &recursive_aggregate::AggregateConfig,
     n: usize,
     log_blowup_factor: u32,
     zk_n_padding: Option<usize>,
 ) -> anyhow::Result<()> {
     use circuit_verifier::verify::{verify_circuit, CircuitPublicData};
-    use recursive_aggregate::leaf_r1r2_unpacker_verify_config;
+    use recursive_aggregate::root_prover::unpacker_verify_config;
 
     // (1) Canonical unpacker verify config recomputed from trusted public params (NoValue), sharing
     //     the prover's builder ⇒ byte-identical preprocessed root/shape. Every baked child root (leaf
-    //     tree0, R1/R2, short variants) is a canonical value already on `config`.
+    //     tree0, level1/fold-node, short variants) is a canonical value already on `config`.
     let verify_config =
-        leaf_r1r2_unpacker_verify_config(n, config, log_blowup_factor, zk_n_padding);
+        unpacker_verify_config(n, config, log_blowup_factor, zk_n_padding);
 
     // (2) Verify the published proof with the CALLER-COMMITTED per-leaf outputs.
     let output_values: Vec<SecureField> = rv.leaf_outputs.iter().flatten().copied().collect();
@@ -1973,7 +1977,7 @@ fn verify_gate_air_root_leaves(
         CircuitPublicData { output_values },
     )
     .map(|_| ())
-    .map_err(|e| anyhow::anyhow!("trusted gate_air root verification failed (leaf/R1/R2): {e}"))
+    .map_err(|e| anyhow::anyhow!("trusted gate_air root verification failed (leaf-recursion): {e}"))
 }
 
 // ----------------------------------------------------------------------------
@@ -2104,11 +2108,12 @@ fn prove_folded(
         GateAirLeafParams,
     };
     use recursive_aggregate::AggregateOutput;
-    use recursive_aggregate::{
-        prove_root_verification_leaves, recursive_aggregate_prove_leaves,
-        recursive_aggregate_prove_leaves_streaming, AggregateConfig, LeafBottom, PoolSet,
-        RecursionPrecompute, TopologyConfig, TreeProof, ZkBlind,
-    };
+    use recursive_aggregate::pools::PoolSet;
+    use recursive_aggregate::precomputes::RecursionPrecompute;
+    use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
+    use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
+    use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom, ZkBlind};
+    use recursive_aggregate::{AggregateConfig, TreeProof};
     use stwo::core::fields::qm31::QM31;
 
     // The base-proof tuple `prove_base_shard` returns (defined in `base.rs`, imported here so the
@@ -2249,7 +2254,7 @@ fn prove_folded(
     };
     // The base preprocessed root is a WITNESS in the leaf statement (`GateAirStatement::new`
     // GUESSES it — circuit_statement.rs), so its VALUE never enters any preprocessed trace nor any
-    // leaf/R1/R2 `CircuitPrecompute` (all built from `NoValue` shapes, where the guessed root's
+    // leaf/level1/fold-node `CircuitPrecompute` (all built from `NoValue` shapes, where the guessed root's
     // value is ignored). We therefore give `shape_params` a byte-irrelevant ZERO placeholder here.
     let placeholder_base_pp_root: HashValue<SecureField> =
         HashValue(std::array::from_fn(|_| U32Wrapper::new_unsafe(SecureField::zero())));
@@ -2277,7 +2282,7 @@ fn prove_folded(
         );
         let pre = build_recursion_precompute(shapes);
         eprintln!(
-            "gate-air: leaf/R1/R2 config + precompute built up front in {:.1}s (node target qm31_ops={})",
+            "gate-air: leaf-recursion config + precompute built up front in {:.1}s (node target qm31_ops={})",
             t_cfg.elapsed().as_secs_f64(),
             agg.node_target_padding_sizes.qm31_ops,
         );
@@ -2564,9 +2569,9 @@ fn prove_folded(
     // BASE↔LEAF OVERLAP (pipeline only), "hide the fold behind base-proving" (Model 1):
     // each leaf verifies exactly ONE base, so as bases arrive from the GPU producer channel we feed
     // them into `recursive_aggregate_prove_leaves_streaming`, which WRAPS each base into a leaf AND
-    // folds the whole tree (level-0 leaf→R1 layer + shared R2 up-tree fold) PROGRESSIVELY on the CPU
+    // folds the whole tree (level-0 leaf→level1-node layer + shared fold-node up-tree fold) PROGRESSIVELY on the CPU
     // `pools` — so GPU base-proving overlaps with BOTH the CPU leaf-wrap AND the fold (no separate
-    // fold tail). The leaf/R1/R2 config + precompute are already built up front (`leaf_cfg` /
+    // fold tail). The leaf-recursion config + precompute are already built up front (`leaf_cfg` /
     // `recursion_pre`). The non-pipeline path keeps the "materialize all bases, then wrap" flow.
     // Pipeline yields the already-folded `(leaves, AggregateOutput)`; the non-pipeline path yields
     // `bases`.
@@ -2688,7 +2693,7 @@ fn prove_folded(
             if overlap_leaves {
                 // OVERLAP (Model 1): feed each base into `recursive_aggregate_prove_leaves_streaming`
                 // AS IT ARRIVES, concurrent with the GPU producers still proving later shards. The
-                // coordinator owns the single wrap+R1+R2 pool and folds progressively; the injected
+                // coordinator owns the single wrap+level1+fold-node pool and folds progressively; the injected
                 // `wrap` closure (make_base + prove_gate_air_leaf) runs INSIDE its pool workers, so
                 // GPU base-proving overlaps BOTH the leaf-wrap and the fold. Leaf i = shard i
                 // (index-tagged), byte-identical to the sequential wrap+fold.
@@ -2801,7 +2806,7 @@ fn prove_folded(
     // ---- Bottom layer + fold + root verification ----
     // The bases (`(Proof<QM31>, GateAirLeafParams)` in shard order) are materialized above.
     // Prove one standalone leaf per base (`prove_gate_air_leaf`), fold the leaves via
-    // `recursive_aggregate_prove_leaves` (level-0 R1 layer + shared R2 fold), and unpack via
+    // `recursive_aggregate_prove_leaves` (level-0 level1-node layer + shared fold-node fold), and unpack via
     // `LeafBottom` / `prove_root_verification_leaves`. Binds `base_nodes` (the fold's height-1
     // inputs), `out`, and `rv` for the shared fingerprint block below.
     let (base_nodes, out, rv) = {
@@ -2855,7 +2860,7 @@ fn prove_folded(
                     leaves.len(),
                     tg.elapsed().as_secs_f64()
                 );
-                // Fold: level-0 R1 layer over the leaves + shared R2 up-tree fold.
+                // Fold: level-0 level1-node layer over the leaves + shared fold-node up-tree fold.
                 let tf = Instant::now();
                 let out = recursive_aggregate_prove_leaves(
                     leaves.clone(),
@@ -2897,8 +2902,8 @@ fn prove_folded(
 
             // TRUSTED FINAL VERIFY (step 3): check the published proof against a canonical unpacker
             // circuit recomputed here from the trusted public `(n, config)` — the real soundness
-            // anchor for the LeafR1R2 arm. The canonical unpacker root PINS every baked child root
-            // (canonical leaf tree0 root + R1/R2/short roots), and the per-leaf outputs are taken
+            // anchor for the leaf-recursion arm. The canonical unpacker root PINS every baked child root
+            // (canonical leaf tree0 root + level1/fold-node/short roots), and the per-leaf outputs are taken
             // from `rv.leaf_outputs` (caller-committed), not the proof.
             let n_leaves = rv.leaf_outputs.len();
             eprintln!(
@@ -2913,13 +2918,13 @@ fn prove_folded(
                 recursion_log_blowup,
                 Some(agg.node_pcs_config.fri_config.n_queries),
             )
-            .expect("trusted gate_air root verification failed (leaf/R1/R2)");
+            .expect("trusted gate_air root verification failed (leaf-recursion)");
             eprintln!(
                 "gate-air: TRUSTED root verify OK in {:.1}s (canonical unpacker root, {} caller-committed outputs)",
                 tv.elapsed().as_secs_f64(),
                 n_leaves,
             );
-            // The fold's height-1 inputs are the leaves themselves under LeafR1R2 (b=1); expose
+            // The fold's height-1 inputs are the leaves themselves under leaf-recursion (b=1); expose
             // them as `base_nodes` for the shared fingerprint block.
             (leaves, out, rv)
     };
@@ -3015,7 +3020,7 @@ fn prove_monolithic(
     // exact config, so its verification circuit now reflects the real (secure) decommitment cost.
     // Base blowup is a sweep knob (env BASE_BLOWUP overrides the default), read off the unified
     // TopologyConfig so this monolithic (non-fold) path resolves the same value as the recursion path.
-    let base_blowup: u32 = recursive_aggregate::TopologyConfig::from_env().base_log_blowup;
+    let base_blowup: u32 = TopologyConfig::from_env().base_log_blowup;
     let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
@@ -3502,7 +3507,7 @@ mod tests {
         );
         let config = leaf::leaf_pcs_config(
             max_log_size,
-            recursive_aggregate::TopologyConfig::default().base_log_blowup,
+            TopologyConfig::default().base_log_blowup,
         );
         (
             rows,
@@ -3898,26 +3903,26 @@ mod tests {
         (circuit_proof, params)
     }
 
-    /// The LEAF/R1/R2 prove→fold→verify→self-verify roundtrip over `n_leaves`
+    /// The leaf-recursion prove→fold→verify→self-verify roundtrip over `n_leaves`
     /// standalone gate_air leaves, using the toy per-base PCS from `prove_tiny_base`: one leaf per base
     /// (`prove_gate_air_leaf`),
-    /// a level-0 leaf-verifying (R1) layer + shared R2 up-tree fold (`recursive_aggregate_prove_leaves`),
+    /// a level-0 leaf-verifying (level1-node) layer + shared fold-node up-tree fold (`recursive_aggregate_prove_leaves`),
     /// and the leaf unpacker (`prove_root_verification_leaves` / `LeafBottom`). `n_leaves == 1` is a
-    /// lone-leaf root (no R1, no R2 — laptop-safe); `n_leaves >= 2` builds the level-0 R1 layer (and, at
-    /// `n > k`, an R2 up-tree node) which floors ~2^22 → heavy.
-    fn leaf_r1r2_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
+    /// lone-leaf root (no level1-node, no fold-node — laptop-safe); `n_leaves >= 2` builds the level-0 level1-node layer (and, at
+    /// `n > k`, an fold-node up-tree node) which floors ~2^22 → heavy.
+    fn leaf_recursion_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
         use circuits_stark_verifier::proof::Proof;
         use leaf::{
             build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
             GateAirLeafParams,
         };
-        use recursive_aggregate::{
-            prove_root_verification_leaves, recursive_aggregate_prove_leaves, LeafBottom, PoolSet,
-            TreeProof,
-        };
+        use recursive_aggregate::pools::PoolSet;
+        use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
+        use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom};
+        use recursive_aggregate::TreeProof;
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
-        // LeafR1R2 uses the leaf preprocessed root (not the base-fanning canonical base root), so the
+        // leaf-recursion uses the leaf preprocessed root (not the base-fanning canonical base root), so the
         // recomputed canonical base pp root is unused here.
         let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let (config, shapes) = derive_aggregate_config(
@@ -3956,60 +3961,60 @@ mod tests {
 
         // TRUSTED FINAL VERIFY (step 3): check `rv` against a canonical unpacker circuit recomputed
         // from trusted public `(n, config)` — canonical unpacker root (pins every baked child root
-        // incl. the canonical leaf tree0 root + R1/R2/short roots) and the caller-committed
+        // incl. the canonical leaf tree0 root + level1/fold-node/short roots) and the caller-committed
         // `rv.leaf_outputs`. `None` blinding matches the unblinded test proof above.
         verify_gate_air_root_leaves(&rv, &config, n_leaves, log_blowup_factor, None)
-            .expect("trusted gate_air root verification failed (leaf/R1/R2 roundtrip)");
+            .expect("trusted gate_air root verification failed (leaf-recursion roundtrip)");
 
         eprintln!(
-            "gate-air: leaf_r1r2 roundtrip OK (N={n_leaves}, n_levels={}, root trace 2^{}) [trusted verify OK]",
+            "gate-air: leaf_recursion roundtrip OK (N={n_leaves}, n_levels={}, root trace 2^{}) [trusted verify OK]",
             out.n_levels, rv.trace_log_size
         );
     }
 
-    /// End-to-end LeafR1R2 correctness gate: ONE standalone leaf that IS the root (no R1 level-0 node,
-    /// no R2 up-tree fold). Validates the leaf-topology WIRING — `derive_aggregate_config`,
+    /// End-to-end leaf-recursion correctness gate: ONE standalone leaf that IS the root (no level-0 level1-node,
+    /// no fold-node up-tree fold). Validates the leaf-topology WIRING — `derive_aggregate_config`,
     /// `prove_gate_air_leaf`, and the leaf unpacker reconstructing + binding a single-leaf tree
-    /// (`prove_root_verification_leaves`'s final `verify_circuit` sanity check). The multi-leaf R1/R2
+    /// (`prove_root_verification_leaves`'s final `verify_circuit` sanity check). The multi-leaf level1/fold-node
     /// path is exercised by the env-gated heavy variant + proving-utils' restored `smoke_cairo_tree`.
     ///
     /// RUN-GUARD (laptop-safety): env-gated to HEAVY_RECURSION so plain `cargo test` never
     /// executes a real recursion prove/verify on a laptop. Run it on the CPU VM with the guard set.
     #[test]
-    fn leaf_r1r2_end_to_end() {
+    fn leaf_recursion_end_to_end() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
-                "leaf_r1r2_end_to_end: SKIPPED (recursion prove/verify). Set \
+                "leaf_recursion_end_to_end: SKIPPED (recursion prove/verify). Set \
                  HEAVY_RECURSION=1 to run."
             );
             return;
         }
         // N=1: lone leaf is the root; no fold. Blowup 1 keeps the leaf + root-verify proofs minimal.
-        leaf_r1r2_roundtrip(
+        leaf_recursion_roundtrip(
             1,
             1,
-            recursive_aggregate::TopologyConfig::default().fold_arity,
+            TopologyConfig::default().fold_arity,
         );
     }
 
-    /// HEAVY (box-only): the LeafR1R2 roundtrip WITH the level-0 R1 layer + R2 up-tree fold. R2 floors
+    /// HEAVY (box-only): the leaf-recursion roundtrip WITH the level-0 level1-node layer + fold-node up-tree fold. The fold-node floors
     /// ~2^22 (several GB); OOMs a laptop, so env-gated to HEAVY_RECURSION=1. Plain `cargo test`
     /// compiles + SKIPS it.
     #[test]
-    fn leaf_r1r2_end_to_end_with_r2() {
+    fn leaf_recursion_end_to_end_with_fold() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
-                "leaf_r1r2_end_to_end_with_r2: SKIPPED (heavy: R1/R2 nodes ~2^22). Set \
-                 HEAVY_RECURSION=1 on the CPU VM to run the with-R1/R2 roundtrip."
+                "leaf_recursion_end_to_end_with_fold: SKIPPED (heavy: level1/fold-node nodes ~2^22). Set \
+                 HEAVY_RECURSION=1 on the CPU VM to run the with-level1/fold-node roundtrip."
             );
             return;
         }
-        // N=2: two leaves → one level-0 R1 leaf-node that IS the root (N <= k, no R2). Bump to N > k to
-        // also exercise the R2 up-tree fold once a box run confirms the R1 layer.
-        leaf_r1r2_roundtrip(
+        // N=2: two leaves → one level-0 level1-node that IS the root (N <= k, no fold-node). Bump to N > k to
+        // also exercise the fold-node up-tree fold once a box run confirms the level1-node layer.
+        leaf_recursion_roundtrip(
             2,
             3,
-            recursive_aggregate::TopologyConfig::default().fold_arity,
+            TopologyConfig::default().fold_arity,
         );
     }
 
@@ -4022,18 +4027,18 @@ mod tests {
     /// equality proves the streaming path is byte-identical to the sequential one — the acceptance
     /// invariant for "hide the fold behind base-proving". `k` is the default fold arity.
     ///
-    /// HEAVY (box-only): builds real R1 (and, at `n > k`, R2) multiverifier nodes (~2^22, GBs) so it
+    /// HEAVY (box-only): builds real level1 (and, at `n > k`, fold-node) multiverifier nodes (~2^22, GBs) so it
     /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
-    fn leaf_r1r2_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
+    fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
         use circuits_stark_verifier::proof::Proof;
         use leaf::{
             build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
             GateAirLeafParams,
         };
-        use recursive_aggregate::{
-            recursive_aggregate_prove_leaves, recursive_aggregate_prove_leaves_streaming,
-            AggregateOutput, PoolSet, TreeProof,
-        };
+        use recursive_aggregate::pools::PoolSet;
+        use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
+        use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
+        use recursive_aggregate::{AggregateOutput, TreeProof};
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let (proof0, params0, cfg, _canonical_base_pp_root) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
@@ -4104,59 +4109,61 @@ mod tests {
             );
         }
         eprintln!(
-            "gate-air: leaf_r1r2 streaming-equiv OK (N={n_leaves}, bit-identical to sequential, scrambled arrival, n_pools 1+2)"
+            "gate-air: leaf_recursion streaming-equiv OK (N={n_leaves}, bit-identical to sequential, scrambled arrival, n_pools 1+2)"
         );
     }
 
     /// (box-only) Scheduling-independence roundtrip over the required n ∈ {1, 2, k, k+1, ragged
-    /// r==1, ~2k+3}. Env-gated (heavy R1/R2 proving). Proves streaming == sequential byte-for-byte.
+    /// r==1, ~2k+3}. Env-gated (heavy level1/fold-node proving). Proves streaming == sequential byte-for-byte.
     #[test]
-    fn leaf_r1r2_streaming_equiv_sweep() {
+    fn leaf_recursion_streaming_equiv_sweep() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
-                "leaf_r1r2_streaming_equiv_sweep: SKIPPED (heavy: real R1/R2 proving ~2^22). Set \
+                "leaf_recursion_streaming_equiv_sweep: SKIPPED (heavy: real level1/fold-node proving ~2^22). Set \
                  HEAVY_RECURSION=1 on the CPU VM to run the out-of-order equivalence sweep."
             );
             return;
         }
-        let k = recursive_aggregate::TopologyConfig::default().fold_arity;
+        let k = TopologyConfig::default().fold_arity;
         // n = k+1 is the ragged r==1 case (splits into k-1 and 2); 2k+3 exercises multi-group + carry.
         for n in [1usize, 2, k, k + 1, 2 * k + 3] {
-            leaf_r1r2_streaming_equiv(n, 1, k);
+            leaf_recursion_streaming_equiv(n, 1, k);
         }
     }
 
     /// TERMINATION + PANIC PROPAGATION for the streaming coordinator: a `wrap` closure that panics
     /// must make the coordinator re-panic on the parent (via `thread::scope` join) — no hang, no
-    /// silent drop — for BOTH n_pools == 1 and > 1. The panic fires INSIDE `wrap`, before any R1/fold
+    /// silent drop — for BOTH n_pools == 1 and > 1. The panic fires INSIDE `wrap`, before any level1/fold
     /// node proves, so the machinery under test is pure scheduling/termination.
     ///
-    /// HEAVY (box-only): `derive_aggregate_config` builds the ~2^22 R1/R2 node preprocessed shapes
+    /// HEAVY (box-only): `derive_aggregate_config` builds the ~2^22 level1/fold-node preprocessed shapes
     /// (heavy REGARDLESS of leaf size — a node verifies `fold_arity` in-circuit STARK proofs), which
     /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
     #[test]
-    fn leaf_r1r2_streaming_wrap_panic_propagates() {
+    fn leaf_recursion_streaming_wrap_panic_propagates() {
         if std::env::var("HEAVY_RECURSION").is_err() {
             eprintln!(
-                "leaf_r1r2_streaming_wrap_panic_propagates: SKIPPED (heavy: config build ~2^22). \
+                "leaf_recursion_streaming_wrap_panic_propagates: SKIPPED (heavy: config build ~2^22). \
                  Set HEAVY_RECURSION=1 on the CPU VM to run the panic-propagation test."
             );
             return;
         }
-        use recursive_aggregate::{recursive_aggregate_prove_leaves_streaming, PoolSet, TreeProof};
+        use recursive_aggregate::pools::PoolSet;
+        use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
+        use recursive_aggregate::TreeProof;
 
-        // Build the smallest valid LeafR1R2 config from a tiny base. No recursion PROVE runs (wrap
+        // Build the smallest valid leaf-recursion config from a tiny base. No recursion PROVE runs (wrap
         // panics first), but the config build itself is the heavy part gated above.
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
-        let fold_arity = recursive_aggregate::TopologyConfig::default().fold_arity;
+        let fold_arity = TopologyConfig::default().fold_arity;
         let (config, shapes) = leaf::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
         let pre = leaf::build_recursion_precompute(shapes);
 
         for n_pools in [1usize, 2] {
             let config = &config;
             let pre = &pre;
-            let n_leaves = 2usize; // one R1 group (n <= k); wrap panics before any node proves.
+            let n_leaves = 2usize; // one level1 group (n <= k); wrap panics before any node proves.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let pools = PoolSet::new(n_pools, 2);
                 let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
@@ -4166,7 +4173,7 @@ mod tests {
                 drop(tx);
                 // Every `wrap` panics — a worker panic must re-panic on the coordinator's
                 // `thread::scope` join (not hang, not be silently dropped). The panic fires inside
-                // `wrap`, before any R1/fold node runs, so no real proving happens (laptop-safe).
+                // `wrap`, before any level1/fold node runs, so no real proving happens (laptop-safe).
                 recursive_aggregate_prove_leaves_streaming(
                     rx,
                     n_leaves,
@@ -4398,7 +4405,7 @@ mod tests {
         }
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let n_gates = gates.len();
-        let topo = recursive_aggregate::TopologyConfig::default();
+        let topo = TopologyConfig::default();
         let rc_lo = build_rc_lo();
         let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
             shard0_shape(&gates, &cases, k, RC_LOG);
@@ -4446,17 +4453,18 @@ mod tests {
             build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
             GateAirLeafParams,
         };
-        use recursive_aggregate::{
-            prove_root_verification_leaves, recursive_aggregate_prove_leaves, LeafBottom, PoolSet,
-            RecursionPrecompute, TreeProof,
-        };
+        use recursive_aggregate::pools::PoolSet;
+        use recursive_aggregate::precomputes::RecursionPrecompute;
+        use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
+        use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom};
+        use recursive_aggregate::TreeProof;
         if std::env::var("HEAVY_RECURSION").is_err() {
-            eprintln!("recursion_precompute_identity: SKIPPED (heavy R1/R2 proving). Set HEAVY_RECURSION=1 on the box.");
+            eprintln!("recursion_precompute_identity: SKIPPED (heavy level1/fold-node proving). Set HEAVY_RECURSION=1 on the box.");
             return;
         }
         let n_leaves = 2usize;
         let log_blowup_factor = 1u32;
-        let fold_arity = recursive_aggregate::TopologyConfig::default().fold_arity;
+        let fold_arity = TopologyConfig::default().fold_arity;
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
         let (proof0, params0, cfg, _canon) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
@@ -4490,7 +4498,7 @@ mod tests {
         // ON: the production precompute. OFF: the all-`None` control arm (rebuild-per-prove).
         let pre_on = build_recursion_precompute(shapes);
         let pre_off = RecursionPrecompute {
-            node_precompute: None,
+            fold_precompute: None,
             level1_precompute: None,
             leaf_precompute: None,
         };

@@ -1053,7 +1053,7 @@ pub(crate) fn prove_base_shard(
     gates: &[Gate],
     k: usize,
     n_gates: usize,
-    topo: &recursive_aggregate::TopologyConfig,
+    topo: &crate::topology::TopologyConfig,
     rc_lo_index: &RcIndex,
 ) -> Result<BaseShardOutput> {
     let shard_samples = shard_cases.len();

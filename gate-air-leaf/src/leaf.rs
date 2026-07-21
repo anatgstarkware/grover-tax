@@ -27,9 +27,10 @@ use circuit_prover::prover::{
 };
 use std::sync::Arc;
 
+use recursive_aggregate::precomputes::{CircuitPrecompute, RecursionPrecompute};
 use recursive_aggregate::{
     multiverifier_node_preprocessed, node_preprocessed_from_shared, preprocessed_root,
-    shared_config_for_leaf, AggregateConfig, CircuitPrecompute, RecursionPrecompute, TreeProof,
+    shared_config_for_leaf, AggregateConfig, TreeProof,
 };
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
@@ -162,13 +163,13 @@ pub fn emit_one_base<Value: IValue>(
 }
 
 // =================================================================================================
-// LEAF/R1/R2 topology — a standalone single-base LEAF (one gate_air base per leaf), a level-1
-// leaf-verifying (R1) node layer, and the shared R2 up-tree fold.
+// Leaf topology — a standalone single-base LEAF (one gate_air base per leaf), a level-1
+// leaf-verifying node layer, and the shared fold-node up-tree fold.
 // =================================================================================================
 
 /// Builds the gate_air single-base LEAF circuit: verify ONE gate_air base proof in-circuit (via
-/// [`emit_one_base`]) and set the reserved outputs to its `H_i`. The multiverifier's level-0 R1 nodes
-/// verify these leaves. Generic over `Value` (NoValue shape / QM31 assignment).
+/// [`emit_one_base`]) and set the reserved outputs to its `H_i`. The multiverifier's level-0
+/// level1-nodes verify these leaves. Generic over `Value` (NoValue shape / QM31 assignment).
 pub fn build_gate_air_leaf_circuit<Value: IValue>(
     proof: Proof<Value>,
     cfg: &ProofConfig,
@@ -180,14 +181,15 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     context.finalize(false)
 }
 
-/// Derives the leaf/R1/R2 `AggregateConfig` for gate_air leaves of this proof's shape.
+/// Derives the `AggregateConfig` for gate_air leaves of this proof's shape.
 /// Resolves the leaf↔node padding decoupling: the leaf pads to its OWN
-/// natural target (~2^20), while the two full-`fold_arity` node variants (R1 verifies leaves, R2
-/// verifies nodes) pad to a COMMON `node_target` fixed point. Populates the config's LeafR1R2 extras
-/// (`leaf_shared_config`, R1, `leaf_preprocessed_root`, leaf target/PCS, leaf/level1 precomputes).
-/// The preprocessed circuits + their (pcs, root) for the leaf/R1/R2 shapes, carried out of
-/// [`derive_aggregate_config`] so [`build_recursion_precompute`] can build the heavy
-/// [`CircuitPrecompute`]s WITHOUT recomputing the (expensive) node fixed-point loop.
+/// natural target (~2^20), while the two full-`fold_arity` node variants (level1-node verifies leaves,
+/// fold-node verifies nodes) pad to a COMMON `node_target` fixed point. Populates the config's leaf /
+/// level1 fields (`leaf_shared_config`, `level1_preprocessed_root`, `leaf_preprocessed_root`, leaf
+/// target/PCS, leaf/level1 precomputes). The preprocessed circuits + their (pcs, root) for the
+/// leaf/level1/fold-node shapes, carried out of [`derive_aggregate_config`] so
+/// [`build_recursion_precompute`] can build the heavy [`CircuitPrecompute`]s WITHOUT recomputing the
+/// (expensive) node fixed-point loop.
 pub struct AggregateShapes {
     pub leaf_pp: PreprocessedCircuit,
     pub pcs: PcsConfig,
@@ -203,11 +205,11 @@ pub fn derive_aggregate_config(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     fold_arity: usize,
-    // Node (R1/R2/root) FRI blowup.
+    // Node (level1-/fold-node/root) FRI blowup.
     log_blowup_factor: u32,
     // Leaf-wrap FRI blowup, decoupled from the node blowup (equal to it unless `LEAF_BLOWUP` is set).
-    // Only the leaf shape's own PCS + preprocessed root take this; R1 verifies leaves at this blowup
-    // automatically because its child config is `shared_config_for_leaf(&leaf_pp, pcs)`.
+    // Only the leaf shape's own PCS + preprocessed root take this; the level1-node verifies leaves at
+    // this blowup automatically because its child config is `shared_config_for_leaf(&leaf_pp, pcs)`.
     leaf_log_blowup: u32,
 ) -> (AggregateConfig, AggregateShapes) {
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
@@ -228,10 +230,10 @@ pub fn derive_aggregate_config(
     let leaf_shared_config = shared_config_for_leaf(&leaf_pp, pcs);
 
     // The two node variants both pad to a COMMON `node_target` (self-verification fixed point):
-    //   - level-1 node (R1): verifies `fold_arity` LEAVES → sized with the leaf `pcs`.
-    //   - level-≥2 node (R2): verifies `fold_arity` NODES → sized with a NODE pcs (node blowup +
+    //   - level-1 node: verifies `fold_arity` LEAVES → sized with the leaf `pcs`.
+    //   - level-≥2 fold-node: verifies `fold_arity` NODES → sized with a NODE pcs (node blowup +
     //     the node's OWN trace_log = `level1_pp.trace_log_size`, which is padded to `node_target`).
-    // Sizing R2's child as a node (not with the leaf `pcs`) makes the fixed point exact for ANY
+    // Sizing the fold-node's child as a node (not with the leaf `pcs`) makes the fixed point exact for ANY
     // leaf/node blowup pair. This only sets witness padding; the pinned pp-roots are independent of
     // blowup/trace_size, so it does not touch the trust anchors.
     let (_, node1_seed_sizes) = multiverifier_node_preprocessed(&leaf_pp, pcs, None, fold_arity);
@@ -239,7 +241,7 @@ pub fn derive_aggregate_config(
     let (level1_pp, node_pp) = loop {
         let (level1_pp, level1_unpadded) =
             multiverifier_node_preprocessed(&leaf_pp, pcs, Some(node_target.clone()), fold_arity);
-        // R2 verifies NODES: size its child with the node blowup + the node's own trace_log.
+        // fold-node verifies NODES: size its child with the node blowup + the node's own trace_log.
         let node_child_pcs = leaf_pcs_config(level1_pp.trace_log_size, log_blowup_factor);
         let (node_pp, node2_unpadded) = multiverifier_node_preprocessed(
             &level1_pp,
@@ -256,11 +258,11 @@ pub fn derive_aggregate_config(
     let level1_preprocessed_root = preprocessed_root(&level1_pp, log_blowup_factor);
 
     // LEAF↔NODE PCS DECOUPLING. A node proof's Merkle auth-path height (node trace ~2^22 + blowup ~25)
-    // is larger than a leaf's (~24), so describe a NODE's own proof (its prove + the R2 child-verify +
-    // the root verify) with a separate node PCS from the node trace size.
+    // is larger than a leaf's (~24), so describe a NODE's own proof (its prove + the fold-node
+    // child-verify + the root verify) with a separate node PCS from the node trace size.
     let node_pcs = leaf_pcs_config(node_pp.trace_log_size, log_blowup_factor);
     let node_shared_config = shared_config_for_leaf(&level1_pp, node_pcs);
-    // Rebuild the R2 (node-verifying) node shape with the NODE pcs for its children (matches
+    // Rebuild the fold-node (node-verifying) node shape with the NODE pcs for its children (matches
     // `build_node_context` at prove time).
     let node_pp =
         node_preprocessed_from_shared(&node_shared_config, node_target.clone(), fold_arity);
@@ -268,7 +270,7 @@ pub fn derive_aggregate_config(
 
     let roots_collapse = level1_preprocessed_root == node_preprocessed_root;
     eprintln!(
-        "gate-air: leaf↔node decoupling: leaf trace 2^{} (pcs lifting {:?}), node trace 2^{} (pcs lifting {:?}); R1{}R2 (collapse={})",
+        "gate-air: leaf↔node decoupling: leaf trace 2^{} (pcs lifting {:?}), node trace 2^{} (pcs lifting {:?}); level1{}fold-node (collapse={})",
         leaf_pp.trace_log_size,
         pcs.lifting_log_size,
         node_pp.trace_log_size,
@@ -291,23 +293,23 @@ pub fn derive_aggregate_config(
     };
 
     let agg = AggregateConfig {
-        // Shared / R2 (also used by the shared up-tree fold).
-        node_shared_config,
-        node_preprocessed_root,
+        // Shared / fold-node tier (also used by the shared up-tree fold).
+        fold_shared_config: node_shared_config,
+        fold_preprocessed_root: node_preprocessed_root,
         node_target_padding_sizes: node_target,
         node_pcs_config: node_pcs,
         fold_arity,
-        // LeafR1R2 tier.
-        leaf_shared_config: Some(leaf_shared_config),
-        level1_preprocessed_root: Some(level1_preprocessed_root),
-        leaf_preprocessed_root: Some(leaf_preprocessed_root),
-        leaf_target_padding_sizes: Some(leaf_target),
-        leaf_pcs_config: Some(pcs),
+        // Leaf / level1 tier.
+        leaf_shared_config,
+        level1_preprocessed_root,
+        leaf_preprocessed_root,
+        leaf_target_padding_sizes: leaf_target,
+        leaf_pcs_config: pcs,
     };
     (agg, shapes)
 }
 
-/// Builds the leaf/R1/R2 [`RecursionPrecompute`] from the shapes carried out of
+/// Builds the leaf/level1/fold-node [`RecursionPrecompute`] from the shapes carried out of
 /// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Precompute is
 /// UNCONDITIONAL in production. The precompute-ON == rebuild-per-prove byte-identity the old
 /// `RECURSION_NO_PRECOMPUTE` A/B control arm checked is now the `recursion_precompute_identity`
@@ -331,15 +333,14 @@ pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecomput
             node_pcs,
             level1_root,
         ))),
-        node_precompute: Some(Arc::new(CircuitPrecompute::new(
+        fold_precompute: Some(Arc::new(CircuitPrecompute::new(
             node_pp, node_pcs, node_root,
         ))),
     }
 }
 
-/// Builds + proves one gate_air single-base LEAF ([`FoldMode::LeafR1R2`]), padded to its OWN target so
-/// `t_leaf` stays pinned independent of `fold_arity`. `real_proof` is the gate_air proof as circuit
-/// values. Requires a `LeafR1R2` config.
+/// Builds + proves one gate_air single-base LEAF, padded to its OWN target so `t_leaf` stays pinned
+/// independent of `fold_arity`. `real_proof` is the gate_air proof as circuit values.
 pub fn prove_gate_air_leaf(
     real_proof: Proof<QM31>,
     cfg: &ProofConfig,
@@ -347,16 +348,9 @@ pub fn prove_gate_air_leaf(
     config: &AggregateConfig,
     pre: &RecursionPrecompute,
 ) -> TreeProof {
-    let leaf_target = config.leaf_target_padding_sizes.clone().expect(
-        "prove_gate_air_leaf requires a LeafR1R2 config (leaf_target_padding_sizes present)",
-    );
-    let leaf_pcs = config
-        .leaf_pcs_config
-        .expect("prove_gate_air_leaf requires a LeafR1R2 config (leaf_pcs_config present)");
-    let leaf_preprocessed_root = config
-        .leaf_preprocessed_root
-        .clone()
-        .expect("prove_gate_air_leaf requires a LeafR1R2 config (leaf_preprocessed_root present)");
+    let leaf_target = config.leaf_target_padding_sizes.clone();
+    let leaf_pcs = config.leaf_pcs_config;
+    let leaf_preprocessed_root = config.leaf_preprocessed_root.clone();
     let mut context = build_gate_air_leaf_circuit::<QM31>(real_proof, cfg, params);
     pad_to_targets(&mut context, leaf_target);
     let circuit_proof = match &pre.leaf_precompute {

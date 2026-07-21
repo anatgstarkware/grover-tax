@@ -8,7 +8,8 @@
 //! `diag` feature exists for parity with the test-support harnesses but these helpers are compiled
 //! unconditionally so `GATE_AIR_*` can be flipped at RUN time on the production-fast binary.
 
-use recursive_aggregate::{AggregateOutput, RootVerificationOutput, TreeProof};
+use recursive_aggregate::root_prover::RootVerificationOutput;
+use recursive_aggregate::{AggregateOutput, TreeProof};
 use sha2::{Digest, Sha256};
 
 use crate::base::BaseShardOutput;
