@@ -75,8 +75,7 @@ pub fn base_proof_fingerprint(shard_bases: &[BaseShardOutput]) -> String {
 /// `base_nodes`) + their outputs, the root proof + outputs, and the unpacked leaf outputs.
 ///
 /// `Proof<QM31>` is purely Vec/array/struct of QM31 (no maps), so its `{:?}` Debug form is a
-/// deterministic, cross-process canonical encoding. `recursion_precompute_identity` (T3) compares
-/// precompute-ON vs OFF via this value; the k=500 gate is `32d827a2`.
+/// deterministic, cross-process canonical encoding; the k=500 byte-identity gate is `32d827a2`.
 pub fn recursion_fingerprint(
     base_nodes: &[TreeProof],
     out: &AggregateOutput,
@@ -85,7 +84,12 @@ pub fn recursion_fingerprint(
     let mut hasher = Sha256::new();
     hasher.update(b"gate-air/recursion-proofs/debug/v1");
     hasher.update(
-        format!("n_base_nodes={} n_levels={}", base_nodes.len(), out.n_levels).as_bytes(),
+        format!(
+            "n_base_nodes={} n_levels={}",
+            base_nodes.len(),
+            out.n_levels
+        )
+        .as_bytes(),
     );
     for (i, bn) in base_nodes.iter().enumerate() {
         hasher.update(format!("base_node[{i}].proof={:?}", bn.proof).as_bytes());
