@@ -1950,6 +1950,27 @@ fn build_tree0_columns(
 /// `zk_n_padding` must equal the prover's blinding `n_padding` (the root PCS `n_queries`) so the
 /// recomputed circuit's component sizes match; `None` for an unblinded (test) proof. Modeled on
 /// `privacy_circuit_verify::verify_recursive_circuit`.
+/// The PINNED per-operating-point unpacker verify [`CircuitConfig`] — `op`'s `PinnedConfigs` rebuilt
+/// (`to_derived`) at the default node/leaf blowup the pinned points were captured with. Asserts
+/// `n == op.n()` (the unpacker is per-operating-point; only this point's leaf count is pinned).
+fn pinned_unpacker_config(
+    op: recursion_consts::OperatingPoint,
+    n: usize,
+) -> circuit_verifier::verify::CircuitConfig {
+    assert_eq!(
+        n,
+        op.n(),
+        "unpacker config requested for n={n} but this operating point has N={}",
+        op.n()
+    );
+    op.pinned()
+        .to_derived(
+            topology::RECURSION_LOG_BLOWUP,
+            topology::RECURSION_LOG_BLOWUP,
+        )
+        .unpacker
+}
+
 fn verify_gate_air_root_leaves(
     rv: &recursive_aggregate::root_prover::RootVerificationOutput,
     op: recursion_consts::OperatingPoint,
@@ -1960,7 +1981,7 @@ fn verify_gate_air_root_leaves(
     // (1) The trusted unpacker verify config is the PINNED per-N const (no recompute/commit at verify).
     //     Its `preprocessed_root` is the canonical unpacker root; a proof whose unpacker baked a forged
     //     child root has a different preprocessed root and is REJECTED here.
-    let verify_config = op.unpacker_config(n);
+    let verify_config = pinned_unpacker_config(op, n);
 
     // (2) Verify the published proof with the CALLER-COMMITTED per-leaf outputs.
     let output_values: Vec<SecureField> = rv.leaf_outputs.iter().flatten().copied().collect();
@@ -2857,7 +2878,7 @@ fn prove_folded(
         };
         // Pinned per-N unpacker config (the trusted verify const); the prover's one-shot unpacker
         // tree asserts its committed root == this const's `preprocessed_root`.
-        let unpacker_config = op.unpacker_config(leaves.len());
+        let unpacker_config = pinned_unpacker_config(op, leaves.len());
         let t = Instant::now();
         let rv =
             prove_root_verification_leaves(&out.root, &bottom, &agg, &unpacker_config, Some(zk));
@@ -3867,15 +3888,12 @@ mod tests {
     fn leaf_recursion_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
         use circuit_verifier::verify::{verify_circuit, CircuitPublicData};
         use circuits_stark_verifier::proof::Proof;
-        use leaf::{
-            build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
-            GateAirLeafParams,
-        };
+        use leaf::{build_recursion_precompute, prove_gate_air_leaf, GateAirLeafParams};
+        use recursion_consts_tests::derive_aggregate_config;
         use recursive_aggregate::pools::PoolSet;
         use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
-        use recursive_aggregate::root_prover::{
-            prove_root_verification_leaves, unpacker_verify_config, LeafBottom,
-        };
+        use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom};
+        use recursive_aggregate::test_utils::unpacker_verify_config;
         use recursive_aggregate::TreeProof;
 
         let (gates, cases, k) = nop_fixture(4, 2, 1);
@@ -3990,10 +4008,8 @@ mod tests {
     /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
     fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
         use circuits_stark_verifier::proof::Proof;
-        use leaf::{
-            build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf,
-            GateAirLeafParams,
-        };
+        use leaf::{build_recursion_precompute, prove_gate_air_leaf, GateAirLeafParams};
+        use recursion_consts_tests::derive_aggregate_config;
         use recursive_aggregate::pools::PoolSet;
         use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
         use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
@@ -4120,7 +4136,8 @@ mod tests {
         let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let fold_arity = TopologyConfig::default().fold_arity;
         let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (config recomputed for tiny base)
-        let config = leaf::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
+        let config =
+            recursion_consts_tests::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
         let pre = leaf::build_recursion_precompute(&config, op, &cfg, &params0, true);
 
         for n_pools in [1usize, 2] {

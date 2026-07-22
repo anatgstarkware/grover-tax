@@ -1,22 +1,27 @@
 //! PINNED recursion VERIFIER configs, keyed PER OPERATING POINT (the 3 Tanuj curve points). Every
 //! config the recursion verifies against is a fixed constant here — leaf / level1 / fold / unpacker —
 //! so nothing security-relevant (n_queries / pow_bits / blowup / fold_step / lifting / column shapes /
-//! preprocessed roots) is derived at prove or verify time. `gate-air-leaf` assembles the
-//! `AggregateConfig` (leaf/node shared configs, PCS, node_target, roots) and the trusted verifier's
-//! unpacker config from these consts; `recursive_aggregate` stays generic.
+//! preprocessed roots) is derived at prove or verify time. Each point is one `PinnedConfigs` (the
+//! generic const-friendly type from `recursive_aggregate::pinned_configs`, shared with the cairo
+//! consumer); `leaf::pinned_aggregate_config` turns it into the runtime `AggregateConfig` via
+//! `PinnedConfigs::to_derived` + `assemble_aggregate_config`.
 //!
 //! The genuinely-COMPUTED fields pinned here (vs the fixed-by-blowup scalars) are, per (kind, point):
 //! `trace_log_size` (→ the PCS `lifting_log_size`), `preprocessed_column_log_sizes`, `node_target`
-//! (`ComponentSizes`, shared by level1 + fold), and the per-(kind, arity) `preprocessed_root`. The PCS
-//! scalars (`pow_bits`, `n_queries`, `fold_step`, `log_last_layer_degree_bound`, `log_blowup_factor`)
-//! and `n_outputs` are FIXED functions of the fixed blowups (see [`leaf_pcs`] / [`node_pcs`]).
+//! (shared by level1 + fold), and the per-(kind, arity) `preprocessed_root`. The PCS scalars
+//! (`pow_bits`, `n_queries`, `fold_step`, `log_last_layer_degree_bound`, `log_blowup_factor`) and
+//! `n_outputs` are FIXED functions of the fixed blowups (rebuilt by `PinnedConfigs::to_derived` via
+//! stwo-circuits' `get_pcs_config`).
 //!
-//! !!! PLACEHOLDER VALUES !!! Most fields below (all roots, all `trace_log_size`/`cols`, `node_target`,
-//! the k=1000/k=2000 unpackers) are PLACEHOLDERs marked `// PLACEHOLDER — capture on box`. The real
-//! values are captured ONCE on the box via the `#[ignore]`d per-layer drift tests
-//! (`recursion_consts_tests.rs`), which rebuild the real config per point and print paste-able
-//! literals. Until captured, any real gate_air run at a curve point asserts-fail at tree build (root
-//! mismatch) — expected. k=500's roots + unpacker are already filled.
+//! All three points are CAPTURED and box-validated (recursion_fingerprint per point + the drift
+//! tests, `recursion_consts_tests.rs`). To re-capture after a drift (stwo/circuit/param change), run
+//! `capture_all` on the box and regenerate this block with `scripts/gen_recursion_consts.py`.
+//!
+//! NB: the `level1`/`fold` blocks are IDENTICAL across the 3 points. That is correct, not a
+//! placeholder: a node's preprocessed root depends on its child's SHAPE (cols + `trace_log_size`,
+//! point-independent — the leaf is `2^21` at every point), not the child's ROOT (a runtime input,
+//! never baked). Only the leaf `root` (fixture-specific) and the `unpacker` (bakes the leaf root + N)
+//! differ per point.
 //!
 //! The 3 curve operating points (samples=9024, RC_LOG=25, base_blowup=1, fold_arity=8, node/leaf
 //! blowup=3):
@@ -26,18 +31,11 @@
 //!
 //! Any other operating point (other k / shots / N / arity / blowup) → panic (unsupported).
 
-use circuit_verifier::verify::CircuitConfig;
-use circuits::blake::HashValue;
-use circuits_stark_verifier::order_hash_map::OrderedHashMap;
-use stwo::core::fields::qm31::QM31;
+use recursive_aggregate::pinned_configs::{
+    PinnedComponentSizes, PinnedConfigs, PinnedLayer, PinnedNodeLayer, PinnedUnpacker,
+};
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
-
-use circuit_common::finalize::ComponentSizes;
-use circuit_common::N_RESERVED;
-
-use crate::topology::{FOLD_ARITY, RECURSION_LOG_BLOWUP};
 
 /// The 3 pinned Tanuj curve operating points. Selected from the public `(k, shots_per_shard)` (which
 /// fix `N` and the base-shard shape). Any other point is unsupported.
@@ -51,99 +49,11 @@ pub enum OperatingPoint {
     K2000N695,
 }
 
-/// The pinned full verifier config for ONE operating point: the leaf/level1/fold per-layer shapes +
-/// roots + `node_target`, and the trusted per-N unpacker config. Roots are the eight raw
-/// preprocessed-tree words (`HashValue::from`); `level1`/`fold` roots are indexed by arity
-/// `2..=FOLD_ARITY` (slot `arity - 2`).
-struct PointConsts {
-    /// The leaf verifier shape (single; leaves share one AIR).
-    leaf: LayerShape,
-    /// The level-1 (leaf-verifying) node shape + per-arity roots.
-    level1: NodeLayer,
-    /// The fold (node-verifying) node shape + per-arity roots.
-    fold: NodeLayer,
-    /// The common padding target every level1/fold node pads to (cross-child uniformity).
-    node_target: ComponentSizes,
-    /// The trusted per-N unpacker verify-config.
-    unpacker: UnpackerConfigConst,
-}
-
-/// One verifier layer's computed shape: the trace log-size (→ PCS lifting) + preprocessed columns,
-/// plus the single preprocessed root (used by the leaf, whose root is not per-arity).
-struct LayerShape {
-    /// PLACEHOLDER — capture on box. `trace_log_size` (the padded preprocessed trace log-size).
-    trace_log_size: u32,
-    /// PLACEHOLDER — capture on box. `(preprocessed column id, log_size)` pairs, in canonical order.
-    preprocessed_column_log_sizes: &'static [(&'static str, u32)],
-    /// PLACEHOLDER — capture on box. `preprocessed_root`.
-    root: [u32; 8],
-}
-
-/// A node verifier layer (level1 or fold): the layer's own shape (`trace_log_size` + columns) plus a
-/// per-arity `preprocessed_root` (`2..=FOLD_ARITY`). All arities pad to the point's `node_target`, so
-/// the shape is shared across arities; only the root content differs per arity.
-struct NodeLayer {
-    /// PLACEHOLDER — capture on box. `trace_log_size` (the padded preprocessed trace log-size).
-    trace_log_size: u32,
-    /// PLACEHOLDER — capture on box. `(preprocessed column id, log_size)` pairs, in canonical order.
-    preprocessed_column_log_sizes: &'static [(&'static str, u32)],
-    /// PLACEHOLDER — capture on box. `preprocessed_root` per arity `2..=FOLD_ARITY` (slot `arity-2`).
-    roots: [[u32; 8]; FOLD_ARITY - 1],
-}
-
-/// The pinned unpacker [`CircuitConfig`] fields for one operating point (all captured on box).
-struct UnpackerConfigConst {
-    /// PLACEHOLDER — capture on box. `pcs_config`.
-    pcs: PcsConfig,
-    /// PLACEHOLDER — capture on box. `n_outputs` (= N * N_RESERVED).
-    n_outputs: usize,
-    /// PLACEHOLDER — capture on box. `(preprocessed column id, log_size)` pairs, in canonical order.
-    preprocessed_column_log_sizes: &'static [(&'static str, u32)],
-    /// PLACEHOLDER — capture on box. `preprocessed_root` (the canonical unpacker root).
-    root: [u32; 8],
-}
-
-/// Leaf PCS: the fixed config for the leaf FRI blowup, `lifting_log_size` pinned to the leaf's
-/// `trace_log_size`. Mirrors stwo-circuits' `get_pcs_config`; the `(pow_bits, n_queries)` are fixed
-/// by the blowup (96-bit secure), so only `lifting_log_size` is point-dependent. The pinned points
-/// use the default leaf blowup (`= RECURSION_LOG_BLOWUP`); a `LEAF_BLOWUP` env override is not a
-/// pinned point (its shape would differ and fail the tree-build root assert).
-pub fn leaf_pcs(trace_log_size: u32) -> PcsConfig {
-    pcs_for_blowup(trace_log_size, RECURSION_LOG_BLOWUP)
-}
-
-/// Node PCS (level1 / fold / root): the fixed config for the node FRI blowup, `lifting_log_size`
-/// pinned to the node's `trace_log_size`.
-pub fn node_pcs(trace_log_size: u32) -> PcsConfig {
-    pcs_for_blowup(trace_log_size, RECURSION_LOG_BLOWUP)
-}
-
-/// The fixed `(pow_bits, n_queries)` for `log_blowup_factor`, as a full [`PcsConfig`] with lifting
-/// pinned to `trace_log_size + log_blowup_factor`. Panics for an unsupported blowup.
-fn pcs_for_blowup(trace_log_size: u32, log_blowup_factor: u32) -> PcsConfig {
-    let (pow_bits, n_queries) = match log_blowup_factor {
-        1 => (26, 70),
-        2 => (26, 35),
-        3 => (27, 23),
-        _ => panic!("unsupported log blowup factor"),
-    };
-    PcsConfig {
-        pow_bits,
-        fri_config: FriConfig {
-            log_blowup_factor,
-            log_last_layer_degree_bound: 0,
-            n_queries,
-            fold_step: 4,
-        },
-        lifting_log_size: Some(trace_log_size + log_blowup_factor),
-    }
-}
-
 // <<GENERATED CONSTS BEGIN — this region is regenerated by scripts/gen_recursion_consts.py from the
 // `capture_all` test output; the placeholders below hold until the first box capture. Do not hand-edit.>>
 
-const K500N174_CONSTS: PointConsts = PointConsts {
-    leaf: LayerShape {
+const K500N174: PinnedConfigs = PinnedConfigs {
+    leaf: PinnedLayer {
         trace_log_size: 21,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -197,7 +107,7 @@ const K500N174_CONSTS: PointConsts = PointConsts {
             3837070059,
         ],
     },
-    level1: NodeLayer {
+    level1: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -246,7 +156,7 @@ const K500N174_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 3913237992, 1328931292, 3600783642, 4160425405, 2292402306, 1372795367, 3344825380,
                 3307260737,
@@ -277,7 +187,7 @@ const K500N174_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    fold: NodeLayer {
+    fold: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -326,7 +236,7 @@ const K500N174_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 2035091519, 501705985, 166047172, 1123045752, 3568305265, 815574077, 3278034143,
                 243510273,
@@ -357,14 +267,14 @@ const K500N174_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    node_target: ComponentSizes {
+    node_target: PinnedComponentSizes {
         eq: 131072,
         qm31_ops: 4194304,
         m31_to_u32: 1048576,
         triple_xor: 524288,
         blake_g_gate: 4194304,
     },
-    unpacker: UnpackerConfigConst {
+    unpacker: PinnedUnpacker {
         pcs: PcsConfig {
             pow_bits: 27,
             fri_config: FriConfig {
@@ -430,8 +340,8 @@ const K500N174_CONSTS: PointConsts = PointConsts {
     },
 };
 
-const K1000N348_CONSTS: PointConsts = PointConsts {
-    leaf: LayerShape {
+const K1000N348: PinnedConfigs = PinnedConfigs {
+    leaf: PinnedLayer {
         trace_log_size: 21,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -485,7 +395,7 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
             2442885335,
         ],
     },
-    level1: NodeLayer {
+    level1: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -534,7 +444,7 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 3913237992, 1328931292, 3600783642, 4160425405, 2292402306, 1372795367, 3344825380,
                 3307260737,
@@ -565,7 +475,7 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    fold: NodeLayer {
+    fold: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -614,7 +524,7 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 2035091519, 501705985, 166047172, 1123045752, 3568305265, 815574077, 3278034143,
                 243510273,
@@ -645,14 +555,14 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    node_target: ComponentSizes {
+    node_target: PinnedComponentSizes {
         eq: 131072,
         qm31_ops: 4194304,
         m31_to_u32: 1048576,
         triple_xor: 524288,
         blake_g_gate: 4194304,
     },
-    unpacker: UnpackerConfigConst {
+    unpacker: PinnedUnpacker {
         pcs: PcsConfig {
             pow_bits: 27,
             fri_config: FriConfig {
@@ -718,8 +628,8 @@ const K1000N348_CONSTS: PointConsts = PointConsts {
     },
 };
 
-const K2000N695_CONSTS: PointConsts = PointConsts {
-    leaf: LayerShape {
+const K2000N695: PinnedConfigs = PinnedConfigs {
+    leaf: PinnedLayer {
         trace_log_size: 21,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -773,7 +683,7 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
             4269289402,
         ],
     },
-    level1: NodeLayer {
+    level1: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -822,7 +732,7 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 1990614252, 494231903, 872668398, 1645072460, 3559864537, 1840174976, 1840493561,
                 460461879,
@@ -853,7 +763,7 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    fold: NodeLayer {
+    fold: PinnedNodeLayer {
         trace_log_size: 22,
         preprocessed_column_log_sizes: &[
             ("bitwise_xor_4_0", 8),
@@ -902,7 +812,7 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
             ("blake_g_gate_output_addr_d", 22),
             ("blake_g_gate_multiplicity", 22),
         ],
-        roots: [
+        roots: &[
             [
                 2035091519, 501705985, 166047172, 1123045752, 3568305265, 815574077, 3278034143,
                 243510273,
@@ -933,14 +843,14 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
             ],
         ],
     },
-    node_target: ComponentSizes {
+    node_target: PinnedComponentSizes {
         eq: 131072,
         qm31_ops: 4194304,
         m31_to_u32: 1048576,
         triple_xor: 524288,
         blake_g_gate: 4194304,
     },
-    unpacker: UnpackerConfigConst {
+    unpacker: PinnedUnpacker {
         pcs: PcsConfig {
             pow_bits: 27,
             fri_config: FriConfig {
@@ -1005,7 +915,6 @@ const K2000N695_CONSTS: PointConsts = PointConsts {
         ],
     },
 };
-
 // <<GENERATED CONSTS END>>
 
 impl OperatingPoint {
@@ -1032,125 +941,14 @@ impl OperatingPoint {
         }
     }
 
-    fn consts(self) -> &'static PointConsts {
+    /// The pinned full verifier config for this point (leaf / level1 / fold / node_target /
+    /// unpacker), the generic const-friendly `PinnedConfigs`. `leaf::pinned_aggregate_config` /
+    /// the drift tests turn it into a runtime `DerivedConfigs` via `to_derived`.
+    pub fn pinned(self) -> &'static PinnedConfigs {
         match self {
-            OperatingPoint::K500N174 => &K500N174_CONSTS,
-            OperatingPoint::K1000N348 => &K1000N348_CONSTS,
-            OperatingPoint::K2000N695 => &K2000N695_CONSTS,
+            OperatingPoint::K500N174 => &K500N174,
+            OperatingPoint::K1000N348 => &K1000N348,
+            OperatingPoint::K2000N695 => &K2000N695,
         }
     }
-
-    /// The pinned leaf verifier [`CircuitConfig`]: leaf PCS (lifting at the pinned leaf trace-log),
-    /// the pinned leaf columns, and the pinned leaf preprocessed root.
-    pub fn leaf_config(self) -> CircuitConfig {
-        let l = &self.consts().leaf;
-        circuit_config(
-            leaf_pcs(l.trace_log_size),
-            l.preprocessed_column_log_sizes,
-            l.root,
-        )
-    }
-
-    /// The pinned level1 (leaf-verifying) node verifier [`CircuitConfig`] for `arity` (`2..=FOLD_ARITY`):
-    /// node PCS (lifting at the pinned level1 trace-log), the pinned level1 columns, and the arity's
-    /// pinned root. Panics for arity outside `2..=FOLD_ARITY`.
-    pub fn level1_config(self, arity: usize) -> CircuitConfig {
-        let l = &self.consts().level1;
-        circuit_config(
-            node_pcs(l.trace_log_size),
-            l.preprocessed_column_log_sizes,
-            l.roots[arity_slot(arity)],
-        )
-    }
-
-    /// The pinned fold (node-verifying) node verifier [`CircuitConfig`] for `arity` (`2..=FOLD_ARITY`):
-    /// node PCS (lifting at the pinned fold trace-log), the pinned fold columns, and the arity's pinned
-    /// root. Used only by the drift test (the prove path folds nodes against the level1 child config).
-    #[cfg(test)]
-    pub fn fold_config(self, arity: usize) -> CircuitConfig {
-        let f = &self.consts().fold;
-        circuit_config(
-            node_pcs(f.trace_log_size),
-            f.preprocessed_column_log_sizes,
-            f.roots[arity_slot(arity)],
-        )
-    }
-
-    /// The common `node_target` padding sizes every level1/fold node pads to.
-    pub fn node_target(self) -> ComponentSizes {
-        self.consts().node_target.clone()
-    }
-
-    /// The pinned leaf preprocessed root.
-    pub fn leaf_root(self) -> HashValue<QM31> {
-        HashValue::from(self.consts().leaf.root)
-    }
-
-    /// The pinned level1 (leaf-verifying) node root for `arity` (`2..=FOLD_ARITY`). Panics otherwise.
-    pub fn level1_root(self, arity: usize) -> HashValue<QM31> {
-        HashValue::from(self.consts().level1.roots[arity_slot(arity)])
-    }
-
-    /// The pinned fold (node-verifying) node root for `arity` (`2..=FOLD_ARITY`). Panics otherwise.
-    pub fn fold_root(self, arity: usize) -> HashValue<QM31> {
-        HashValue::from(self.consts().fold.roots[arity_slot(arity)])
-    }
-
-    /// The pinned per-N unpacker verify-config for `n` leaves. Panics if `n` != this point's `N`.
-    pub fn unpacker_config(self, n: usize) -> CircuitConfig {
-        assert_eq!(
-            n,
-            self.n(),
-            "unpacker config requested for n={n} but this operating point has N={}",
-            self.n()
-        );
-        let u = &self.consts().unpacker;
-        CircuitConfig {
-            config: u.pcs,
-            n_outputs: u.n_outputs,
-            preprocessed_column_log_sizes: cols(u.preprocessed_column_log_sizes),
-            preprocessed_root: HashValue::from(u.root),
-        }
-    }
-}
-
-/// Assembles a node/leaf verifier [`CircuitConfig`] from a pinned PCS + columns + root. `n_outputs`
-/// is `N_RESERVED` (the reserved-output count every recursion circuit emits).
-fn circuit_config(
-    pcs: PcsConfig,
-    preprocessed_column_log_sizes: &'static [(&'static str, u32)],
-    root: [u32; 8],
-) -> CircuitConfig {
-    CircuitConfig {
-        config: pcs,
-        n_outputs: N_RESERVED,
-        preprocessed_column_log_sizes: cols(preprocessed_column_log_sizes),
-        preprocessed_root: HashValue::from(root),
-    }
-}
-
-/// Builds an [`OrderedHashMap`] of preprocessed column id → log_size from the pinned literal pairs,
-/// preserving their (canonical committed) order.
-fn cols(pairs: &'static [(&'static str, u32)]) -> OrderedHashMap<PreProcessedColumnId, u32> {
-    pairs
-        .iter()
-        .map(|(id, log_size)| {
-            (
-                PreProcessedColumnId {
-                    id: (*id).to_owned(),
-                },
-                *log_size,
-            )
-        })
-        .collect()
-}
-
-/// The slot index for `arity` in a `[_; FOLD_ARITY - 1]` per-arity table. Panics for arity outside
-/// `2..=FOLD_ARITY` (unsupported).
-fn arity_slot(arity: usize) -> usize {
-    assert!(
-        (2..=FOLD_ARITY).contains(&arity),
-        "unsupported arity {arity} (must be 2..={FOLD_ARITY})"
-    );
-    arity - 2
 }

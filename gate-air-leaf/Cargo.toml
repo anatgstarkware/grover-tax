@@ -50,6 +50,10 @@ gate-air-cuda-kernel = { path = "../gate-air-cuda-kernel", optional = true }
 # a time regardless of how they're invoked. Dev-only: never in the shipped prover.
 [dev-dependencies]
 serial_test = "3"
+# Enable proving-utils' `test-utils` for the gate-air tests so they reach `recursive_aggregate::
+# test_utils` (capture/drift derivations + `check_*`). Merges with the normal `recursive-aggregate`
+# dependency for test/dev builds only; the shipped binary never pulls `test-utils`.
+recursive-aggregate = { path = "../../proving-utils/crates/recursive_aggregate", features = ["test-utils"] }
 
 [features]
 # K1/K4 GPU trace-gen kernels (gpu_tracegen.rs). Kernels are compiled AOT by build.rs (nvcc) from

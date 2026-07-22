@@ -5,7 +5,8 @@ Usage: gen_recursion_consts.py <capture_log> [<recursion_consts.rs>]
 
 Parses the `@@`-prefixed lines the `capture_all` test prints (all 3 operating points, all layers) and
 replaces the region between the `// <<GENERATED CONSTS BEGIN ...>>` / `// <<GENERATED CONSTS END>>`
-markers with the three full `const K*_CONSTS: PointConsts` definitions. Run `cargo fmt` afterwards.
+markers with the three full `const K*: PinnedConfigs` definitions (the generic const-friendly type
+from `recursive_aggregate::pinned_configs`). Run `cargo fmt` afterwards.
 """
 import sys
 import os
@@ -52,18 +53,18 @@ def cols(c):
 
 
 def roots7(d):
-    return "[" + ", ".join(root(d[a]) for a in range(2, 9)) + "]"
+    return "&[" + ", ".join(root(d[a]) for a in range(2, 9)) + "]"
 
 
 def gen_point(name, p):
     pcs = p["UNPACKER_PCS"]  # pow_bits log_blowup log_last_layer n_queries fold_step lifting
     nt = p["NODE_TARGET"]
-    return f"""const {name}_CONSTS: PointConsts = PointConsts {{
-    leaf: LayerShape {{ trace_log_size: {p['LEAF_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEAF_COLS'])}, root: {root(p['LEAF_ROOT'])} }},
-    level1: NodeLayer {{ trace_log_size: {p['LEVEL1_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEVEL1_COLS'])}, roots: {roots7(p['level1_roots'])} }},
-    fold: NodeLayer {{ trace_log_size: {p['FOLD_TRACE']}, preprocessed_column_log_sizes: {cols(p['FOLD_COLS'])}, roots: {roots7(p['fold_roots'])} }},
-    node_target: ComponentSizes {{ eq: {nt[0]}, qm31_ops: {nt[1]}, m31_to_u32: {nt[2]}, triple_xor: {nt[3]}, blake_g_gate: {nt[4]} }},
-    unpacker: UnpackerConfigConst {{
+    return f"""const {name}: PinnedConfigs = PinnedConfigs {{
+    leaf: PinnedLayer {{ trace_log_size: {p['LEAF_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEAF_COLS'])}, root: {root(p['LEAF_ROOT'])} }},
+    level1: PinnedNodeLayer {{ trace_log_size: {p['LEVEL1_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEVEL1_COLS'])}, roots: {roots7(p['level1_roots'])} }},
+    fold: PinnedNodeLayer {{ trace_log_size: {p['FOLD_TRACE']}, preprocessed_column_log_sizes: {cols(p['FOLD_COLS'])}, roots: {roots7(p['fold_roots'])} }},
+    node_target: PinnedComponentSizes {{ eq: {nt[0]}, qm31_ops: {nt[1]}, m31_to_u32: {nt[2]}, triple_xor: {nt[3]}, blake_g_gate: {nt[4]} }},
+    unpacker: PinnedUnpacker {{
         pcs: PcsConfig {{ pow_bits: {pcs[0]}, fri_config: FriConfig {{ log_blowup_factor: {pcs[1]}, log_last_layer_degree_bound: {pcs[2]}, n_queries: {pcs[3]}, fold_step: {pcs[4]} }}, lifting_log_size: Some({pcs[5]}) }},
         n_outputs: {p['UNPACKER_NOUT']},
         preprocessed_column_log_sizes: {cols(p['UNPACKER_COLS'])},

@@ -1826,6 +1826,7 @@ dependencies = [
  "num-traits",
  "rayon",
  "stwo",
+ "stwo-constraint-framework",
 ]
 
 [[package]]
