@@ -32,18 +32,11 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::{prove_ex, CommitmentSchemeProver};
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, Relation, RelationEntry};
 
-// ----------------------------------------------------------------------------
-// Program-consistency table (the single hidden program)
-// ----------------------------------------------------------------------------
-//
-// One row per program slot (gate) i in 0..n_gates, padded to a power of two.
-// Row i stores the canonical op tuple (opcode_scalar, target, ctrl_a, ctrl_b)
-// as WITNESS (the hidden program) plus a multiplicity = number of executions of
-// slot i = samples*K (every shot runs the program K times). Inactive controls
-// canonicalise to 0, matching ReadCols::inactive().q == 0 on the use side. Slot
-// index is a PREPROCESSED column (public row layout). Padding rows carry
-// multiplicity 0, so their op contents are inert (never addressed: pc_in_prog
-// stays in 0..n_gates).
+/// Program-consistency table (the single hidden program): one row per program slot (gate) i in
+/// 0..n_gates, padded to a power of two. Row i stores the canonical op tuple as WITNESS plus a
+/// multiplicity = samples*K executions of that slot. Inactive controls canonicalise to 0 (matching the
+/// use side). Slot index is PREPROCESSED. Padding rows carry multiplicity 0, so their op contents are
+/// inert (never addressed: pc_in_prog stays in 0..n_gates).
 pub(crate) struct ProgramTable {
     pub(crate) log_size: u32,
     pub(crate) slot: Vec<u32>,          // preprocessed slot index 0..size
@@ -192,17 +185,6 @@ pub(crate) fn build_rc_table(rows: &[Row], rc_log: u32) -> RcTable {
     table
 }
 
-// ----------------------------------------------------------------------------
-// Dynamic range-check tables (preprocessed)
-// ----------------------------------------------------------------------------
-//
-// T_lo = {(pos, v): 0 <= v < 2^pos,        pos in 0..16}
-// T_hi = {(pos, v): 0 <= v < 2^(15-pos),   pos in 0..16}
-// Each has sum_pos 2^pos / 2^(15-pos) = 2^16 - 1 entries; padded to 2^16 rows.
-// Padding rows reuse the (pos=0, v=0) tuple (a genuine table member) so the
-// LogUp membership math stays sound: extra supply of an existing tuple is fine
-// as long as the multiplicity-trace counts only real reads (which it does).
-
 /// Maps (pos, value) -> a row index in the flattened range-check table. The per-address +1 counter
 /// fix (and later the single-`d` rc lookup) removed the range-check LOOKUP; this now survives ONLY so
 /// the CUDA trace-gen glue (`gpu_flat_inputs` -> `off_lo`/`off_hi`) can keep its device-buffer layout
@@ -270,13 +252,10 @@ impl FrameworkEval for GateEval {
         let one = E::F::one();
         let two = BaseField::from_u32_unchecked(2);
 
-        // Preprocessed (tree0) columns: SHARD-INVARIANT POSITIONAL values (verifier-pinned).
-        //   enabler   = real-row indicator (1 on real rows, 0 on padding)
-        //   shot_id   = row / (k*n_gates)   (partitions the per-qubit chains per shot)
-        //   pc        = row % (k*n_gates)   (per-shot PROGRAM COUNTER, program order) — the access
-        //               timestamp is the inlined affine `ts = pc + 1` (verifier-pinned program order
-        //               is what forbids reordering an address's accesses).
-        //   pc_in_prog= pc mod n_gates      (the program slot each execution row addresses)
+        // Preprocessed (tree0) columns: shard-invariant positional values (verifier-pinned). enabler =
+        // real-row indicator; shot_id = row/(k*n_gates); pc = row%(k*n_gates) (per-shot program counter,
+        // whose verifier-pinned order forbids reordering an address's accesses — ts = pc+1 is inlined);
+        // pc_in_prog = pc mod n_gates (the program slot each row addresses).
         let enabler = eval.get_preprocessed_column(pp_id("gate_enabler"));
         let shot_id = eval.get_preprocessed_column(pp_id("gate_shot_id"));
         let pc = eval.get_preprocessed_column(pp_id("gate_pc"));
@@ -287,7 +266,7 @@ impl FrameworkEval for GateEval {
         let is_cnot = eval.next_trace_mask();
         let is_toffoli = eval.next_trace_mask();
 
-        // target access: addr, prev_ts, v_before (ts inlined = pc+1; v_after inlined = v_before+delta).
+        // target/control accesses: addr, prev_ts, v_before, d (ts = pc+1 inlined; v_after inlined).
         let target = access_masks(&mut eval);
         let ctrl_a = access_masks(&mut eval);
         let ctrl_b = access_masks(&mut eval);
@@ -296,7 +275,7 @@ impl FrameworkEval for GateEval {
         let fire = eval.next_trace_mask();
         let delta = eval.next_trace_mask();
 
-        // --- Opcode booleanity + one-hot sum = enabler. ---
+        // Opcode booleanity + one-hot sum = enabler.
         for op in [&is_nop, &is_not, &is_cnot, &is_toffoli] {
             eval.add_constraint(op.clone() * (op.clone() - one.clone()));
         }
@@ -311,40 +290,33 @@ impl FrameworkEval for GateEval {
         let a_active = is_cnot.clone() + is_toffoli.clone();
         let b_active = is_toffoli.clone();
 
-        // The target's post-gate value `v_after` is NOT a witness column: it equals
-        // `v_before + delta` (the pinned gate-apply equality, now inlined). `delta = fire*(1-2*v_before)`
-        // is enforced below, so `v_after = v_before + delta` remains a bit and carries the write forward.
+        // v_after is inlined (= v_before + delta), not a witness column; delta = fire*(1-2*v_before)
+        // is enforced below, so v_after stays a bit and carries the write forward.
         let t_bit = target.v.clone(); // v_before
         let v_after = t_bit.clone() + delta.clone();
 
-        // --- Value booleanity (memory values are 1 bit). The target's written value is the derived
-        // `v_after = v_before + delta`; booleanity on it keeps the memory value a bit. ---
+        // Value booleanity (memory values are 1 bit), including the derived v_after.
         for v in [&target.v, &v_after, &ctrl_a.v, &ctrl_b.v] {
             eval.add_constraint(v.clone() * (v.clone() - one.clone()));
         }
 
-        // --- Gate-apply on the memory values. ---
+        // Gate-apply on the memory values: ab = v_a*v_b; fire = is_not + is_cnot*v_a + is_toffoli*ab;
+        // delta = v_after - v_before = fire*(1 - 2*v_before) (v_after = v_before XOR fire).
         let a_bit = ctrl_a.v.clone();
         let b_bit = ctrl_b.v.clone();
-        // ab = v_a * v_b.
         eval.add_constraint(ab.clone() - a_bit.clone() * b_bit.clone());
-        // fire = is_not + is_cnot*v_a + is_toffoli*ab.
         eval.add_constraint(
             fire.clone()
                 - is_not.clone()
                 - is_cnot.clone() * a_bit.clone()
                 - is_toffoli.clone() * ab.clone(),
         );
-        // v_after = v_before XOR fire; delta = v_after - v_before = fire*(1 - 2*v_before). (The
-        // `v_after - v_before - delta = 0` equality is now vacuous — v_after is defined as v_before+delta.)
         eval.add_constraint(delta.clone() - fire.clone() + t_bit.clone() * fire.clone() * two);
 
-        // The access timestamp is the affine `ts = pc + 1` of the preprocessed pc, shared by all three
-        // accesses of the step (no witness column, no per-access slot). Computed once, inlined below.
+        // ts = pc + 1 (inlined), shared by all three accesses of the step.
         let ts = pc.clone() + one.clone();
 
-        // --- Qubit-memory chain: per active access Use(predecessor) + Yield(successor). ---
-        // Target (always active iff enabler): Use(prev_ts, v_before), Yield(ts=pc+1, v_after=v_before+delta).
+        // Qubit-memory chain: per active access Use(predecessor) + Yield(successor).
         add_qubitmem_pair(
             &mut eval,
             &self.elements.qubitmem,
@@ -375,29 +347,24 @@ impl FrameworkEval for GateEval {
             b_active.clone(),
         );
 
-        // --- ts-ordering RANGE-CHECK LOOKUPs (emitted here so their relation-batch order is
-        // qubitmem-pairs (6 terms), then the 3 single-`d` rc lookups (target, ctrl_a, ctrl_b), then
-        // program; finalize-in-pairs folds the trailing 3 rc + 1 program into 2 batches:
-        // (rc_t, rc_a) and (rc_b, program). Mirrored exactly by `gen_main_interaction` and MainGate. ---
+        // ts-ordering rc lookups, emitted here so the relation-batch order is qubitmem pairs (6 terms),
+        // then the 3 single-`d` rc lookups, then program — folded by finalize-in-pairs into (rc_t, rc_a)
+        // and (rc_b, program). Mirrored exactly by `gen_main_interaction` and MainGate.
         add_rc_lookup(&mut eval, &self.elements.rc, &target, enabler.clone());
         add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_a, a_active.clone());
         add_rc_lookup(&mut eval, &self.elements.rc, &ctrl_b, b_active.clone());
 
-        // --- ts-ordering: RANGE-CHECK prev_ts < ts (soundness-critical). ---
-        // The old PIN constraint `active*(ts - (pc*TS_STRIDE + slot)) = 0` is GONE: ts is now
-        // structurally `pc + 1` (inlined), so the pin is vacuous. Only the RANGE reconstruction
-        // remains: active*((pc+1) - prev_ts - 1 - d) = 0 pins the witness `d` to
-        // pc - prev_ts, range-checked by the single rc-table lookup above =>
-        // d ∈ [0, 2^TS_RC_BITS), i.e. prev_ts < ts. Together with the structurally program-ordered ts
-        // and the LogUp chain balance this forces a FORWARD DAG (no stale-read cycle): each read
-        // observes the program-order-last write. Inactive accesses (active=0) unconstrained.
+        // ts-ordering range-check prev_ts < ts (soundness-critical): active*((pc+1) - prev_ts - 1 - d)
+        // = 0 pins d = pc - prev_ts, range-checked into [0,2^RC_LOG) by the rc lookup above. With the
+        // program-ordered ts and the LogUp chain balance this forces a forward DAG (no stale-read
+        // cycle) — each read observes the program-order-last write. Inactive accesses unconstrained.
         add_ts_range(&mut eval, &ts, &target, enabler.clone());
         add_ts_range(&mut eval, &ts, &ctrl_a, a_active);
         add_ts_range(&mut eval, &ts, &ctrl_b, b_active);
 
-        // --- Program-consistency (use side, +enabler). ---
-        // opcode_scalar = is_not + 2*is_cnot + 3*is_toffoli (NOP -> 0). Addresses are the access
-        // addr columns (0 for inactive controls, matching the program table's canonical zero).
+        // Program-consistency (use side, +enabler): opcode_scalar = is_not + 2*is_cnot + 3*is_toffoli
+        // (NOP -> 0); addresses are the access addr columns (0 for inactive controls, matching the
+        // program table's canonical zero).
         let opcode_scalar = is_not.clone()
             + is_cnot.clone() * two
             + is_toffoli.clone() * BaseField::from_u32_unchecked(3);
@@ -428,11 +395,10 @@ struct AccessMasks<F> {
 }
 
 fn access_masks<E: EvalAtRow>(eval: &mut E) -> AccessMasks<E::F> {
-    // ts is NOT a column — it is the inlined `pc + 1`. Per-access columns: addr, prev_ts, v, d.
+    // Per-access columns (matches `cell_at` order): addr, prev_ts, v, d. ts is not a column (= pc+1).
     let addr = eval.next_trace_mask();
     let prev_ts = eval.next_trace_mask();
     let v = eval.next_trace_mask();
-    // d follows v (matches `cell_at`'s per-access column order).
     let d = eval.next_trace_mask();
     AccessMasks {
         addr,
@@ -442,9 +408,8 @@ fn access_masks<E: EvalAtRow>(eval: &mut E) -> AccessMasks<E::F> {
     }
 }
 
-/// Emit the chain Use(predecessor) + Yield(successor) pair for one access, gated by `active`.
-/// `ts` is the access's inlined timestamp expression (`pc + 1`, shared across the step); `v_out` is
-/// the value written forward (v_after = v_before+delta for the target, v for a control read).
+/// Emit the chain Use(predecessor) + Yield(successor) pair for one access, gated by `active`. `v_out`
+/// is the value written forward (v_after for the target, v for a control read).
 fn add_qubitmem_pair<E: EvalAtRow>(
     eval: &mut E,
     elements: &GateRel,
@@ -468,7 +433,7 @@ fn add_qubitmem_pair<E: EvalAtRow>(
         E::EF::from(active.clone()),
         &use_entry,
     ));
-    // Yield successor: -active / (shot, addr, ts=pc+1, v_after).
+    // Yield successor: -active / (shot, addr, ts, v_after).
     let yield_entry = [
         tag,
         shot_id.clone(),
@@ -483,23 +448,17 @@ fn add_qubitmem_pair<E: EvalAtRow>(
     ));
 }
 
-/// Emit the range-check reconstruction for one access, gated by `active`:
-///   RANGE: active*(ts - prev_ts - 1 - d) = 0 — pins the witness `d` column to the diff
-///          d = ts - prev_ts - 1 = pc - prev_ts. `d` itself is range-checked by the rc-table LOOKUP
-///          (`add_rc_lookup`), not here, so d ∈ [0, 2^RC_LOG_SIZE) (prev_ts < ts). `ts` is the inlined
-///          `pc + 1` expression.
-/// The old PIN constraint is removed (ts is structurally pc+1, so the pin is vacuous). The
-/// reconstruction is gated by `active`; the `d` LOOKUP is also gated by `active` (an inactive access
-/// emits no rc term). Inactive accesses (active = 0) leave prev_ts/d free.
+/// Range-check reconstruction for one access, gated by `active`: active*(ts - prev_ts - 1 - d) = 0
+/// pins the witness `d = pc - prev_ts`. `d` is range-checked into [0,2^RC_LOG) by `add_rc_lookup`, not
+/// here, giving prev_ts < ts. Inactive accesses leave prev_ts/d free.
 fn add_ts_range<E: EvalAtRow>(eval: &mut E, ts: &E::F, a: &AccessMasks<E::F>, active: E::F) {
     let one = E::F::one();
     let d = ts.clone() - a.prev_ts.clone() - one;
     eval.add_constraint(active * (d - a.d.clone()));
 }
 
-/// Emit the single rc-table range-check LOOKUP for one access, gated by `active`: `d` is looked up as
-/// (TAG_RC, d); the rc supply table supplies each in-range value. One term/access (mirrored by
-/// `gen_main_interaction` and the in-circuit MainGate).
+/// Single rc-table range-check lookup for one access, gated by `active`: `d` is looked up as (TAG_RC,
+/// d). One term/access (mirrored by `gen_main_interaction` and MainGate).
 fn add_rc_lookup<E: EvalAtRow>(eval: &mut E, rc: &GateRel, a: &AccessMasks<E::F>, active: E::F) {
     let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
     eval.add_to_relation(RelationEntry::new(
@@ -509,14 +468,9 @@ fn add_rc_lookup<E: EvalAtRow>(eval: &mut E, rc: &GateRel, a: &AccessMasks<E::F>
     ));
 }
 
-/// Phase-2 packing of the main trace. The scalar `Vec<Row>` (filled in parallel
-/// over shots in `build_rows`) is packed into `PackedM31` columns. Columns are
-/// fully independent, so we pack IN PARALLEL OVER COLUMNS: each task owns one
-/// column's whole `Vec<PackedM31>` and fills every packed word for it. No two
-/// threads ever touch the same column or the same packed word, so a shot block
-/// (k*n_gates rows) being non-16-aligned can never cause a packed-word race. The
-/// cell→column mapping is identical to the old serial `Col::set(row_idx, ..)`
-/// fill, so the trace is bit-identical.
+/// Pack the scalar `Vec<Row>` main trace into `PackedM31` columns, in parallel over columns: each task
+/// owns one column's whole buffer, so no two threads touch the same packed word (a non-16-aligned shot
+/// block can't race). Bit-identical to a serial per-cell fill.
 pub(crate) fn generate_main_trace(
     rows: &[Row],
     padded_rows: usize,
@@ -548,23 +502,14 @@ pub(crate) fn generate_main_trace(
         })
         .collect()
 }
-/// Shard-invariant base-proof precompute. Built ONCE before the shard loop and shared (by `Arc`)
-/// across every shard's base proof, so the work that does not depend on the shard's secret shots is
-/// done exactly once instead of N times:
-///
-/// 1. tree-0 (the 13-column preprocessed commitment) — interpolated + LDE + Merkle-committed ONCE
-///    and reused via `CommitmentSchemeProver::commit_tree(MaybeOwned::Borrowed(..))` (re-mixes the
-///    SAME root into each shard's fresh channel — transcript unchanged).
-/// 2. twiddles — `precompute_twiddles` once, shared by reference.
-/// 3. the N1 program table — identical across shards (multiplicity = shots_per_shard*k constant).
-/// 4. (cuda) the N3 device-resident gate-list / RcIndex-offset buffers — uploaded ONCE.
-///
-/// N4 (the GATE_SIM + INTERACTION PTX modules) is a process-level OnceLock cache in gpu_tracegen,
-/// not part of this struct.
-// `config`/`boundary`/`padded_rows`/`log_n_rows` are read by the cuda `build_device_parts` and by the
-// debug/test-only `assert_tree0_matches_rebuild`; in a NON-cuda RELEASE build (assert compiled out)
-// they are populated-but-unread, so allow dead_code in exactly that config (warning stays live
-// everywhere else to catch genuine dead fields).
+/// Shard-invariant base-proof precompute, built once before the shard loop and shared by `Arc` across
+/// every shard so the shot-independent work runs once instead of N times: tree-0 (interpolated + LDE +
+/// Merkle-committed once, reused via `commit_tree` which re-mixes the same root into each shard's
+/// channel), twiddles, the N1 program table (constant multiplicity across shards), and (cuda) the N3
+/// device-resident gate-list / RcIndex-offset buffers.
+// `config`/`boundary`/`padded_rows`/`log_n_rows` are read only by the cuda `build_device_parts` and
+// the debug/test `assert_tree0_matches_rebuild`; in a non-cuda release build they are populated-but-
+// unread, so allow dead_code in exactly that config.
 #[cfg_attr(not(any(debug_assertions, test, feature = "cuda")), allow(dead_code))]
 pub(crate) struct BaseProverPrecompute {
     config: stwo::core::pcs::PcsConfig,
@@ -572,36 +517,32 @@ pub(crate) struct BaseProverPrecompute {
     tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
     /// Shared N1 program table (constant multiplicity across shards).
     program: ProgramTable,
-    /// Shard-invariant boundary table SHAPE (positional (shot, addr); witness x/y/ts_last are
-    /// per-shard, but the preprocessed columns depend only on the shape, which is shard-invariant).
+    /// Shard-invariant boundary table shape: the preprocessed columns depend only on the (shot, addr)
+    /// shape (witness x/y/ts_last are per-shard).
     boundary: BoundaryTable,
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
     padded_rows: usize,
     log_n_rows: u32,
-    /// Dynamic rc-table log-size (= ceil(log2(k*n_gates))); shard-invariant. Used to REBUILD tree0
-    /// (device n != 0 replica / the debug rebuild check) with the same rc membership sizing.
+    /// Dynamic rc-table log-size (= ceil(log2(k*n_gates))); shard-invariant. Used to rebuild tree0
+    /// (device-n replica / the debug rebuild check) with the same rc membership sizing.
     rc_log: u32,
-    /// (cuda) shape needed to REBUILD the device-resident parts on a producer's device (device != 0).
+    /// (cuda) shape needed to rebuild the device-resident parts on a producer's device (device != 0).
     #[cfg(feature = "cuda")]
     max_log_size: u32,
     #[cfg(feature = "cuda")]
     n_gates: usize,
-    /// (cuda) device-resident N3 inputs uploaded once ON DEVICE 0: gate list + RcIndex lo/hi offsets.
-    /// Only the per-shard `x_states` upload remains in `prove_base_shard`. For devices != 0 the
-    /// equivalent buffers live in `device_parts` (built lazily per device from the owned inputs).
+    /// (cuda) device-resident N3 inputs uploaded once on device 0 (gate list + RcIndex offsets); for
+    /// devices != 0 the equivalent buffers live in `device_parts`.
     #[cfg(feature = "cuda")]
     d_gates: cudarc::driver::CudaSlice<u32>,
     #[cfg(feature = "cuda")]
     d_off_lo: cudarc::driver::CudaSlice<u32>,
     #[cfg(feature = "cuda")]
     d_off_hi: cudarc::driver::CudaSlice<u32>,
-    // MULTI-GPU ("option A"): the device-resident precompute (tree0 + twiddles + N3 buffers) is bound
-    // to the device it was built on. Device 0's copy is the eager fields above (built + soundness-
-    // asserted in `new`). For a producer thread on device n != 0, `device_parts()` lazily REBUILDS
-    // the same device-resident parts on device n (from the owned host inputs below) and caches them
-    // in slot n. tree0 is shard-invariant, so a device-n rebuild is byte-identical to device 0's —
-    // this is just per-device REPLICATION of the same precompute, not different data. Slot 0 stays
-    // empty (device 0 uses the eager fields); slots 1..MAX filled on demand.
+    // Multi-GPU: the device-resident precompute is bound to the device it was built on. Device 0 uses
+    // the eager fields above; for a producer on device n != 0, `device_parts()` lazily rebuilds the
+    // same parts on device n from these owned host inputs and caches them in slot n. tree0 is
+    // shard-invariant, so a device-n rebuild is byte-identical — pure per-device replication.
     #[cfg(feature = "cuda")]
     rows0: Vec<Row>,
     #[cfg(feature = "cuda")]
@@ -618,10 +559,9 @@ pub(crate) struct BaseProverPrecompute {
 #[cfg(feature = "cuda")]
 const MAX_BASE_GPUS: usize = 16;
 
-/// (cuda) The device-resident half of the base precompute, bound to ONE device. Built once per
-/// device (device 0 eagerly in `BaseProverPrecompute::new`, devices != 0 lazily in `device_parts`).
-/// tree0/twiddles are re-derived identically on each device (shard-invariant inputs), so replicating
-/// them per device does not change any committed value.
+/// (cuda) The device-resident half of the base precompute, bound to one device (device 0 eagerly in
+/// `new`, devices != 0 lazily in `device_parts`). tree0/twiddles are re-derived identically per device
+/// (shard-invariant), so replication changes no committed value.
 #[cfg(feature = "cuda")]
 struct DevicePrecompute {
     twiddles: stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
@@ -632,12 +572,10 @@ struct DevicePrecompute {
 }
 
 impl BaseProverPrecompute {
-    /// Build the precompute from shard 0's shape (`program0`, `rows0`). `rows0`/`program0` are
-    /// shard-invariant (see [`build_tree0_columns`]), so the cached tree-0 is valid for every shard.
-    ///
-    /// SOUNDNESS GUARD: the committed tree-0 root is exactly what each shard's transcript mixes (via
-    /// `commit_tree`), so the caller asserts it equals an independently rebuilt shard-0 root + matches
-    /// column count/sizes (the load-bearing check in `assert_tree0_matches_rebuild`).
+    /// Build the precompute from shard 0's shape (`program0`, `rows0`), which is shard-invariant (see
+    /// [`build_tree0_columns`]), so the cached tree-0 is valid for every shard. Soundness guard: the
+    /// caller asserts the committed root equals an independently rebuilt shard-0 root
+    /// (`assert_tree0_matches_rebuild`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: stwo::core::pcs::PcsConfig,
@@ -662,14 +600,11 @@ impl BaseProverPrecompute {
                 .circle_domain()
                 .half_coset,
         );
-        // Scratch pool used only for tree-0's build (the committed tree owns its own polynomials, so
-        // the pool can be dropped afterwards; per-shard witness trees use their scheme's own pool).
+        // Scratch pool for tree-0's build only (the committed tree owns its polynomials).
         let pool = BaseColumnPool::<ProverBackend>::new();
 
-        // Build + commit tree-0 ONCE. `lifting_log_size = None` lets CommitmentTreeProver derive it
-        // from the columns' max domain size, exactly as the per-shard `tree_builder().commit()` path
-        // does (it uses the same scheme config, which has lifting_log_size from leaf_pcs_config). The
-        // store flag is FALSE to match the base proof's barycentric-OODS path (no stored coeffs).
+        // Build + commit tree-0 once, matching the per-shard `tree_builder().commit()` path (same
+        // scheme config; store=false for the barycentric-OODS path, no stored coeffs).
         let cols = build_tree0_columns(
             &program0,
             rows0,
@@ -684,7 +619,7 @@ impl BaseProverPrecompute {
             polys,
             config.fri_config.log_blowup_factor,
             &twiddles,
-            false, // store_polynomials_coefficients: barycentric OODS path (matches base proof)
+            false, // store_polynomials_coefficients: barycentric OODS path
             config.lifting_log_size,
             &pool,
         );
@@ -723,8 +658,7 @@ impl BaseProverPrecompute {
             d_off_lo,
             #[cfg(feature = "cuda")]
             d_off_hi,
-            // Owned rebuild inputs so `device_parts` can replicate the device-resident parts on a
-            // producer thread's device (n != 0). Cheap: shard-0 rows + the small N3 flat arrays.
+            // Owned rebuild inputs so `device_parts` can replicate on a producer's device (n != 0).
             #[cfg(feature = "cuda")]
             rows0: rows0.to_vec(),
             #[cfg(feature = "cuda")]
@@ -733,17 +667,15 @@ impl BaseProverPrecompute {
             off_lo: off_lo.to_vec(),
             #[cfg(feature = "cuda")]
             off_hi: off_hi.to_vec(),
-            // Slot 0 stays empty (device 0 uses the eager `twiddles`/`tree0`/`d_*` fields above);
-            // slots 1..MAX are filled lazily by `device_parts` on first use from each device's thread.
+            // Slot 0 stays empty (device 0 uses the eager fields); slots 1..MAX filled lazily.
             #[cfg(feature = "cuda")]
             device_parts: [const { std::sync::OnceLock::new() }; MAX_BASE_GPUS],
         })
     }
 
-    /// (cuda) Build the DEVICE-RESIDENT precompute parts (twiddles + tree0 + N3 buffers) on the
-    /// CALLING thread's current device, from the shard-invariant host inputs. Same construction as
-    /// `new` (byte-identical tree0), factored so device-0 (`new`) and device-n (`device_parts`) share
-    /// it. The caller must have already bound its device (via gpu_tracegen::set_base_gpu / cuda_device).
+    /// (cuda) Build the device-resident precompute parts (twiddles + tree0 + N3 buffers) on the calling
+    /// thread's current device from the shard-invariant host inputs — byte-identical tree0 to `new`.
+    /// The caller must have already bound its device.
     #[cfg(feature = "cuda")]
     fn build_device_parts(&self) -> Result<DevicePrecompute> {
         use stwo::prover::mempool::BaseColumnPool;
@@ -793,10 +725,9 @@ impl BaseProverPrecompute {
         })
     }
 
-    /// (cuda) The device-resident precompute for the CALLING thread's base GPU ordinal. Device 0
-    /// returns the eager fields built in `new` (byte-identical to the single-GPU path). Devices != 0
-    /// lazily build + cache their own replica on FIRST use from that device's producer thread. tree0
-    /// is shard-invariant, so every device's replica commits the identical root.
+    /// (cuda) The device-resident precompute for the calling thread's base GPU ordinal. Device 0
+    /// returns the eager fields from `new`; devices != 0 lazily build + cache their own replica on
+    /// first use. tree0 is shard-invariant, so every replica commits the identical root.
     #[cfg(feature = "cuda")]
     fn device_parts(&self) -> DevicePartsRef<'_> {
         let ord = gpu_tracegen::base_gpu_ordinal();
@@ -813,8 +744,8 @@ impl BaseProverPrecompute {
             .device_parts
             .get(ord)
             .unwrap_or_else(|| panic!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"));
-        // Build once per device; the build runs on THIS producer thread (already bound to device
-        // `ord`). Fatal on failure (matches `new`'s `?` — a broken precompute cannot proceed).
+        // Build once per device, on this producer thread (already bound to device `ord`). Fatal on
+        // failure — a broken precompute cannot proceed.
         let parts = slot.get_or_init(|| {
             self.build_device_parts()
                 .unwrap_or_else(|e| panic!("device {ord} precompute build failed: {e}"))
@@ -829,8 +760,8 @@ impl BaseProverPrecompute {
     }
 }
 
-/// (cuda) Borrowed view of the device-resident precompute parts (device 0's eager fields or a
-/// device-n cached replica), so `prove_base_shard` reads them uniformly regardless of ordinal.
+/// (cuda) Borrowed view of the device-resident precompute parts, so `prove_base_shard` reads them
+/// uniformly regardless of ordinal.
 #[cfg(feature = "cuda")]
 struct DevicePartsRef<'a> {
     twiddles: &'a stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
@@ -840,27 +771,17 @@ struct DevicePartsRef<'a> {
     d_off_hi: &'a cudarc::driver::CudaSlice<u32>,
 }
 
-/// LOAD-BEARING SOUNDNESS CHECK for the base precompute. Independently rebuilds shard 0's tree-0 the
-/// OLD way (a fresh throwaway `CommitmentSchemeProver` + `tree_builder().commit()`) and asserts:
-///
-/// - the cached tree-0 root == the freshly-rebuilt root (the value mixed into each shard channel),
-/// - the cached tree-0 column count == the rebuilt column count,
-/// - each cached column's committed domain log_size == the rebuilt column's.
-///
-/// A mismatch (wrong column order / blowup / lifting / sort) aborts before any reused proof is built.
-/// Run on shard 0 only (all shards share the shape). `GATE_AIR_NO_BASE_PRECOMPUTE` skips reuse, so
-/// this check is a no-op there (the rebuild path is exercised directly per shard).
-///
-/// Compiled ONLY in debug or test builds: the runtime caller is `#[cfg(debug_assertions)]` and the CI
-/// coverage is `tests::tree0_precompute_matches_rebuild`. Absent from the release binary (its cost is
-/// a full duplicate tree0 build), so `--release` pays nothing and stays byte-identical.
+/// Load-bearing soundness check for the base precompute: independently rebuilds shard 0's tree-0 via a
+/// fresh throwaway `CommitmentSchemeProver` and asserts the cached root, column count, and per-column
+/// domain sizes match. A mismatch (wrong column order / blowup / lifting / sort) aborts before any
+/// reused proof is built. Debug/test only (a full duplicate tree0 build), so release pays nothing.
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn assert_tree0_matches_rebuild(
     pc: &BaseProverPrecompute,
     rows0: &[Row],
     n_gates: usize,
 ) {
-    // Rebuild via the exact old path (fresh scheme/channel; columns from the same builder).
+    // Rebuild via a fresh scheme/channel; columns from the same builder.
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(
             tree0_max_log_size(
@@ -892,13 +813,13 @@ pub(crate) fn assert_tree0_matches_rebuild(
     tb.commit(&mut throwaway_channel);
 
     let rebuilt = &scheme.trees[0];
-    // 1. Root equality (the value mixed into every shard's transcript).
+    // Root equality (the value mixed into every shard's transcript).
     assert_eq!(
         pc.tree0.commitment.root(),
         rebuilt.commitment.root(),
         "base-precompute tree0 root != rebuilt shard-0 root (column order/blowup/lifting mismatch)"
     );
-    // 2. Column count.
+    // Column count.
     assert_eq!(
         pc.tree0.polynomials.len(),
         n_cols,
@@ -913,7 +834,7 @@ pub(crate) fn assert_tree0_matches_rebuild(
         n_cols, N_PREPROCESSED_COLS,
         "tree0 column count != N_PREPROCESSED_COLS"
     );
-    // 3. Per-column committed domain sizes (the lifted-Merkle sort order).
+    // Per-column committed domain sizes (the lifted-Merkle sort order).
     for (i, (a, b)) in pc
         .tree0
         .polynomials
@@ -932,23 +853,13 @@ pub(crate) fn assert_tree0_matches_rebuild(
         n_cols
     );
 }
-/// SOUNDNESS (base pp-root pin, step 1): recompute the CANONICAL base gate_air preprocessed (tree0)
-/// root at BUILD TIME purely from the trusted PUBLIC config — the program table, `k`, `n_gates`,
-/// `shots_per_shard`, the shard-invariant row shape, the boundary layout, `rc_log = RC_LOG` (the fixed
-/// production rc log-size), and the base blowup. The canonical base preprocessed (tree0) root a base proof commits,
-/// recomputed from the trusted PUBLIC shape so it can be compared against a forgeable proof value.
-///
-/// It must NOT read `base_extended.proof` (the prover's `commitments[0]` — a forgeable value). tree0
-/// is SHARD-INVARIANT (every preprocessed column is positional / shape-derived, see
-/// [`build_tree0_columns`]), so ANY shard's rows recompute the same root; the caller passes shard 0's
-/// rows (already materialized for the base proof). The build mirrors [`BaseProverPrecompute::new`]'s
-/// tree0 path exactly (same columns, blowup, lifting, `store=false`), so the recomputed root equals
-/// the honest prover's committed base preprocessed root by construction.
-///
-/// REBUILD-ASSERT GUARD (debug/test only, mirrors [`assert_tree0_matches_rebuild`]): the tree0 root is
-/// re-derived via a fresh `CommitmentSchemeProver` + `tree_builder().commit()` and asserted equal, so
-/// a column-order / blowup / lifting / sort divergence aborts before the canonical constant is baked.
-/// Compiled out of `--release` (byte-identical, pays nothing).
+/// Soundness (base pp-root pin): recompute the canonical base tree0 root at build time purely from the
+/// trusted public config (program table, k, n_gates, shard-invariant row shape, boundary layout,
+/// rc_log = RC_LOG, base blowup), so it can be compared against a forgeable proof value. Must NOT read
+/// the prover's `commitments[0]`. tree0 is shard-invariant (see [`build_tree0_columns`]), so any
+/// shard's rows recompute the same root; the build mirrors [`BaseProverPrecompute::new`] exactly, so the
+/// result equals the honest committed root by construction. A debug/test rebuild-assert (mirrors
+/// [`assert_tree0_matches_rebuild`]) aborts on any column-order/blowup/lifting/sort divergence.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn canonical_base_preprocessed_root(
@@ -973,7 +884,7 @@ pub(crate) fn canonical_base_preprocessed_root(
             .half_coset,
     );
     let pool = BaseColumnPool::<ProverBackend>::new();
-    // Same tree0 build as `BaseProverPrecompute::new` (barycentric-OODS path: store=false).
+    // Same tree0 build as `BaseProverPrecompute::new`.
     let cols = build_tree0_columns(
         program,
         rows,
@@ -994,7 +905,7 @@ pub(crate) fn canonical_base_preprocessed_root(
     );
     let canonical: HashValue<SecureField> = tree0.commitment.root().into();
 
-    // Rebuild-assert (debug/test only): independent fresh-scheme rebuild must give the same root.
+    // Rebuild-assert (debug/test only): an independent fresh-scheme rebuild must give the same root.
     #[cfg(any(debug_assertions, test))]
     {
         let twiddles_r = ProverBackend::precompute_twiddles(
@@ -1029,9 +940,8 @@ pub(crate) fn canonical_base_preprocessed_root(
     canonical
 }
 
-// The base-proof tuple `prove_base_shard` returns. Named so the pipeline producer can send
-// it over a channel; `prove_ex` yields `ExtendedStarkProof<MC::H>` with
-// `MC::H = Blake2sMerkleHasher`, so this is backend-independent (cuda vs simd).
+/// The base-proof tuple `prove_base_shard` returns (named so the pipeline producer can send it over a
+/// channel). Backend-independent: `prove_ex` yields `ExtendedStarkProof<Blake2sMerkleHasher>`.
 pub(crate) type BaseShardOutput = (
     ExtendedStarkProof<Blake2sMerkleHasher>,
     Vec<SecureField>,
@@ -1043,10 +953,9 @@ pub(crate) type BaseShardOutput = (
     u32,
 );
 
-// Per-shard base proof: same trace-gen + commit + prove_ex pipeline as the single proof, but over
-// this shard's shots. Returns the distinct ExtendedStarkProof plus the claim / nonce / log_n_rows the
-// leaf needs. `rc_lo_index` is used only under `#[cfg(feature = "cuda")]`, hence the unused-variable
-// allowance on the CPU build.
+/// Per-shard base proof: the trace-gen + commit + prove_ex pipeline over this shard's shots, returning
+/// the ExtendedStarkProof plus the claim / nonce / log_n_rows the leaf needs. `rc_lo_index` is used
+/// only under `cuda`.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub(crate) fn prove_base_shard(
@@ -1063,9 +972,8 @@ pub(crate) fn prove_base_shard(
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
-    // Fixed rc-table log-size = RC_LOG (<= log_n_rows, so it never raises the floor). Prove-entry
-    // tripwire: the fixed [0,2^RC_LOG) table must contain every honest `d = pc - prev_ts`, whose max
-    // is k*n_gates - 1; a run big enough to overflow it (k ≳ 8000) needs a wider rc table.
+    // Fixed rc-table log-size RC_LOG. Prove-entry tripwire: the fixed [0,2^RC_LOG) table must contain
+    // every honest `d = pc - prev_ts` (max k*n_gates - 1); k ≳ 8000 would overflow it.
     debug_assert!(
         (k * gates.len()).next_power_of_two().ilog2() <= RC_LOG,
         "rc: k·n_gates log2 exceeds RC_LOG={RC_LOG}; k≳8000 needs a wider rc table"
@@ -1090,10 +998,9 @@ pub(crate) fn prove_base_shard(
     } else {
         None
     };
-    // MULTI-GPU: the device-resident precompute parts (twiddles/tree0/N3) for THIS thread's
-    // device. On device 0 these are the eager fields (byte-identical to before); on device
-    // n != 0 they are the lazily-built per-device replica. `None` (no-precompute fallback)
-    // leaves `dp` None and uses `owned_twiddles` / the per-shard rebuild, unchanged.
+    // Multi-GPU: the device-resident precompute parts for this thread's device (device 0's eager
+    // fields, or a per-device replica). `None` (no-precompute fallback) leaves `dp` None and uses
+    // `owned_twiddles` / the per-shard rebuild.
     #[cfg(feature = "cuda")]
     let dp = precompute.map(|pc| pc.device_parts());
     #[cfg(feature = "cuda")]
@@ -1106,8 +1013,7 @@ pub(crate) fn prove_base_shard(
         Some(pc) => &pc.twiddles,
         None => owned_twiddles.as_ref().unwrap(),
     };
-    // N1 program table: shared from the precompute (constant multiplicity across shards), else
-    // rebuilt. `shard_samples == shots_per_shard` for every shard, so the multiplicity matches.
+    // N1 program table: shared from the precompute (constant multiplicity across shards), else rebuilt.
     let owned_program = if precompute.is_none() {
         Some(build_program_table(gates, shard_samples, k))
     } else {
@@ -1125,10 +1031,9 @@ pub(crate) fn prove_base_shard(
     let mut commitment_scheme =
         CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(config, twiddles);
 
-    // Tree 0: reuse the precomputed commitment (re-mix the SAME root into THIS shard's
-    // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way. Under
-    // multi-GPU the reused tree0 is THIS device's replica (`dp.tree0`); its root is identical
-    // to device 0's (shard-invariant), so the transcript mix is unchanged.
+    // Tree 0: reuse the precomputed commitment (re-mix the same root via `commit_tree`, no NTT/Merkle
+    // rebuild), else rebuild it. Under multi-GPU the reused tree0 is this device's replica, whose root
+    // is identical to device 0's, so the transcript mix is unchanged.
     #[cfg(feature = "cuda")]
     match &dp {
         Some(dp) => {
@@ -1155,8 +1060,8 @@ pub(crate) fn prove_base_shard(
             commitment_scheme.commit_tree(MaybeOwned::Borrowed(&pc.tree0), prover_channel);
         }
         None => {
-            // Old path: build the (size-sorted) preprocessed columns, then interpolate + LDE +
-            // Merkle-commit them inline (the shard-invariant work this precompute eliminates).
+            // Fallback: build + interpolate + LDE + Merkle-commit the preprocessed columns inline
+            // (the shard-invariant work the precompute eliminates).
             let pp = build_tree0_columns(
                 program,
                 &rows,
@@ -1186,24 +1091,20 @@ pub(crate) fn prove_base_shard(
         v
     };
     let mut tree_builder = commitment_scheme.tree_builder();
-    // Holds K1's column-major main-trace device buffer so K4 (interaction) can reuse it instead of
-    // re-running K0/K1. GPU trace-gen is unconditional under `cuda` (the CPU-tracegen == GPU-tracegen
-    // byte-identity the old GATE_AIR_CPU_TRACEGEN A/B arm covered is now T1a/T1b); the CPU arm below
-    // survives only on the non-cuda (SimdBackend) build.
+    // Holds K1's column-major main-trace device buffer so K4 can reuse it (no K0/K1 re-run). GPU
+    // trace-gen is unconditional under `cuda`; the CPU arm below survives only on the non-cuda build.
     #[cfg(feature = "cuda")]
     let d_main_cols: cudarc::driver::CudaSlice<u32> = {
-        // N3: gate list + RcIndex offsets are shard-invariant. On the reuse path they are
-        // already device-resident in the precompute (uploaded once); only this shard's
-        // `x_states` is uploaded here. On the fallback path they're uploaded per shard.
+        // N3 inputs (gate list + RcIndex offsets) are device-resident in the precompute on the reuse
+        // path; only this shard's `x_states` is uploaded here (per-shard on the fallback path).
         let mut x_states = Vec::with_capacity(shard_cases.len() * N_LIMBS);
         for c in shard_cases {
             let bytes = hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
             x_states.extend_from_slice(&state_to_limbs(&bytes));
         }
         let (main_dev, _lo, d_cols) = match &dp {
-            // Multi-GPU: use THIS device's N3 buffers (device 0's eager d_*, or the per-device
-            // replica) — feeding device-0 buffers to a device-n kernel would be an illegal
-            // cross-device access.
+            // Multi-GPU: use THIS device's N3 buffers (feeding device-0 buffers to a device-n kernel
+            // would be an illegal cross-device access).
             Some(dp) => gpu_tracegen::gpu_gen_main_trace_device_d(
                 dp.d_gates,
                 &x_states,
@@ -1246,7 +1147,6 @@ pub(crate) fn prove_base_shard(
     tree_builder.commit(prover_channel);
 
     // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
-    // See `MainTrace::from_k1`.
     #[cfg(feature = "cuda")]
     let main_k1: gpu_tracegen::MainTrace =
         gpu_tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
@@ -1277,9 +1177,8 @@ pub(crate) fn prove_base_shard(
         .map_err(|e| anyhow::anyhow!(e))?;
         (cols, claimed)
     };
-    // K4 done: FREE the ~24 GB resident `d_cols` DEVICE buffer NOW (before tree2), not at
-    // end-of-shard, and synchronize so tree2's pool can reserve it. `free_after_k4` consumes
-    // the buffer explicitly.
+    // Free the ~24 GB resident buffer now (before tree2, not end-of-shard) so tree2's pool can reserve
+    // it.
     #[cfg(feature = "cuda")]
     main_k1.free_after_k4().map_err(|e| anyhow::anyhow!(e))?;
     // GPU path: skip CPU interaction gen (the dominant cost); claimed_sum == CPU main_sum.
@@ -1288,8 +1187,8 @@ pub(crate) fn prove_base_shard(
     #[cfg(not(feature = "cuda"))]
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
-    // H_P binding (Fork A): program supply now carries an internal (-mult, TAG_PROGRAM) AND a
-    // public (+mult, TAG_PROGRAM_PUB) term, paired into one batch => still 4 interaction cols.
+    // H_P binding: program supply carries both an internal (-mult, TAG_PROGRAM) and a public
+    // (+mult, TAG_PROGRAM_PUB) term, paired into one batch (still 4 interaction cols).
     let (program_interaction, program_sum) = gen_program_interaction(program, &elements.program);
     let (boundary_interaction, boundary_sum) =
         gen_boundary_interaction(&boundary, &elements.qubitmem);
@@ -1301,21 +1200,13 @@ pub(crate) fn prove_base_shard(
         })
     };
 
-    // Phase-3 x/y binding + H_P program binding (Fork A): the base is NOT internally balanced.
-    //   - boundary re-keys y to TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]);
-    //   - program supply adds a public P_pub = Σ mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
-    //     (its internal -mult/TAG_PROGRAM term cancels main's program demand).
-    // So the base's claimed sums net to B + P_pub (not 0). The leaf's public_logup_sum supplies
-    // −B (over guessed x/y) AND −P_pub (over guessed program Vars), so the verifier balance
-    // forces guessed x/y == committed AND guessed program == committed. rc demand (main) and rc
-    // supply (rc_sum) cancel, contributing 0. (stwo's native verify does NOT require
-    // Σ claimed_sums == 0; this is a prover self-check.)
-    // Prover self-check (DEBUG-ONLY, compiled out in --release): the base's claimed LogUp sums
-    // must net to the public terms B + P_pub. Pure tripwire — `b_public`/`p_pub` feed nothing
-    // downstream (only `claimed_sums` below is mixed), so gating changes no committed value
-    // (release byte-identical). Per-shard cost (two small-table scans) is thus paid only in
-    // debug. CI coverage: `tests::shard_claimed_sums_net_to_public` (CPU/Simd fixture); this
-    // runtime check additionally guards each run's real secret shot data in debug builds.
+    // x/y binding + H_P program binding: the base is NOT internally balanced. Boundary re-keys y to
+    // TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]); program supply adds a public P_pub (its internal
+    // -mult/TAG_PROGRAM term cancels main's demand). So the base's claimed sums net to B + P_pub, and
+    // the leaf's public_logup_sum supplies −B and −P_pub over guessed values, forcing guessed ==
+    // committed. rc demand and supply cancel. (stwo verify does not require Σ = 0; this is a self-check.)
+    // Debug-only prover self-check: the claimed sums must net to B + P_pub. Pure tripwire —
+    // `b_public`/`p_pub` feed nothing downstream, so gating it changes no committed value.
     #[cfg(debug_assertions)]
     {
         let b_public = boundary_public_term(&boundary, &elements.qubitmem);

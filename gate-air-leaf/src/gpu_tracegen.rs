@@ -1,83 +1,33 @@
-//! P3.1 — K1: CUDA gate-sim + main-trace kernel for gate_air (on-device "model B").
-//!
-//! ============================================================================================
-//! RE-SYNCED to the CURRENT (sound, final) CPU design: ts = pc+1 (inlined) + single-`d` rc-table
-//! range-check, 19-col.
-//! --------------------------------------------------------------------------------------------
-//! This file mirrors the FINAL CPU encoding (`main.rs` `GateEval` / `cell_at` / `gen_main_interaction`
-//! / `build_rc_table`): the access timestamp is the affine `ts = pc + 1` of the preprocessed `pc`
-//! (NOT a witness column — inlined in K4 and the AIR), plus a range-check on the SINGLE diff
-//! `d = ts - prev_ts - 1 = pc - prev_ts` looked up into a dynamic rc supply table. The target's
-//! `v_after` is likewise NOT a column (= v_before + delta, inlined). This dropped the 3 per-access
-//! `ts` columns + the target `v_after` column, and (this change) collapsed the two rc limbs to a
-//! single `d` column: 22 -> 19.
-//!   * ts closed form (thread-per-execution SURVIVES): `ts = pc + 1`, `pc = rep*n_gates + gate_idx` —
-//!     known per execution, shared by all accesses of the step (no per-gate slot).
-//!     `prev_ts` is the ts of the previous access to this addr (0 = init), so it is NO LONGER
-//!     `ts-1` in general; K1 reconstructs it from `prog_slot_meta`'s cyclic-predecessor constants
-//!     (predecessor pc + 1; see `prev_ts_of`).
-//!   * rc DIFF: a SINGLE range-check column per access — `d = pc - prev_ts` (25-bit, no limb split).
-//!     Layout is now ACCESS_BLOCK = 4 (addr,prev_ts,v,d), TRACE_COLUMNS = 19 (see `cell_at`/
-//!     `ACCESS_BLOCK` in main.rs).
-//!   * rc HISTOGRAM: a single `2^RC_LOG` multiplicity histogram over `d` (rc_log = RC_LOG, the FIXED
-//!     production rc log-size). Each ACTIVE access bumps `hist[d] += 1` (one bump/access).
-//!     Emitted into the (formerly unused) `rc_lo` device arg. NOTE: on the
-//!     PRODUCTION path the rc multiplicity WITNESS column is built ON THE HOST from the always-present
-//!     CPU `rows` (`build_rc_table` in main.rs), independent of this kernel — so the GPU histogram is
-//!     used ONLY by the `k1_byte_identity` diagnostic to cross-check the device histogram against CPU.
-//!   * boundary: nothing on the MAIN kernel (the `gate_bnd_enabler`-gated (B)/(D) is host-only).
-//!
-//! QUBIT-MEMORY ENCODING (branch anatg/gate-air-qubit-mem).
-//! -------------------------------------------------------
-//! Generates the main-trace columns ENTIRELY on the GPU (trace never leaves device memory). The old
-//! whole-state (188/191-col TAG_STATE) encoding + its qdecode histograms are replaced by the
-//! per-qubit chain-lookup qubit-memory (TAG_QUBITMEM) + the ts-ordering rc-table lookup (TAG_RC),
-//! byte-identical to the CPU `simulate_shot` / `cell_at` / `build_rc_table`.
-//!
-//! THREAD-PER-EXECUTION (survives via a closed-form ts).
-//! -----------------------------------------------------
-//! `ts` is a CLOSED FORM in the pc: for an access in rep `r` at gate `g`, the pc is
-//! `pc = r*n_gates + g` and `ts = pc + 1` (shared by all accesses of the step). This depends only
-//! on (r, g) — NOT on any running per-address counter — so the thread-per-EXECUTION split holds:
-//!   * `prog_slot_meta` — one-thread prepass: per gate-slot the program constant `prev_gate` = the
-//!     gate index of the PREVIOUS access to this addr within one pass (or a sentinel if none), so K1
-//!     can compute `prev_ts` (the predecessor's closed-form ts) without a serial history. See the
-//!     kernel doc for the exact prev_ts recovery (intra-rep predecessor vs. cross-rep / init).
-//!   * K0 `gate_sim_states` — thread-per-SHOT, VALUE-ONLY: snapshots the 512-qubit state (32 limbs)
-//!     at every (shot, rep) boundary (linear-in-k value chain). Seeds K1's per-execution value chain.
-//!   * K1 `gate_sim` — thread-per-EXECUTION: thread `(shot, rep)` loads its rep-boundary state, walks
-//!     the rep's n_gates gates for v_before/v_after, and fills prev_ts + the single rc diff `d`
-//!     (ts = pc + 1 is closed-form, not emitted), and bumps the rc histogram.
-//! Parallelism is n_shots·k. Row(shot,rep,g) = (shot*k+rep)*n_gates+g is the same contiguous per-shot
-//! block; only how ts/prev_ts/rc are produced changed.
-//!
-//! SOUNDNESS / BYTE-IDENTITY: K1's per-gate body mirrors `simulate_shot` (the ctrl_a/ctrl_b/target
-//! access order, the value gate-apply, delta_to_m31), the `cell_at` 19-column layout, the closed-form
-//! `ts = pc + 1`, `prev_ts` (per-address chain), and the single rc diff `d` + histogram.
-//! Validated by GATE_AIR_GPU_TEST=k1 / k4 column-by-column (+ histogram) vs CPU.
+//! On-device CUDA gate-sim + interaction trace-gen for gate_air, byte-identical to the CPU encoding
+//! in `main.rs` (`GateEval`/`cell_at`/`gen_main_interaction`/`build_rc_table`). Key invariant: the
+//! access timestamp is the inlined affine `ts = pc + 1` (not a column), the target `v_after` is
+//! inlined (= v_before + delta), and each access carries a SINGLE 25-bit rc diff column
+//! `d = pc - prev_ts` looked up into a dynamic rc supply table (TAG_RC) — a 19-column layout with
+//! per-qubit chain lookups (TAG_QUBITMEM). `prev_ts` is the predecessor access's ts, recovered from
+//! `prog_slot_meta`'s cyclic-predecessor constants (not a running counter), which keeps trace-gen
+//! thread-per-EXECUTION. Module map: K0 `gate_sim_states` (thread-per-shot, snapshots rep-boundary
+//! state) → K1 `gate_sim` (thread-per-execution, fills the 19 columns + rc histogram) → K4
+//! interaction (`gpu_gen_interaction*`), all feeding the CudaBackend commit device-resident. The rc
+//! histogram is diagnostic-only (production builds the multiplicity witness on the host); byte-identity
+//! is validated by GATE_AIR_GPU_TEST=k1/k4.
 
 use std::sync::{Arc, OnceLock};
 
-// MULTI-GPU ("option A"): the base GPU ORDINAL this host thread proves on. A producer thread proving
-// shard set S on GPU n calls `set_base_gpu(n)` once at its start; every `cuda_device()` /
-// module-cache access below then keys off THIS thread's ordinal, so the harness tracegen lands on
-// the SAME device (n) as the backend commit for that shard. DEFAULT 0 for every un-set thread, so
-// the single-GPU path (one producer, ordinal 0) is byte-identical to before (device 0 throughout).
+// Multi-GPU: the base GPU ordinal this host thread proves on. Producer threads call `set_base_gpu(n)`;
+// every `cuda_device()` / module-cache access keys off it so tracegen lands on the same device as the
+// backend commit. Default 0 (single-GPU path is byte-identical to before).
 thread_local! {
     static BASE_GPU_ORDINAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Set the current host thread's base GPU ordinal (multi-GPU producer setup). Idempotent per thread.
-/// Records the ordinal for the harness tracegen (`cuda_device`) AND, under the device-resident
-/// backend, binds the backend's CUDA runtime current-device for this thread so its pool/commit calls
-/// target the same device. Call ONCE at the top of each producer thread, before any GPU work.
+/// Set this host thread's base GPU ordinal (multi-GPU producer setup); call ONCE before any GPU work.
+/// Records the ordinal for tracegen (`cuda_device`) and, under the device-resident backend, binds the
+/// backend's CUDA runtime current-device for this thread.
 #[cfg(feature = "gpu-cuda")]
 pub(crate) fn set_base_gpu(ordinal: usize) {
     BASE_GPU_ORDINAL.with(|c| c.set(ordinal));
-    // Bind the backend (stwo_cuda) runtime current-device on THIS thread. cudarc's cuda_device()
-    // also binds the primary context (== runtime device) on first use, but the backend may issue a
-    // runtime-API call before that; setting it explicitly here removes the ordering dependency.
-    // Only under the device-resident backend (feature = "cuda"); no-op on the K1/K4-only build.
+    // Explicitly bind the backend runtime current-device: cudarc binds the primary context lazily, but
+    // the backend may issue a runtime-API call before that, so set it here to remove the ordering dep.
     #[cfg(feature = "cuda")]
     {
         let rc = unsafe { stwo::stwo_cuda::bindings::cuda_set_device(ordinal as i32) };
@@ -100,26 +50,13 @@ pub(crate) fn base_gpu_ordinal() -> usize {
     BASE_GPU_ORDINAL.with(|c| c.get())
 }
 
-/// Build a PRIVATE rayon `ThreadPool` whose every worker is bound to CUDA device `gpu` (multi-GPU
-/// SIGSEGV fix, Class-1). The producer thread proves its shard INSIDE this pool via `pool.install(..)`,
-/// so the OODS-phase rayon fan-outs (`build_weights_hash_map`'s `par_iter`, OODS `par_map_cols` in
-/// `pcs/mod.rs`) dispatch to THESE workers instead of rayon's GLOBAL pool. The global pool's workers
-/// were never device-bound (default device 0), so on device N != 0 they dereferenced device-N pointers
-/// while current-device-0 => illegal address => SIGSEGV. Binding each worker via `set_base_gpu(gpu)`
-/// (which sets BOTH the driver `cudaSetDevice` AND the cudarc thread_local ordinal, exactly like the
-/// producer) makes the fan-out run on device N, matching the pointers.
-///
-/// `num_threads` (mechanical choice): the fan-out is light CPU glue that only LAUNCHES kernels — the
-/// heavy compute is on-GPU and serializes on device N's stream regardless — so a small pool suffices
-/// and avoids over-subscribing cores across the G concurrent producers. Default 4, overridable via
-/// `GATE_AIR_OODS_POOL_THREADS` for box tuning. (Correctness is independent of the count; it only
-/// affects fan-out parallelism.)
-///
-/// BYTE-IDENTITY: a private pool changes only WHICH threads run the fan-out and WHICH device they are
-/// bound to — never the work, the order of commits, or any Fiat-Shamir draw. rayon's `par_iter`/
-/// `par_map_cols` are already order-independent reductions/maps; running them on a 4-thread private
-/// pool vs. the global pool yields identical results. At N=1 (device 0) the workers bind device 0,
-/// identical to today's global-pool-on-device-0 behavior.
+/// Build a private rayon `ThreadPool` whose every worker is bound to CUDA device `gpu`. The producer
+/// proves its shard inside this pool (`pool.install`) so the OODS-phase rayon fan-outs dispatch to
+/// device-bound workers, not the global pool. SIGSEGV fix: global-pool workers stay on device 0, so on
+/// device N they dereference device-N pointers while current-device-0 => illegal address; binding each
+/// worker via `set_base_gpu(gpu)` makes the fan-out run on device N. Thread count is a tuning knob
+/// (default 4, `GATE_AIR_OODS_POOL_THREADS`) — correctness-independent, since the fan-outs are
+/// order-independent reductions/maps (byte-identical to the global pool).
 #[cfg(feature = "gpu-cuda")]
 pub(crate) fn build_device_bound_pool(gpu: usize) -> rayon::ThreadPool {
     let num_threads = std::env::var("GATE_AIR_OODS_POOL_THREADS")
@@ -135,16 +72,11 @@ pub(crate) fn build_device_bound_pool(gpu: usize) -> rayon::ThreadPool {
         .unwrap_or_else(|e| panic!("failed to build device-bound OODS pool for gpu {gpu}: {e}"))
 }
 
-/// Shared cudarc handle on the CURRENT THREAD's target device primary CUDA context, cached
-/// process-wide PER ORDINAL. The NitrooZK `CudaBackend` (stwo_cuda) targets the same device's
-/// primary context via the CUDA runtime API, and cudarc `CudaDevice::new(n)` retains + binds that
-/// SAME primary context (`ctx::set_current`), so once a thread has used this handle its runtime
-/// current-device is also `n` — device pointers produced by these cudarc K1/K4 kernels interoperate
-/// with the backend's commit on the same device. For the single-GPU path the ordinal is 0 and this
-/// is byte-identical to the previous single-`OnceLock` behavior. Replaces the obelyzk
-/// `get_cuda_executor`. [box-verified for n=0]
+/// Shared cudarc handle on the calling thread's target device primary CUDA context, cached
+/// process-wide per ordinal. The backend (stwo_cuda) targets the SAME device's primary context, so
+/// device pointers from these cudarc K1/K4 kernels interoperate with the backend's commit on that
+/// device. Single-GPU path (ordinal 0) is byte-identical to the previous single-`OnceLock` behavior.
 pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
-    // One cached device handle per ordinal. `MAX_BASE_GPUS` slots is plenty (GPUs 0..7 on the box).
     const MAX_BASE_GPUS: usize = 16;
     static DEVS: [OnceLock<Arc<cudarc::driver::CudaDevice>>; MAX_BASE_GPUS] =
         [const { OnceLock::new() }; MAX_BASE_GPUS];
@@ -153,8 +85,8 @@ pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
         .get(ord)
         .ok_or_else(|| format!("base gpu ordinal {ord} >= {MAX_BASE_GPUS}"))?;
     if let Some(d) = slot.get() {
-        // Ensure THIS thread has the device's primary context current (cheap; needed when the same
-        // cached handle is first touched from a new thread — see cudarc bind_to_thread contract).
+        // Bind this thread to the device's primary context (needed when the cached handle is first
+        // touched from a new thread — cudarc bind_to_thread contract).
         d.bind_to_thread()
             .map_err(|e| format!("bind_to_thread(dev {ord}): {e}"))?;
         return Ok(d.clone());
@@ -165,20 +97,13 @@ pub(crate) fn cuda_device() -> Result<Arc<cudarc::driver::CudaDevice>, String> {
     Ok(d)
 }
 
-/// N4 — process-level MODULE CACHE. `load_ptx` (loading the AOT fatbin build.rs produced from
-/// cuda/*.cu) is expensive and was previously run on EVERY `gpu_gen_main_trace*` /
-/// `gpu_gen_interaction*` call (once per shard). Each kernel module should load ONCE per process.
-/// cudarc registers a loaded module on the device under its name (`get_func` then retrieves functions
-/// cheaply), so we guard the load with a `OnceLock` (like `cuda_device()`); after the first call only
-/// `get_func` runs.
-///
-/// Returns the module name + a `bool` (true on the first load) for callers that want to log.
+/// Process-level module cache: load the AOT fatbin (from cuda/*.cu) ONCE per process instead of per
+/// shard, guarded by a `OnceLock`. Returns the module name + a `bool` (true on the first load).
 #[cfg(feature = "gpu-cuda")]
 fn gate_sim_module(dev: &Arc<cudarc::driver::CudaDevice>) -> Result<(&'static str, bool), String> {
-    // PER-ORDINAL load guard: cudarc registers a loaded module on the SPECIFIC CudaDevice (its
-    // CUcontext), so each device must load the fatbin once. A single shared guard would load only on
-    // the first device and leave the others' `get_func` unresolved. Keyed by the caller's ordinal
-    // (== dev.ordinal()); slot [0] for the single-GPU path => same one-load behavior as before.
+    // Per-ordinal guard: cudarc registers a loaded module on the specific CudaDevice's CUcontext, so
+    // each device must load the fatbin once (a shared guard would leave other devices' `get_func`
+    // unresolved). Keyed by ordinal; slot 0 => same one-load behavior as the single-GPU path.
     const MAX_BASE_GPUS: usize = 16;
     static LOADED: [OnceLock<Result<(), String>>; MAX_BASE_GPUS] =
         [const { OnceLock::new() }; MAX_BASE_GPUS];
@@ -194,9 +119,6 @@ fn gate_sim_module(dev: &Arc<cudarc::driver::CudaDevice>) -> Result<(&'static st
         // a fatbin). Note: the byte-string `Ptx` paths NUL-terminate their input, so a binary fatbin
         // must go through the file path, not `from_src`/an image byte vec (PtxKind::Image is private).
         let ptx = cudarc::nvrtc::Ptx::from_file(concat!(env!("OUT_DIR"), "/gate_sim.fatbin"));
-        // Qubit-memory encoding, thread-per-EXECUTION (recovered): `prog_slot_meta` precomputes the
-        // closed-form ts constants, K0 `gate_sim_states` snapshots per-rep-boundary values, K1
-        // `gate_sim` fills each (shot, rep)'s rows independently.
         dev.load_ptx(
             ptx,
             "gate_sim_mod",
@@ -235,8 +157,6 @@ fn interaction_module(
     let mut first = false;
     let res = guard.get_or_init(|| {
         first = true;
-        // AOT: build.rs compiled cuda/interaction.cu -> $OUT_DIR/interaction.fatbin (see
-        // gate_sim_module for why the fatbin is loaded via `Ptx::from_file`).
         let ptx = cudarc::nvrtc::Ptx::from_file(concat!(env!("OUT_DIR"), "/interaction.fatbin"));
         dev.load_ptx(ptx, "logup_mod", &names)
             .map_err(|e| format!("load_ptx (K4): {e}"))?;
@@ -245,14 +165,10 @@ fn interaction_module(
     res.clone().map(|()| ("logup_mod", first))
 }
 
-/// Allocate the thread-per-execution scratch buffers shared by every K1 launch wrapper:
-/// - `d_rep`: n_shots*k*N_LIMBS rep-boundary states (written by K0, read by K1).
-/// - `d_slot`: n_gates*9 predecessor constants ([a_pg,a_ps,a_wrap, b_pg,b_ps,b_wrap, t_pg,t_ps,t_wrap]
-///   per gate) — for each active access slot, the (gate, slot) of the previous access to the SAME addr
-///   in cyclic program order + a `wrap` flag (1 = predecessor is in the previous rep, 0 = same rep).
-///   K1 turns these into `prev_ts` (see the `gate_sim` doc). Filled ONCE here by `prog_slot_meta`.
-/// `prog_slot_meta` is a single-thread program pass (n_gates is tiny), launched here so the constants
-/// are ready before K0/K1. Returns (`d_rep`, `d_slot`).
+/// Allocate the thread-per-execution scratch buffers shared by every K1 launch wrapper: `d_rep`
+/// (n_shots*k*N_LIMBS rep-boundary states, K0→K1) and `d_slot` (n_gates*9 cyclic-predecessor constants
+/// per gate — the (gate, slot, wrap) of the previous access to the same addr, from which K1 derives
+/// `prev_ts`). `d_slot` is filled once here by the single-thread `prog_slot_meta` pass (n_gates tiny).
 #[cfg(feature = "gpu-cuda")]
 fn alloc_rep_and_slot(
     dev: &Arc<cudarc::driver::CudaDevice>,
@@ -321,31 +237,16 @@ fn launch_k0_states(
     Ok(())
 }
 
-// K1 gate-sim kernel source lives in `cuda/gate_sim.cu`, compiled AOT by build.rs into
-// `$OUT_DIR/gate_sim.fatbin` and loaded in `gate_sim_module`. Layout/constants mirror gate_air
-// `main.rs`: N_QUBITS=512, N_LIMBS=32, LIMB_BITS=16, TRACE_COLUMNS=19, M31 modulus 2^31-1,
-// opcodes NOP=0/NOT=1/CNOT=2/TOFFOLI=3, ts = pc+1 (no slot); the ts-ordering diff is the SINGLE
-// column `d = pc - prev_ts`. Kernel buffers/scalars: `gates` (n_gates*4), `x_states`
-// (n_shots*N_LIMBS), `rep_states` (n_shots*k*N_LIMBS, K0->K1), `slot_meta` (n_gates*9 predecessor
-// constants), `cols` (TRACE_COLUMNS*padded_rows, column-major), `rc_hist` (2^RC_LOG multiplicity
-// histogram over `d`; diagnostic-only — production uses the host build_rc_table), scalars
-// k/n_gates/n_shots/padded_rows. Launch order: prog_slot_meta -> K0 gate_sim_states -> K1 gate_sim.
+// K1 gate-sim kernel source lives in `cuda/gate_sim.cu` (compiled AOT into `$OUT_DIR/gate_sim.fatbin`,
+// loaded in `gate_sim_module`); layout/constants mirror `main.rs`. Launch order:
+// prog_slot_meta -> K0 gate_sim_states -> K1 gate_sim.
 
 /// Number of gate_air main-trace columns the K1 kernel emits (see cuda/gate_sim.cu cell_at layout).
 pub const TRACE_COLUMNS: usize = 19;
 
-/// Run K1 on the GPU and copy the trace + histograms back to the host (for the P3.1 byte-identity
-/// test). The production GPU-resident path (return BaseColumns, no D2H) is P3.4.
-///
-/// Inputs (host, already flattened by the caller):
-/// - `gates_flat`: n_gates*4 (opcode, target_q, ctrl_a_q, ctrl_b_q); inactive controls -> any value
-///   (kernel guards on a_active/b_active).
-/// - `x_states`: n_shots*32 initial limbs (state_to_limbs of each shot's x_hex).
-/// - `off_lo`/`off_hi`: 16 each (RcIndex offsets).
-/// Returns (cols [column-major, TRACE_COLUMNS*padded_rows], rc_hist[2^rc_log]).
-/// NOTE (padding): real rows [0, n_shots*k*n_gates) are written by the kernel; padding rows stay
-/// zero here — the caller must set the 3 read-block `mask` columns = 1 for padding rows to match
-/// `Row::padding` (TODO; the byte-identity test compares real rows + histograms first).
+/// Run K1 on the GPU and copy the trace + histogram back to the host (byte-identity diagnostic; the
+/// production device-resident path is `gpu_gen_main_trace_device`). Returns (cols [column-major,
+/// TRACE_COLUMNS*padded_rows], rc_hist[2^rc_log]). Padding rows stay zero here.
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn gpu_gen_main_trace(
     gates_flat: &[u32],
@@ -361,13 +262,12 @@ pub fn gpu_gen_main_trace(
 
     let dev = cuda_device()?;
 
-    // N4: compile+load once per process (cached); just get_func afterwards.
     gate_sim_module(&dev)?;
     let func = dev
         .get_func("gate_sim_mod", "gate_sim")
         .ok_or_else(|| "get_func gate_sim".to_string())?;
 
-    let _ = (off_lo, off_hi); // RcIndex offsets no longer used (repurposed arg slots carry rep_states/slot_meta).
+    let _ = (off_lo, off_hi); // RcIndex offsets unused (arg slots repurposed for rep_states/slot_meta).
     let d_gates = dev
         .htod_copy(gates_flat.to_vec())
         .map_err(|e| format!("htod gates: {e}"))?;
@@ -377,9 +277,8 @@ pub fn gpu_gen_main_trace(
     let mut d_cols = dev
         .alloc_zeros::<u32>(TRACE_COLUMNS * padded_rows)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    // rc multiplicity histogram over the single diff `d ∈ [0, 2^RC_LOG)`. Sized to the FIXED
-    // `1 << RC_LOG` (production rc log-size) — the kernel bumps `rc_hist[d]` with d up to
-    // total_pc-1, so the buffer must cover [0,2^RC_LOG).
+    // rc multiplicity histogram over the single diff `d`, sized to the fixed `1 << RC_LOG`: the kernel
+    // bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must cover [0,2^RC_LOG).
     let rc_hist_len = 1usize << crate::RC_LOG;
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
@@ -389,10 +288,10 @@ pub fn gpu_gen_main_trace(
     let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, &d_gates, k, n_gates, n_shots)?;
 
     let block = 256u32;
-    // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
+    // K0: thread-per-shot — fill rep-boundary states (value chain, linear in k).
     launch_k0_states(&dev, &d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
-    // K1: thread-per-EXECUTION — one thread per (shot, rep) = n_shots*k threads. rep_states seeds the
-    // value chain, slot_meta gives the closed-form ts; d_x is UNUSED (arg compat).
+    // K1: thread-per-execution — one thread per (shot, rep). rep_states seeds the value chain,
+    // slot_meta gives the closed-form ts; d_x is unused (arg compat).
     let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
@@ -400,7 +299,6 @@ pub fn gpu_gen_main_trace(
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    // 6 device pointers + 4 scalars = 10 args. off_lo slot = rep_states, off_hi slot = slot_meta.
     unsafe {
         func.launch(
             cfg,
@@ -423,7 +321,7 @@ pub fn gpu_gen_main_trace(
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
     let mut cols = vec![0u32; TRACE_COLUMNS * padded_rows];
-    let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
+    let mut lo = vec![0u32; rc_hist_len];
     dev.dtoh_sync_copy_into(&d_cols, &mut cols)
         .map_err(|e| format!("dtoh cols: {e}"))?;
     dev.dtoh_sync_copy_into(&d_lo, &mut lo)
@@ -431,18 +329,16 @@ pub fn gpu_gen_main_trace(
     Ok((cols, lo))
 }
 
-/// P3.1 soundness gate: assert the GPU K1 trace (real rows + rc multiplicity histogram) is
-/// BYTE-IDENTICAL to the CPU reference (`build_rows` + `cell_at` + `build_rc_table`). Run on a small
-/// fixture (k1-n4) via `GATE_AIR_GPU_TEST=k1` (hooked in main). Compares the 19 main columns
-/// cell-by-cell over the real rows AND the rc-table multiplicity histogram (2^rc_log rows over the
-/// single diff `d`, val[i]=i) against `build_rc_table(&rows, rc_log).multiplicity`; padding rows are all-zero.
+/// Assert the GPU K1 trace (real rows + rc multiplicity histogram) is byte-identical to the CPU
+/// reference (`build_rows` + `cell_at` + `build_rc_table`), comparing the 19 main columns cell-by-cell
+/// and the histogram row-by-row. Run on a small fixture via `GATE_AIR_GPU_TEST=k1`.
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn k1_byte_identity(
     gates: &[crate::Gate],
     cases: &[crate::TestCase],
     k: usize,
     rc_lo: &crate::RcIndex,
-    _rc_hi: &crate::RcIndex, // UNUSED (qubit-memory encoding dropped rc_hi); kept for call-site compat.
+    _rc_hi: &crate::RcIndex, // unused (single-`d` rc); kept for call-site compat.
 ) -> Result<(), String> {
     let n_gates = gates.len();
     let n_shots = cases.len();
@@ -451,9 +347,8 @@ pub fn k1_byte_identity(
         .next_power_of_two()
         .max(1 << (crate::LOG_N_LANES + 2)); // matches main.rs
 
-    // CPU reference (qubit-memory `build_rows`: (rows, boundary)); boundary is a separate component
-    // not covered by K1, so it is ignored here. `build_rc_table` gives the CPU rc multiplicity
-    // histogram (one row per row_of(pos,limb)) that the K1 device histogram must match.
+    // CPU reference; boundary is a separate component not covered by K1, so ignore it. `build_rc_table`
+    // gives the CPU rc multiplicity histogram the K1 device histogram must match.
     let (rows, _boundary) = crate::build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     if rows.len() != real_rows {
         return Err(format!(
@@ -462,7 +357,6 @@ pub fn k1_byte_identity(
             real_rows
         ));
     }
-    // Fixed rc supply-table log-size: RC_LOG (the production rc log-size).
     let rc_log = crate::RC_LOG;
     let cpu_rc = crate::build_rc_table(&rows, rc_log);
 
@@ -479,13 +373,12 @@ pub fn k1_byte_identity(
         let bytes = hex::decode(&c.x_hex).map_err(|e| format!("decode x_hex: {e}"))?;
         x_states.extend_from_slice(&crate::state_to_limbs(&bytes));
     }
-    // off_lo/off_hi are unused by the kernel now (arg-compat only); pass the RcIndex offsets.
+    // off_lo/off_hi are unused by the kernel now (arg-compat only).
     let off_lo: Vec<u32> = (0..crate::LIMB_BITS)
         .map(|p| rc_lo.offset[p] as u32)
         .collect();
     let off_hi = off_lo.clone();
 
-    // GPU. `hist` (2nd return) is the rc multiplicity histogram.
     let (cols, hist) = gpu_gen_main_trace(
         &gates_flat,
         &x_states,
@@ -513,9 +406,8 @@ pub fn k1_byte_identity(
         }
     }
 
-    // Compare the rc multiplicity histogram (GPU device histogram vs CPU build_rc_table). The device
-    // histogram is indexed directly by the single diff `d` (row [0,2^rc_log), val[i]=i) — exactly
-    // RcTable's flattened row order (row_of(d) == d).
+    // Compare the rc multiplicity histogram; the device histogram is indexed directly by `d`
+    // (row_of(d) == d), matching RcTable's row order.
     let mut hist_mismatches = 0usize;
     for i in 0..cpu_rc.multiplicity.len() {
         if hist[i] != cpu_rc.multiplicity[i] {
@@ -549,49 +441,19 @@ pub fn k1_byte_identity(
     }
 }
 
-// ============================================================================
-// P3.2 — K4: CUDA LogUp interaction trace (full on-device).
-// ============================================================================
-//
-// Generates gate_air's main-component interaction M31 columns (N_LOGUP_COLS=5 LogUp columns ×
-// 4 coords = 20) + claimed_sum on the GPU, byte-identical to the CPU `gen_main_interaction` /
-// `LogupTraceGenerator`. Consumes K1's main-trace columns (no re-simulation). The last LogUp column
-// (k = N_LOGUP_COLS-1 = 4) is the (rc ctrl_b d + program) PAIR batch and carries the cumsum_shift.
-//
-// Pipeline (per LogUp column k=0..N_LOGUP_COLS, sequential — col k accumulates onto col k-1):
-//   1. logup_col_gen[batch k]: per row, combine the batch's relation tuple(s) -> (num, denom)
-//      where d = (Σ_i alpha^i · values[i]) − z   (QM31), num = m0·d1 + m1·d0, denom = d0·d1.
-//   2. logup_finalize_col: value = num · denom^{-1} (per-element QM31 inverse — byte-identical
-//      to the CPU batch inverse, since the field inverse is unique); running sum across columns.
-// Then once, on the last column (k = N_LOGUP_COLS-1 = 4):
-//   3. logup_cumsum_reduce  -> coordinate_sums = claimed_sum (Σ rows of last col, per coord).
-//   4. logup_cumsum_shift   -> subtract cumsum_shift = claimed_sum / 2^log_size.
-//   5. inclusive_prefix_sum (per coord): bit-reverse -> circle→coset -> scan -> coset→circle ->
-//      bit-reverse. Matches stwo's `inclusive_prefix_sum` (coset-order inclusive scan of
-//      bit-reversed-CircleDomain evals). Hand-rolled scan (block_scan + add_offsets).
-//
-// FIELD MATH is transcribed exactly from stwo (qm31.rs/cm31.rs): CM31 is i^2 = -1
-// (mul = (a.r·b.r − a.i·b.i, a.r·b.i + a.i·b.r)); QM31 = CM31[j]/(j^2 − (2+i)), R = (2,1).
-// (NB: obelyzk fft.rs uses a different u^2=2 convention — NOT used here.)
-//
-// SOUNDNESS: validated by `k4_byte_identity` (20 cols + claimed_sum) vs the CPU reference
-// using a FIXED `GateRel::dummy()` (z,alpha) before it is trusted.
-//
-// OCCUPANCY: K4 is ALREADY thread-per-EXECUTION-instance — every per-row kernel here
-// (logup_col_gen / logup_finalize_col / logup_cumsum_shift / the prefix-sum stages) maps one
-// thread per ROW with `row = blockIdx*blockDim + threadIdx; if (row >= padded_rows) return;`, and
-// the launch grid is `padded_rows.div_ceil(block)`. Since padded_rows ≈ n_shots*k*n_gates rounded
-// to a power of two, parallelism is already millions of threads at the Tanuj benchmark and scales
-// with total work — it never had K1's thread-per-shot pathology, so K4's mapping is unchanged here.
-// (logup_cumsum_reduce is a grid-stride block reduction capped at 1024 blocks, which is correct and
-// fully occupied.) The K4 column writes are coordinate-major (4 coords × padded_rows); each thread
-// writes its row's 4 coords at stride padded_rows, the same layout K1 uses.
+// K4: CUDA LogUp interaction trace (full on-device). Generates gate_air's main-component interaction
+// M31 columns (N_LOGUP_COLS=5 batches × 4 coords = 20) + claimed_sum, byte-identical to the CPU
+// `gen_main_interaction` / `LogupTraceGenerator`, consuming K1's main-trace columns (no re-simulation).
+// Per LogUp column (sequential, col k accumulates onto k-1): logup_col_gen combines the batch tuples
+// into (num, denom), logup_finalize_col computes value = num·denom^{-1} + running sum. On the last
+// column: cumsum_reduce -> claimed_sum, cumsum_shift subtracts claimed_sum/2^log_size, then a per-coord
+// inclusive prefix sum (bit-reverse -> circle→coset -> scan -> coset→circle -> bit-reverse) matching
+// stwo's `inclusive_prefix_sum`. Field math is transcribed exactly from stwo (qm31.rs/cm31.rs: CM31
+// i^2=-1, QM31 R=(2,1)) — NOT obelyzk's u^2=2 convention. Validated by `k4_byte_identity`.
 
-/// Number of LogUp columns (batches) gate_air's main component emits. The pc-pinned ts + single-`d`
-/// rc-table range-check encoding emits 10 relation entries — 3 qubitmem pairs (target/ctrl_a/ctrl_b
-/// Use+Yield), 3 rc single-`d` terms (target/ctrl_a/ctrl_b), and 1 program singleton — folded by
-/// `finalize_logup_in_pairs` into 5 batches (all pairs). Each batch is a SecureColumnByCoords (4 M31).
-/// Order MUST match `gen_main_interaction` (main.rs) exactly.
+/// Number of LogUp columns (batches) gate_air's main component emits: 10 relation entries (3 qubitmem
+/// Use+Yield pairs + 3 rc single-`d` terms + 1 program singleton) folded by `finalize_logup_in_pairs`
+/// into 5 batches. Order MUST match `gen_main_interaction` (main.rs) exactly.
 pub const N_LOGUP_COLS: usize = 5;
 /// Number of M31 interaction columns committed = 5 × 4 = 20.
 pub const N_INTERACTION_COLS: usize = N_LOGUP_COLS * 4;
@@ -599,15 +461,12 @@ pub const N_INTERACTION_COLS: usize = N_LOGUP_COLS * 4;
 /// program = tag + 5 payload = 6).
 pub const GATE_REL_WIDTH: usize = 6;
 
-// K4 interaction kernel source (M31/CM31/QM31 device arithmetic + the logup_* / ps_* prefix-sum
-// kernels) lives in `cuda/interaction.cu`, compiled AOT by build.rs into `$OUT_DIR/interaction.fatbin`
-// and loaded in `interaction_module`.
+// K4 interaction kernel source lives in `cuda/interaction.cu` (compiled AOT into
+// `$OUT_DIR/interaction.fatbin`, loaded in `interaction_module`).
 
-/// Run the full K4 interaction pipeline on the GPU and copy the N_INTERACTION_COLS (20) interaction columns +
-/// claimed_sum back to the host. Inputs: the host-side main trace `cols` (column-major,
-/// TRACE_COLUMNS × padded_rows), the drawn `z` and `alpha_powers` (each QM31 → 4 M31, length
-/// GATE_REL_WIDTH), and dims. Returns (interaction_cols [N_INTERACTION_COLS × padded_rows,
-/// column-major], claimed_sum [4 M31]).
+/// Run the full K4 interaction pipeline on the GPU and copy the 20 interaction columns + claimed_sum
+/// back to the host. Inputs: host-side main trace `cols` (column-major), drawn `z`/`alpha_powers`, dims.
+/// Returns (interaction_cols [column-major], claimed_sum [4 M31]).
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gen_interaction(
@@ -626,7 +485,6 @@ pub fn gpu_gen_interaction(
 
     let dev = cuda_device()?;
 
-    // N4: compile+load the interaction module once per process (cached); just get_func afterwards.
     interaction_module(&dev)?;
     let get = |n: &str| {
         dev.get_func("logup_mod", n)
@@ -644,8 +502,8 @@ pub fn gpu_gen_interaction(
     let d_ap = dev
         .htod_copy(ap_flat)
         .map_err(|e| format!("htod ap: {e}"))?;
-    // Positional dims for K4's enabler/shot_id/pc recompute (moved to tree0). One pointer arg keeps
-    // the launch tuple within cudarc's LaunchAsync arity cap.
+    // Positional dims for K4's enabler/shot_id/pc recompute; one pointer arg keeps the launch tuple
+    // within cudarc's LaunchAsync arity cap.
     let d_dims = dev
         .htod_copy(vec![real_rows, shot_stride])
         .map_err(|e| format!("htod dims: {e}"))?;
@@ -846,17 +704,16 @@ where
     Ok(())
 }
 
-/// P3.2 soundness gate: assert the GPU K4 interaction trace (N_INTERACTION_COLS=20 M31 columns + claimed_sum) is
-/// byte-identical to the CPU `gen_main_interaction` / `LogupTraceGenerator`, using a FIXED
-/// `GateRel::dummy()` (z, alpha) so both sides see the same challenges. Run via
-/// `GATE_AIR_GPU_TEST=k4` on a small fixture (k1-n4).
+/// Assert the GPU K4 interaction trace (20 M31 columns + claimed_sum) is byte-identical to the CPU
+/// `gen_main_interaction`, using a fixed `GateRel::dummy()` (z, alpha) so both sides see the same
+/// challenges. Run via `GATE_AIR_GPU_TEST=k4`.
 #[cfg(all(feature = "gpu-cuda", feature = "diag"))]
 pub fn k4_byte_identity(
     gates: &[crate::Gate],
     cases: &[crate::TestCase],
     k: usize,
-    _rc_lo: &crate::RcIndex, // UNUSED (arg-compat); the rc diff `d` comes from the K1 main trace columns.
-    _rc_hi: &crate::RcIndex, // UNUSED (single-`d` rc encoding); kept for call-site compat.
+    _rc_lo: &crate::RcIndex, // unused (rc diff `d` comes from the K1 main trace); call-site compat.
+    _rc_hi: &crate::RcIndex, // unused (single-`d` rc); call-site compat.
 ) -> Result<(), String> {
     use stwo::prover::backend::Column;
 
@@ -874,7 +731,7 @@ pub fn k4_byte_identity(
     let (cpu_cols, cpu_sum) =
         crate::gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
 
-    // GPU main trace (host) — reuse K1 (includes padding rows now).
+    // GPU main trace (host) — reuse K1.
     let mut gates_flat = Vec::with_capacity(n_gates * 4);
     for g in gates {
         gates_flat.push(g.opcode as u32);
@@ -890,7 +747,7 @@ pub fn k4_byte_identity(
     let off_lo: Vec<u32> = (0..crate::LIMB_BITS)
         .map(|p| _rc_lo.offset[p] as u32)
         .collect();
-    let off_hi = off_lo.clone(); // unused by the kernel; passed for arg-list compat.
+    let off_hi = off_lo.clone(); // unused by the kernel; arg-list compat.
     let (main_cols, _lo) = gpu_gen_main_trace(
         &gates_flat,
         &x_states,
@@ -902,11 +759,6 @@ pub fn k4_byte_identity(
         padded_rows,
     )?;
 
-    // Extract (z, alpha_powers) from the relation via the PUBLIC `Relation::combine`
-    // (the inner LookupElements is private to constraint-framework). Works for any
-    // challenges (dummy here, real-drawn in P3.4): combine(values) = Σ α^i·v[i] − z, so
-    //   combine([0])      = −z                  → z      = −combine([0])
-    //   combine(unit_i)   = α^i − z             → α^i    = combine(unit_i) + z
     let (z_qm, alpha_powers_qm) = extract_z_alpha(&elements.qubitmem);
     let z = secure_to_m31x4(z_qm);
     let alpha_powers: Vec<[u32; 4]> = alpha_powers_qm
@@ -924,7 +776,7 @@ pub fn k4_byte_identity(
         (k * n_gates) as u64,
     )?;
 
-    // Compare the N_INTERACTION_COLS (20) interaction columns over ALL padded rows (prefix sum spans them).
+    // Compare the 20 interaction columns over all padded rows (the prefix sum spans them).
     let mut mismatches = 0usize;
     let mut samples: Vec<String> = Vec::new();
     for c in 0..N_INTERACTION_COLS {
@@ -982,7 +834,8 @@ fn secure_to_m31x4(x: stwo::core::fields::qm31::SecureField) -> [u32; 4] {
 }
 
 /// Recover (z, alpha_powers[0..GATE_REL_WIDTH]) from a `GateRel` using only its public
-/// `Relation::combine` (the inner `LookupElements` is private to constraint-framework).
+/// `Relation::combine` (the inner `LookupElements` is private): combine(v) = Σ α^i·v[i] − z, so
+/// z = −combine([0]) and α^i = combine(unit_i) + z.
 #[cfg(feature = "gpu-cuda")]
 fn extract_z_alpha(
     rel: &crate::GateRel,
@@ -1008,28 +861,13 @@ fn extract_z_alpha(
     (z, alpha_powers)
 }
 
-// ============================================================================
-// P3.4 — device-resident output: feed K1/K4's GPU columns straight into the
-// CudaBackend commit with NO host round-trip.
-// ============================================================================
-//
-// INTEROP (the "two CUDA memory worlds" problem): K1/K4 write into cudarc
-// `CudaSlice<u32>` (obelyzk executor, `get_cuda_executor`), while the CudaBackend
-// columns are NitrooZK `BaseFieldVec { device_ptr, size }` (raw `cuda_malloc` via
-// the stwo cuda FFI). Both allocators run on the SAME device-0 primary CUDA
-// context (cudarc `CudaDevice::new(0)` and NitrooZK's driver/runtime `cuMalloc`),
-// so a device pointer from one is a valid `cudaMemcpy DeviceToDevice` operand for
-// the other. We use approach (B) — a single per-column device-to-device copy:
-//   1. K1/K4 run exactly as validated, producing the column-major cudarc buffer.
-//   2. For each committed column we allocate a `BaseFieldVec::new_uninitialized`
-//      and `copy_uint32_t_vec_from_device_to_device(src_ptr + col*padded_rows,
-//      dst.device_ptr, padded_rows)` (D2D — no D2H+H2D).
-//   3. Wrap each `BaseFieldVec` in `CircleEvaluation::<CudaBackend>::new(domain, _)`.
-// (B) is chosen over (A) wrap-the-cudarc-pointer-as-a-BaseFieldVec because mixing
-// two owning allocators behind one `Drop` is fragile (double-free / lifetime
-// hazards): cudarc frees its `CudaSlice` on drop, and a borrowed BaseFieldVec
-// would dangle once the kernel scope ends. D2D keeps each side owning its own
-// memory while still removing the host upload — the actual win.
+// Device-resident output: feed K1/K4's GPU columns straight into the CudaBackend commit with no host
+// round-trip. Interop between two allocators: K1/K4 write cudarc `CudaSlice<u32>`, the CudaBackend
+// columns are stwo_cuda `BaseFieldVec`. Both run on the same primary CUDA context, so a device pointer
+// from one is a valid device-to-device copy operand for the other. Each committed column is a single
+// per-column D2D copy into a fresh `BaseFieldVec` wrapped as `CircleEvaluation<CudaBackend>` — chosen
+// over wrapping the cudarc pointer directly, which would put two owning allocators behind one Drop
+// (double-free / dangling once the kernel scope ends).
 
 /// cudarc `CudaSlice<u32>` device address as a raw `*const u32` (the integer
 /// `CUdeviceptr`, valid in the shared primary context).
@@ -1039,9 +877,8 @@ fn cudarc_dptr(slice: &cudarc::driver::CudaSlice<u32>) -> *const u32 {
     (*slice.device_ptr()) as usize as *const u32
 }
 
-/// Copy ONE column (`padded_rows` u32s starting at element offset `col_off`) from a
-/// cudarc device buffer into a freshly allocated NitrooZK `BaseFieldVec`, via a
-/// device-to-device copy (no host round-trip), and wrap it as a device-resident
+/// Copy one column (`padded_rows` u32s at element offset `col_off`) from a cudarc device buffer into a
+/// fresh `BaseFieldVec` via a device-to-device copy (no host round-trip), wrapped as a device-resident
 /// `CircleEvaluation<CudaBackend>`.
 #[cfg(feature = "gpu-cuda")]
 fn d2d_column(
@@ -1074,18 +911,11 @@ fn d2d_column(
     CircleEvaluation::<_, _, BitReversedOrder>::new(domain, dst)
 }
 
-/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 19 main
-/// columns as `CircleEvaluation<CudaBackend>` (device-resident, no host upload),
-/// plus the rc histogram copied to the host (tiny; the
-/// multiplicity columns are still built + uploaded on the CPU path in main.rs),
-/// plus the raw column-major main-trace device buffer `d_cols` so the interaction
-/// path (K4) can REUSE it instead of re-running K0/K1 (no re-simulation, no
-/// re-upload). The 19 returned `CircleEvaluation`s are independent D2D copies of
-/// `d_cols`'s columns (see `d2d_column`), so handing `d_cols` back to the caller
-/// does not alias or mutate them.
-///
-/// Reuses the EXACT validated K1 kernel (cuda/gate_sim.cu); only the output handoff
-/// changes (D2D into BaseFieldVecs instead of D2H into `Vec<u32>`).
+/// Device-resident K1: run `gpu_gen_main_trace`'s kernels and return the 19 main columns as
+/// device-resident `CircleEvaluation<CudaBackend>` (no host upload), the rc histogram (host, tiny),
+/// and the raw column-major device buffer `d_cols` so K4 can reuse it (no K0/K1 re-run). The returned
+/// `CircleEvaluation`s are independent D2D copies of `d_cols`'s columns, so returning `d_cols` does
+/// not alias them.
 #[cfg(feature = "gpu-cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gen_main_trace_device(
@@ -1113,9 +943,8 @@ pub fn gpu_gen_main_trace_device(
     String,
 > {
     let dev = cuda_device()?;
-    // Upload the shard-INVARIANT inputs (gate list + RcIndex offsets) here, then delegate to the
-    // device-buffer body. The base precompute path uploads these ONCE and calls the `_d` body
-    // directly (skipping this per-shard upload); only `x_states` is per-shard.
+    // Upload the shard-invariant inputs here, then delegate to the device-buffer body. The base
+    // precompute path uploads these once and calls the `_d` body directly; only `x_states` is per-shard.
     let d_gates = dev
         .htod_copy(gates_flat.to_vec())
         .map_err(|e| format!("htod gates: {e}"))?;
@@ -1173,7 +1002,6 @@ pub fn gpu_gen_main_trace_device_d(
 
     let dev = cuda_device()?;
 
-    // N4: compile+load the GATE_SIM module once per process (cached); just get_func afterwards.
     gate_sim_module(&dev)?;
     let func = dev
         .get_func("gate_sim_mod", "gate_sim")
@@ -1186,11 +1014,9 @@ pub fn gpu_gen_main_trace_device_d(
     let mut d_cols = dev
         .alloc_zeros::<u32>(cols_len)
         .map_err(|e| format!("alloc cols: {e}"))?;
-    // rc multiplicity histogram over the single diff `d`. Sized to the FIXED `1 << RC_LOG` — the K1
-    // kernel bumps `rc_hist[d]` with d up to total_pc-1, so the buffer must cover [0,2^RC_LOG) or the
-    // kernel writes out of bounds on real (large-k) runs. Production ignores the returned histogram
-    // (the multiplicity witness is host-built), but the device buffer must still be correctly sized
-    // so the atomic bumps stay in bounds.
+    // rc histogram sized to the fixed `1 << RC_LOG`: the kernel bumps `rc_hist[d]` with d up to
+    // total_pc-1, so the buffer must cover [0,2^RC_LOG) to keep the atomic bumps in bounds on large-k
+    // runs. Production ignores the returned histogram (the multiplicity witness is host-built).
     let rc_hist_len = 1usize << crate::RC_LOG;
     let mut d_lo = dev
         .alloc_zeros::<u32>(rc_hist_len)
@@ -1201,10 +1027,10 @@ pub fn gpu_gen_main_trace_device_d(
     let (mut d_rep, d_slot) = alloc_rep_and_slot(&dev, d_gates, k, n_gates, n_shots)?;
 
     let block = 256u32;
-    // K0: thread-per-SHOT — fill rep-boundary states (value chain, linear in k).
+    // K0: thread-per-shot — fill rep-boundary states (value chain, linear in k).
     launch_k0_states(&dev, d_gates, &d_x, &mut d_rep, k, n_gates, n_shots)?;
-    // K1: thread-per-EXECUTION — one thread per (shot, rep). rep_states (off_lo slot) seeds the value
-    // chain; slot_meta (off_hi slot) gives the closed-form ts. d_x is UNUSED (compat).
+    // K1: thread-per-execution — one thread per (shot, rep); rep_states seeds the value chain, slot_meta
+    // gives the closed-form ts. d_x is unused (compat).
     let n_exec = (n_shots as u64) * (k as u64);
     let grid = (n_exec.div_ceil(block as u64)) as u32;
     let cfg = LaunchConfig {
@@ -1233,22 +1059,19 @@ pub fn gpu_gen_main_trace_device_d(
 
     dev.synchronize().map_err(|e| format!("sync: {e}"))?;
 
-    // Device handoff: build the 19 CudaBackend columns from `d_cols` (column-major; column c at
-    // element offset c*padded_rows). No host copy.
+    // Device handoff: build the 19 CudaBackend columns from `d_cols` (column-major, column c at offset
+    // c*padded_rows). No host copy.
     let domain = CanonicCoset::new(log_n_rows).circle_domain();
     let cols: Vec<_> = (0..TRACE_COLUMNS)
         .map(|c| d2d_column(&d_cols, c * padded_rows, padded_rows, domain))
         .collect();
 
-    // Histogram is tiny → keep it on host (the multiplicity columns are built
-    // + uploaded on the existing CPU path in main.rs).
-    let mut lo = vec![0u32; rc_hist_len]; // rc multiplicity histogram over d, length 2^rc_log
+    let mut lo = vec![0u32; rc_hist_len];
     dev.dtoh_sync_copy_into(&d_lo, &mut lo)
         .map_err(|e| format!("dtoh rc_hist: {e}"))?;
     dev.synchronize().map_err(|e| format!("sync hist: {e}"))?;
-    // SUCCESS handoff: return the resident `d_cols` device buffer so K4 reads it directly (no K0/K1
-    // re-run); it is no longer touched here after the column build above. The buffer frees via cudarc
-    // `cuMemFree` when the caller eventually drops it.
+    // Return the resident `d_cols` buffer so K4 reads it directly (no K0/K1 re-run); it frees when the
+    // caller drops it.
     Ok((cols, lo, d_cols))
 }
 
@@ -1266,10 +1089,9 @@ impl MainTrace {
         Ok(MainTrace(d_cols))
     }
 
-    /// Free the underlying device main-trace buffer NOW, after K4 has consumed it and BEFORE the
-    /// tree2 commit. Call this instead of relying on `drop` at end-of-prove. The resident `CudaSlice`
-    /// (`cuMemFree`) is dropped at the end of this scope; we then SYNCHRONIZE so the free settles
-    /// before tree2's first alloc.
+    /// Free the underlying device main-trace buffer now (after K4, before the tree2 commit), then
+    /// synchronize so the free settles before tree2's first alloc — instead of relying on end-of-prove
+    /// drop.
     pub fn free_after_k4(self) -> Result<(), String> {
         drop(self);
         let dev = cuda_device()?;
@@ -1279,16 +1101,10 @@ impl MainTrace {
     }
 }
 
-/// Device-resident K4: run `gpu_gen_interaction`'s pipeline using the REAL drawn
-/// `LookupElements` (z/alpha recovered via `extract_z_alpha`) and return the 20
-/// interaction columns as `CircleEvaluation<CudaBackend>` (device-resident, no host
-/// upload) plus the `claimed_sum` (mixed into the channel in main.rs exactly as the
-/// CPU `gen_main_interaction` sum was).
-///
-/// `main` is the SAME column-major main trace K1 produced earlier in this base proof — the resident
-/// device buffer, read here via `COL(c)` (no re-simulation; K0/K1 are NOT re-run). The buffer is
-/// only read here (the K4 `logup_col_gen` kernel reads it and writes its own `d_num`/`d_denom`/
-/// `d_inter` scratch). Reuses the EXACT validated K4 kernel (cuda/interaction.cu).
+/// Device-resident K4: run `gpu_gen_interaction`'s pipeline using the real drawn `LookupElements`
+/// (z/alpha recovered via `extract_z_alpha`) and return the 20 interaction columns as device-resident
+/// `CircleEvaluation<CudaBackend>` plus `claimed_sum`. `main` is the resident buffer K1 produced
+/// earlier in this base proof, read in place (no K0/K1 re-run).
 #[cfg(feature = "gpu-cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gen_interaction_device(
@@ -1329,13 +1145,10 @@ pub fn gpu_gen_interaction_device(
 
     let dev = cuda_device()?;
 
-    // K4 reads the main-trace columns from the buffer K1 already produced (`main`, passed in by the
-    // caller). No K0/K1 re-run, no re-upload of gates/x_states/off_lo/off_hi, no histogram/rep
-    // scratch — those were only needed to repopulate the main trace, which now lives in `main`.
+    // K4 reads the main-trace columns from the buffer K1 already produced (`main`); no K0/K1 re-run,
+    // no re-upload, no histogram/rep scratch.
     let block = 256u32;
 
-    // ---- K4 interaction pipeline (verbatim launches from gpu_gen_interaction) ----
-    // N4: compile+load the interaction module once per process (cached); just get_func afterwards.
     interaction_module(&dev)?;
     let get = |n: &str| {
         dev.get_func("logup_mod", n)
@@ -1349,7 +1162,7 @@ pub fn gpu_gen_interaction_device(
     let d_ap = dev
         .htod_copy(ap_flat)
         .map_err(|e| format!("htod ap: {e}"))?;
-    // Positional dims for K4's enabler/shot_id/pc recompute (moved to tree0).
+    // Positional dims for K4's enabler/shot_id/pc recompute.
     let d_dims = dev
         .htod_copy(vec![real_rows, shot_stride])
         .map_err(|e| format!("htod dims: {e}"))?;
@@ -1364,7 +1177,6 @@ pub fn gpu_gen_interaction_device(
         .alloc_zeros::<u32>(4 * padded_rows)
         .map_err(|e| format!("alloc denom: {e}"))?;
 
-    // K4 reads K1's resident device buffer in place (byte-for-byte the previous behavior).
     let d_cols: &cudarc::driver::CudaSlice<u32> = &main.0;
 
     let grid = (padded_rows as u32).div_ceil(block);

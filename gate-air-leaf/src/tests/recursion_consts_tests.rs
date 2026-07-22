@@ -1,14 +1,7 @@
-//! PINNED recursion-const capture + DRIFT tests (box-only, `#[ignore]`d). `capture_all` recomputes
-//! the whole pinned table FRESH from the fixtures in one pass (emitting `@@` lines the generator
-//! parses); the per-operating-point drift tests rebuild the real leaf preprocessed circuit and call
-//! `check_configs`, which runs the SAME fresh cascade and asserts each layer/arity equals the pinned
-//! table (`op.pinned().to_derived(..)`). One test per point (3); node_target is a field checked
-//! inside `check_configs`.
-//!
-//! No env flags: `#[ignore]` is the laptop guard (these build real ~2^22 node preprocessed circuits —
-//! GBs, box-only). The per-k fixture is resolved from `CARGO_MANIFEST_DIR/../../grover-tax/fixtures`.
-//!
-//! Run e.g.: `cargo test --release k500_drift -- --ignored --nocapture --test-threads=1`.
+//! PINNED recursion-const capture + DRIFT tests (box-only, `#[ignore]`d — they build real ~2^22 node
+//! preprocessed circuits). `capture_all` recomputes the whole pinned table fresh in one pass (emitting
+//! `@@` lines `gen_recursion_consts.py` parses); the per-point drift tests rebuild the real cascade and
+//! `check_configs` asserts each layer/arity equals `op.pinned().to_derived(..)`.
 
 use super::*;
 
@@ -25,14 +18,10 @@ use recursive_aggregate::AggregateConfig;
 
 use leaf::{build_gate_air_leaf_circuit, GateAirLeafParams};
 
-/// COMPUTES (not pins) the gate_air `AggregateConfig` for a fixture — a THIN wrapper over the shared
-/// `derive_configs` + `assemble_aggregate_config`, for the tiny non-pinned wiring roundtrips in
-/// `main`'s `mod tests` (a tiny fixture is not a pinned point). Builds the leaf preprocessed circuit
-/// (padded to its OWN natural target, decoupled from the node target), derives the full cascade, and
-/// assembles the runtime config. The `n` fed to `derive_configs` only affects its (discarded)
-/// unpacker field — the returned `AggregateConfig` carries no unpacker — so a placeholder `n = 1`
-/// is used; callers recompute the real per-N unpacker via `unpacker_verify_config`. NOT on the
-/// production path — production reads `leaf::pinned_aggregate_config`.
+/// COMPUTES (not pins) the gate_air `AggregateConfig` for a fixture — a thin wrapper over
+/// `derive_configs` + `assemble_aggregate_config`, for the tiny non-pinned wiring roundtrips (a tiny
+/// fixture is not a pinned point). `n = 1` placeholder (only feeds the discarded unpacker field;
+/// callers recompute the real per-N unpacker). Production reads `leaf::pinned_aggregate_config`.
 pub(super) fn derive_aggregate_config(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,

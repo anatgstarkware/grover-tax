@@ -1,35 +1,20 @@
-//! PINNED recursion VERIFIER configs, keyed PER OPERATING POINT (the 3 Tanuj curve points). Every
-//! config the recursion verifies against is a fixed constant here — leaf / level1 / fold / unpacker —
-//! so nothing security-relevant (n_queries / pow_bits / blowup / fold_step / lifting / column shapes /
-//! preprocessed roots) is derived at prove or verify time. Each point is one `PinnedConfigs` (the
-//! generic const-friendly type from `recursive_aggregate::pinned_configs`, shared with the cairo
-//! consumer); `leaf::pinned_aggregate_config` turns it into the runtime `AggregateConfig` via
-//! `PinnedConfigs::to_derived` + `assemble_aggregate_config`.
+//! PINNED recursion VERIFIER configs, keyed per operating point (the 3 Tanuj curve points), so
+//! nothing security-relevant (n_queries / pow_bits / blowup / fold_step / lifting / column shapes /
+//! roots) is derived at prove or verify time. Each point is one `PinnedConfigs`;
+//! `leaf::pinned_aggregate_config` turns it into the runtime `AggregateConfig` via `to_derived` +
+//! `assemble_aggregate_config`. Re-capture after a drift with `capture_all` on the box +
+//! `scripts/gen_recursion_consts.py`.
 //!
-//! The genuinely-COMPUTED fields pinned here (vs the fixed-by-blowup scalars) are, per (kind, point):
-//! `trace_log_size` (→ the PCS `lifting_log_size`), `preprocessed_column_log_sizes`, `node_target`
-//! (shared by level1 + fold), and the per-(kind, arity) `preprocessed_root`. The PCS scalars
-//! (`pow_bits`, `n_queries`, `fold_step`, `log_last_layer_degree_bound`, `log_blowup_factor`) and
-//! `n_outputs` are FIXED functions of the fixed blowups (rebuilt by `PinnedConfigs::to_derived` via
-//! stwo-circuits' `get_pcs_config`).
+//! NB: the `level1`/`fold` blocks are IDENTICAL across the 3 points, and correctly so — a node's root
+//! depends on its child's SHAPE (point-independent: the leaf is `2^21` everywhere), not the child's
+//! ROOT (a runtime input, never baked). Only the leaf `root` and the `unpacker` differ per point.
 //!
-//! All three points are CAPTURED and box-validated (recursion_fingerprint per point + the drift
-//! tests, `recursion_consts_tests.rs`). To re-capture after a drift (stwo/circuit/param change), run
-//! `capture_all` on the box and regenerate this block with `scripts/gen_recursion_consts.py`.
-//!
-//! NB: the `level1`/`fold` blocks are IDENTICAL across the 3 points. That is correct, not a
-//! placeholder: a node's preprocessed root depends on its child's SHAPE (cols + `trace_log_size`,
-//! point-independent — the leaf is `2^21` at every point), not the child's ROOT (a runtime input,
-//! never baked). Only the leaf `root` (fixture-specific) and the `unpacker` (bakes the leaf root + N)
-//! differ per point.
-//!
-//! The 3 curve operating points (samples=9024, RC_LOG=25, base_blowup=1, fold_arity=8, node/leaf
-//! blowup=3):
+//! The 3 points (samples=9024, RC_LOG=25, base_blowup=1, fold_arity=8, node/leaf blowup=3):
 //!   - k=500,  shots_per_shard=52 → N=174
 //!   - k=1000, shots_per_shard=26 → N=348
 //!   - k=2000, shots_per_shard=13 → N=695
 //!
-//! Any other operating point (other k / shots / N / arity / blowup) → panic (unsupported).
+//! Any other point → panic (unsupported).
 
 use recursive_aggregate::pinned_configs::{
     PinnedComponentSizes, PinnedConfigs, PinnedLayer, PinnedNodeLayer, PinnedUnpacker,

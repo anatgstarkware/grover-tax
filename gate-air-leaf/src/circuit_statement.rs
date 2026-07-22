@@ -1,27 +1,22 @@
-//! In-circuit verifier of the gate_air STARK proof (Design A, Milestone 2).
-//!
-//! Mirrors gate_air's `FrameworkEval` components as `CircuitEval` components for the generic
-//! `circuits_stark_verifier`. gate_air's LogUp uses ONE shared relation (`GateRel`) with a constant
-//! id tag prepended to each tuple (see `TAG_*` in main.rs), exactly matching this verifier's single
-//! `acc.interaction_elements` model — so each `add_to_relation` here prepends the same tag the
-//! prover used, e.g. cairo-style `&[eval!(context, TAG_PROGRAM), …payload]`.
-//!
-//! Qubit-memory encoding (branch anatg/gate-air-qubit-mem): the whole-state TAG_STATE chain is
-//! replaced by a per-qubit TAG_QUBITMEM chain lookup. Components: main gate, program (hidden-program
-//! consistency), boundary (per (shot,addr) init/final anchoring). Same-row. Timestamp ordering is a
-//! degree-1 equality `flag*(ts - prev_ts - 1) = 0` on a per-address +1 counter (no rc_lo table).
+//! In-circuit verifier of the gate_air STARK proof: mirrors gate_air's `FrameworkEval` components as
+//! `CircuitEval` components for the generic `circuits_stark_verifier`. gate_air's LogUp uses ONE
+//! shared relation with a constant id tag prepended to each tuple (see `TAG_*` in main.rs), so each
+//! `add_to_relation` here prepends the same tag the prover used. Components: main gate, program
+//! (hidden-program consistency via H_P), boundary (per (shot,addr) anchoring), rc (ts-ordering
+//! range-check supply). Same-row; `ts = pc+1` and the target `v_after` are inlined, not columns.
 #![allow(dead_code)]
 
-use circuits::blake::HashValue;
+use circuits::blake::{blake2s, HashValue};
 use circuits::context::{Context, Var};
 use circuits::eval;
 use circuits::ivalue::{qm31_from_u32s, IValue};
-use circuits::ops::Guess;
+use circuits::ops::{eq, inv, Guess};
 use circuits::simd::Simd;
 use circuits::wrappers::U32Wrapper;
 use circuits_stark_verifier::constraint_eval::{
     CircuitEval, ComponentDataTrait, CompositionConstraintAccumulator, RelationUse,
 };
+use circuits_stark_verifier::logup::combine_term;
 use circuits_stark_verifier::order_hash_map::OrderedHashMap;
 use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
 use circuits_stark_verifier::statement::Statement;
@@ -35,21 +30,13 @@ use crate::{
     TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
 };
 
-/// QM31 constant Var of base-field value `v` (= `(v,0,0,0)`), used for tags and literals.
-fn konst<Value: IValue>(context: &mut Context<Value>, v: u32) -> Var {
-    context.constant(qm31_from_u32s(v, 0, 0, 0))
-}
-
-// Table components emit only their supply term(s); they consume no relation, so
-// `relation_uses_per_row` is empty (matches cairo's range_check_12).
+// Table components consume no relation, so `relation_uses_per_row` is empty (like cairo's range_check_12).
 const NO_RELATION_USES: [RelationUse; 0] = [];
 const ONE_TERM_INTERACTION_COLUMNS: usize = 4;
 
-/// Program-consistency table (supply). Mirrors main.rs `ProgramTableEval` (H_P binding, Fork A): emits
-/// TWO terms, paired into ONE batch (still 4 interaction cols):
-///   (internal, -mult) / [TAG_PROGRAM,     slot, op, t, a, b]  — cancels main's demand,
-///   (public,   +mult) / [TAG_PROGRAM_PUB, slot, op, t, a, b]  — the dangling P_pub.
-/// Variable log_size (set per proof), so no fixed size assert here.
+/// Program-consistency table (supply). Mirrors main.rs `ProgramTableEval`: emits an internal `-mult`
+/// term on TAG_PROGRAM (cancels main's demand) and a public `+mult` term on TAG_PROGRAM_PUB (the
+/// dangling P_pub), paired into one batch (4 interaction cols).
 pub struct ProgramTable;
 impl<Value: IValue> CircuitEval<Value> for ProgramTable {
     fn name(&self) -> String {
@@ -182,33 +169,9 @@ impl<Value: IValue> CircuitEval<Value> for RcTable {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Main gate component: mirrors gate_air's GateEval::evaluate exactly (same 19-col trace-column
-// order, same constraint order, same 10 relation-term emission order => 5 pairs => 20 interaction
-// cols). ts (= pc+1) and the target's v_after (= v_before+delta) are inlined, not columns.
-// Timestamp ordering is a degree-1 range-check reconstruction + a single-`d` lookup.
-// ----------------------------------------------------------------------------
-
-/// Parsed access-block Vars: addr, prev_ts, v, then the single range-check diff `d`.
-/// The access timestamp `ts` is NOT a column — it is the inlined `pc + 1` expression.
-struct AccessVars {
-    addr: Var,
-    prev_ts: Var,
-    v: Var,
-    d: Var,
-}
-
-fn parse_access(cols: &[Var], off: usize) -> AccessVars {
-    AccessVars {
-        addr: cols[off],
-        prev_ts: cols[off + 1],
-        v: cols[off + 2],
-        d: cols[off + ACCESS_COLS],
-    }
-}
-
-/// Main gate component. Emits 10 relation terms => 5 pairs => 20 interaction columns
-/// (3 qubitmem pairs + 3 single-`d` rc terms + 1 program, folded into 5 pairs).
+/// Main gate component. Mirrors gate_air's `GateEval::evaluate` exactly (19-col trace, same constraint
+/// and relation-term order): 10 relation terms => 5 pairs => 20 interaction cols (3 qubitmem pairs +
+/// 3 single-`d` rc terms + 1 program).
 pub struct MainGate;
 impl<Value: IValue> CircuitEval<Value> for MainGate {
     fn name(&self) -> String {
@@ -221,9 +184,7 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
         20
     }
     fn relation_uses_per_row(&self) -> &[RelationUse] {
-        // Positive USE terms per row: 3 chain USEs (target + 2 controls) + 3 rc range checks (one `d`
-        // per access) + 1 program = 7. The 3 chain YIELDs are negative. (One shared relation id.)
-        // The ts-ordering range reconstruction stays degree-1 algebraic.
+        // 7 positive USEs/row: 3 chain (target + 2 controls) + 3 rc range checks + 1 program.
         &[
             RelationUse {
                 relation_id: "gate_qubitmem_use",
@@ -359,38 +320,16 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
             &[tag_qm, shot_id, ctrl_b.addr, ts, ctrl_b.v],
         );
 
-        // --- ts-ordering RANGE-CHECK LOOKUPs: per active access, look up its single diff `d` into the
-        // rc table (mirrors main.rs `add_rc_lookup`). Emitted AFTER the qubitmem pairs and BEFORE the
-        // program emit so the relation-batch order is qubitmem-pairs (6), then the 3 rc `d` terms, then
-        // program — folded by finalize-in-pairs into (rc_t, rc_a) and (rc_b, program). ---
-        let add_rc = |context: &mut Context<Value>,
-                      acc: &mut CompositionConstraintAccumulator,
-                      a: &AccessVars,
-                      active: Var| {
-            acc.add_to_relation(context, active, &[tag_rc, a.d]);
-        };
-        add_rc(context, acc, &target, enabler);
-        add_rc(context, acc, &ctrl_a, a_active);
-        add_rc(context, acc, &ctrl_b, b_active);
+        // rc-table lookups (single diff `d` per access) emitted AFTER the qubitmem pairs and BEFORE
+        // program, so finalize-in-pairs folds them (rc_t, rc_a) and (rc_b, program).
+        add_rc(context, acc, tag_rc, &target, enabler);
+        add_rc(context, acc, tag_rc, &ctrl_a, a_active);
+        add_rc(context, acc, tag_rc, &ctrl_b, b_active);
 
-        // --- ts-ordering: RANGE-CHECK reconstruction (mirrors main.rs `add_ts_range`,
-        // target/ctrl_a/ctrl_b in order). Per active access:
-        //   RANGE: active*(ts - prev_ts - 1 - d) = 0 (the witness `d` is range-checked by the rc-table
-        //       lookup above), with ts = pc+1 inlined. The old PIN constraint is gone (ts is
-        //       structurally pc+1). pc is the preprocessed per-shot program counter (verifier-pinned);
-        //       the structural program-ordered ts + the forward-DAG range-check defeat the reorder.
-        let add_ts_range = |context: &mut Context<Value>,
-                            acc: &mut CompositionConstraintAccumulator,
-                            a: &AccessVars,
-                            active: Var| {
-            // RANGE reconstruction: d (witness) == ts - prev_ts - 1 = pc - prev_ts.
-            let recon = eval!(context, ((ts) - (a.prev_ts)) - (one));
-            let c = eval!(context, (active) * ((recon) - (a.d)));
-            acc.add_constraint(context, c);
-        };
-        add_ts_range(context, acc, &target, enabler);
-        add_ts_range(context, acc, &ctrl_a, a_active);
-        add_ts_range(context, acc, &ctrl_b, b_active);
+        // ts-ordering range reconstruction (target/ctrl_a/ctrl_b in order).
+        add_ts_range(context, acc, ts, one, &target, enabler);
+        add_ts_range(context, acc, ts, one, &ctrl_a, a_active);
+        add_ts_range(context, acc, ts, one, &ctrl_b, b_active);
 
         // --- Program-consistency (use side, +enabler). ---
         let opcode_scalar = eval!(
@@ -412,12 +351,7 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
     }
 }
 
-// ----------------------------------------------------------------------------
-// GateAirStatement: the 4-component statement (order matches the prover:
-// main, program, boundary, rc). The rc component is the ts-ordering range-check
-// supply table (its LogUp lookups replace the algebraic bit-decomposition).
-// ----------------------------------------------------------------------------
-
+/// The 4 statement components in prover order: main, program, boundary, rc.
 pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn CircuitEval<Value>>> {
     IndexMap::from([
         (
@@ -496,23 +430,15 @@ impl<Value: IValue> GateAirStatement<Value> {
         program: ProgramRows,
         nonce: [u32; 2],
     ) -> Self {
-        // Component order: main, program, boundary, rc. The rc component's OWN log_size is `R = rc_log`,
-        // the native size of its [0,2^R) supply table (R <= main_log_size; the table is lifted in the
-        // committed tree but its component log_size is R, not main).
+        // Component order: main, program, boundary, rc. The rc component's log_size is `R = rc_log`,
+        // the native size of its [0,2^R) supply table.
         //
-        // SOUNDNESS-CRITICAL: R is a FIXED TRUSTED CONSTRUCTION INPUT — the fixed public `RC_LOG`
-        // constant in production (a value the verifier knows, so it is trivially unforgeable), or a
-        // test-chosen value in a self-contained test (which builds both the base and this statement, so
-        // R is trusted and consistent within the test). R is NEVER derived from `total_pc` and NEVER
-        // read from the proof: a prover-supplied, inflated R would enlarge the table and admit
-        // out-of-range `d` (forging prev_ts >= ts => stale read). Soundness holds because
-        // `RC_LOG >= ceil(log2(total_pc))` for the honest k range (k ≲ 8000; the base prove-entry
-        // debug_assert enforces it), and a WIDER rc range still contains every honest `d = pc - prev_ts`
-        // — a wider (but still trusted) range never admits a forgery. The same R sizes the `gate_rc_val`
-        // preprocessed column (get_preprocessed_column_ids below), so the leaf still binds R by BOTH the
-        // transcript (component_log_sizes) AND the preprocessed root (the canonical member-only [0,2^R)
-        // table contents). `total_pc` is retained for its public program-size binding role. LOUD guard:
-        // 2^R < p (R <= 30); production R = RC_LOG = 25, so this holds with margin.
+        // SOUNDNESS-CRITICAL: R is a FIXED TRUSTED CONSTRUCTION INPUT (the public `RC_LOG` in
+        // production; a test-chosen value in a self-contained test), NEVER derived from `total_pc` or
+        // read from the proof — a prover-inflated R would admit out-of-range `d` (stale reads). Both
+        // the transcript (`component_log_sizes`) and the preprocessed root (the `gate_rc_val` column,
+        // sized by the same R) bind it. A wider-but-trusted range still contains every honest
+        // `d = pc - prev_ts`, so it never admits a forgery. Loud guard: 2^R < p (R <= 30).
         assert!(
             rc_log <= 30,
             "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)"
@@ -543,25 +469,15 @@ impl<Value: IValue> GateAirStatement<Value> {
             })
             .collect::<Vec<_>>();
 
-        // H_P program Vars. slot + multiplicity are PINNED public constants (a prover cannot forge
-        // them: slot = row index, mult = samples*k shape value). op/addresses are GUESSED (the hidden
-        // program) — bound to the base via TAG_PROGRAM_PUB in `public_logup_sum`.
+        // H_P program Vars. slot + multiplicity are PINNED public constants (slot = row index, mult =
+        // samples*k), unforgeable; op/addresses are GUESSED (the hidden program), bound to the base via
+        // TAG_PROGRAM_PUB in `public_logup_sum`. Padding slots (mult == 0) are NOT LogUp-bound but ARE
+        // hashed into H_P, so their op/addr must be PINNED to the base's canonical padding (0) — else a
+        // prover could vary them to change H_P without breaking balance (same-program forgery).
         let konst_c =
             |context: &mut Context<Value>, v: u32| context.constant(qm31_from_u32s(v, 0, 0, 0));
         let guess_c = |context: &mut Context<Value>, v: u32| {
             Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context)
-        };
-        // Real slots (mult > 0) GUESS op/addr (the hidden program, bound via TAG_PROGRAM_PUB). Padding
-        // slots (mult == 0) are NOT LogUp-bound (zero numerator) but ARE hashed into H_P, so their
-        // op/addr must be PINNED to the base's canonical padding values (0) — otherwise a prover could
-        // vary padding op/addr to change H_P without breaking balance (same-program forgery). Pin them
-        // as constants matching `build_program_table` (padding op/addr all 0).
-        let field_var = |context: &mut Context<Value>, is_pad: bool, v: u32| {
-            if is_pad {
-                konst_c(context, v)
-            } else {
-                guess_c(context, v)
-            }
         };
         let is_pad: Vec<bool> = program.multiplicity.iter().map(|&m| m == 0).collect();
         let program_vars = ProgramVars {
@@ -570,25 +486,25 @@ impl<Value: IValue> GateAirStatement<Value> {
                 .opcode_scalar
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .map(|(i, &v)| program_field_var(context, is_pad[i], v))
                 .collect(),
             target: program
                 .target
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .map(|(i, &v)| program_field_var(context, is_pad[i], v))
                 .collect(),
             ctrl_a: program
                 .ctrl_a
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .map(|(i, &v)| program_field_var(context, is_pad[i], v))
                 .collect(),
             ctrl_b: program
                 .ctrl_b
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| field_var(context, is_pad[i], v))
+                .map(|(i, &v)| program_field_var(context, is_pad[i], v))
                 .collect(),
             multiplicity: program
                 .multiplicity
@@ -632,7 +548,6 @@ impl<Value: IValue> GateAirStatement<Value> {
     /// words, shared across leaves) blinds the preimage for hiding. Preimage layout (per slot, in row
     /// order): [slot, opcode_scalar, target, ctrl_a, ctrl_b, multiplicity], then [nonce0, nonce1].
     pub fn compute_h_p(&self, context: &mut Context<Value>) -> HashValue<Var> {
-        use circuits::blake::blake2s;
         let p = &self.program;
         let n = p.slot.len();
         let mut preimage = Vec::with_capacity(n * 6 + 2);
@@ -683,18 +598,12 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         context: &mut Context<Value>,
         interaction_elements: [Var; 2],
     ) -> Var {
-        // PHASE-3 x/y binding. The base is no longer internally balanced: its re-keyed boundary leaves
-        // a PUBLIC dangling term B = Σ_{shot,addr} ( +[shot,addr,0,x] − [shot,addr,TS_FINAL,y] ) in the
-        // committed claimed sums. `verify` enforces `public_logup_sum + Σ claimed_sums == 0`, so this
-        // function must return −B computed over the GUESSED x/y:
-        //     Σ_{shot,addr} ( −1/combine(TAG,shot,addr,0,x_bit) + 1/combine(TAG,shot,addr,TS_FINAL,y_bit) ).
-        // Distinct tuples (ts=0 vs ts=TS_FINAL, value in {0,1}) => at random (z,α) the ONLY way the
-        // balance holds is x_bit==committed x and y_bit==committed y per (shot,addr) — binding the
-        // guessed limbs (which also feed the output hash) to the proven boundary. addr = limb*16 + bit
-        // (LSB-first), matching the base's boundary addr encoding.
-        use circuits::ops::{eq, inv};
-        use circuits_stark_verifier::logup::combine_term;
-
+        // x/y binding. The base's re-keyed boundary leaves a PUBLIC dangling term
+        // B = Σ_{shot,addr} ( +[shot,addr,0,x] − [shot,addr,TS_FINAL,y] ) in its claimed sums, and
+        // `verify` enforces `public_logup_sum + Σ claimed_sums == 0`, so this must return −B over the
+        // GUESSED x/y bits. Distinct tuples (ts=0 vs TS_FINAL, value in {0,1}) mean the balance holds at
+        // random (z,α) only if x_bit/y_bit == the committed boundary, binding the guessed limbs (which
+        // also feed the output hash). addr = limb*16 + bit (LSB-first), matching the base's encoding.
         let tag = konst(context, TAG_QUBITMEM);
         let ts0 = context.zero();
         let ts_final = konst(context, TS_FINAL);
@@ -758,17 +667,12 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
             }
         }
 
-        // H_P program binding (OPEN #3, Fork A). The base's program table emits a PUBLIC dangling term
-        //     P_pub = Σ_slot mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)
-        // (its internal −mult/TAG_PROGRAM term cancels main's demand, so program-consistency is intact).
-        // `verify` enforces `public_logup_sum + Σ claimed_sums == 0` and the committed claimed sums net
-        // to B + P_pub, so this function must ALSO return −P_pub over the GUESSED program Vars:
-        //     Σ_slot ( − mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b) ).
-        // At random (z,α) the ONLY way the balance holds is that every guessed (op, t, a, b) equals the
-        // base's committed program at that slot (slot + mult are pinned constants), binding the guessed
-        // program — which ALSO feeds `compute_h_p` — to the executed program. So H_P commits to the
-        // LogUp-bound secret circuit, not a free guess. Padding slots have mult == 0 => zero numerator,
-        // contributing nothing (matches the base's `count == 0` skip).
+        // H_P program binding. The base's program table emits a PUBLIC dangling term
+        //     P_pub = Σ_slot mult / combine(TAG_PROGRAM_PUB, slot, op, t, a, b),
+        // so this must ALSO return −P_pub over the GUESSED program Vars. At random (z,α) the balance
+        // holds only if every guessed (op, t, a, b) equals the base's committed program at that slot
+        // (slot + mult are pinned), binding the guessed program — which also feeds `compute_h_p` — to
+        // the executed circuit. Padding slots (mult == 0) contribute nothing.
         let tag_prog_pub = konst(context, TAG_PROGRAM_PUB);
         let p = &self.program;
         for i in 0..p.slot.len() {
@@ -793,75 +697,64 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
     }
 }
 
-#[cfg(test)]
-mod constraint_tests {
-    use super::*;
-    use crate::{build_rows, cell_at, parse_gtv1, Fixture};
-    use circuits::context::Context;
-    use circuits_stark_verifier::test_utils::TestComponentData;
-    use std::collections::HashMap;
+/// QM31 constant Var of base-field value `v` (= `(v,0,0,0)`), used for tags and literals.
+fn konst<Value: IValue>(context: &mut Context<Value>, v: u32) -> Var {
+    context.constant(qm31_from_u32s(v, 0, 0, 0))
+}
 
-    // Laptop diagnostic: every valid trace row must satisfy MainGate's EXPLICIT constraints (the
-    // logup add_to_relation terms don't touch acc.accumulation until finalize_logup_in_pairs, which
-    // we skip), so acc.finalize() == 0 on a valid row iff the constraint translation is correct.
-    #[test]
-    fn main_explicit_constraints_zero_on_valid_rows() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../grover-tax/fixtures/v0.3-iadd256-k4-n16.json"
-        );
-        let fx: Fixture = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
-        let gates = parse_gtv1(&fx.circuit_byte_serialisation_hex).unwrap();
-        let n_gates = gates.len() as u32;
-        let k = fx.repetitions;
-        let cases = &fx.test_cases[..1];
-        let (rows, _boundary) = build_rows(&gates, cases, k).unwrap();
-
-        let dummy_interaction = vec![qm31_from_u32s(0, 0, 0, 0); 16];
-        for (ri, row) in rows.iter().enumerate() {
-            let mut ctx = Context::<QM31>::default();
-            let trace: Vec<QM31> = (0..TRACE_COLUMNS)
-                .map(|c| qm31_from_u32s(cell_at(row, c), 0, 0, 0))
-                .collect();
-            let comp = TestComponentData::from_values(
-                &mut ctx,
-                &trace,
-                &dummy_interaction,
-                qm31_from_u32s(0, 0, 0, 0),
-                1 << 14,
-            );
-            // enabler / shot_id / pc / pc_in_prog are PREPROCESSED; feed them via the map.
-            let pc = row.pc;
-            let pp = HashMap::from([
-                (
-                    pp_id("gate_enabler"),
-                    ctx.constant(qm31_from_u32s(row.enabler, 0, 0, 0)),
-                ),
-                (
-                    pp_id("gate_shot_id"),
-                    ctx.constant(qm31_from_u32s(row.shot_id, 0, 0, 0)),
-                ),
-                (pp_id("gate_pc"), ctx.constant(qm31_from_u32s(pc, 0, 0, 0))),
-                (
-                    pp_id("gate_pc_in_prog"),
-                    ctx.constant(qm31_from_u32s(pc % n_gates, 0, 0, 0)),
-                ),
-            ]);
-            let coeff = ctx.constant(qm31_from_u32s(7, 11, 13, 17));
-            let ie = [
-                ctx.constant(qm31_from_u32s(2, 3, 5, 7)),
-                ctx.constant(qm31_from_u32s(19, 23, 29, 31)),
-            ];
-            let mut acc =
-                CompositionConstraintAccumulator::new(&mut ctx, pp, HashMap::new(), coeff, ie);
-            MainGate.evaluate(&mut ctx, &comp, &mut acc);
-            let result = acc.finalize();
-            assert_eq!(
-                ctx.get(result),
-                qm31_from_u32s(0, 0, 0, 0),
-                "MainGate explicit constraints nonzero at row {ri} (pc={pc})"
-            );
-        }
-        eprintln!("OK: explicit constraints zero on all {} rows", rows.len());
+/// A program-table field Var: pinned constant for padding slots, guessed witness for real slots.
+fn program_field_var<Value: IValue>(context: &mut Context<Value>, is_pad: bool, v: u32) -> Var {
+    if is_pad {
+        context.constant(qm31_from_u32s(v, 0, 0, 0))
+    } else {
+        Value::from_qm31(qm31_from_u32s(v, 0, 0, 0)).guess(context)
     }
 }
+
+/// Parsed access-block Vars: addr, prev_ts, v, then the single range-check diff `d`. The access
+/// timestamp `ts` is NOT a column — it is the inlined `pc + 1` expression.
+struct AccessVars {
+    addr: Var,
+    prev_ts: Var,
+    v: Var,
+    d: Var,
+}
+
+fn parse_access(cols: &[Var], off: usize) -> AccessVars {
+    AccessVars {
+        addr: cols[off],
+        prev_ts: cols[off + 1],
+        v: cols[off + 2],
+        d: cols[off + ACCESS_COLS],
+    }
+}
+
+/// Emits one access's rc-table lookup term (single diff `d`, mirrors main.rs `add_rc_lookup`).
+fn add_rc<Value: IValue>(
+    context: &mut Context<Value>,
+    acc: &mut CompositionConstraintAccumulator,
+    tag_rc: Var,
+    a: &AccessVars,
+    active: Var,
+) {
+    acc.add_to_relation(context, active, &[tag_rc, a.d]);
+}
+
+/// ts-ordering range reconstruction for one access (mirrors main.rs `add_ts_range`):
+/// `active*(ts - prev_ts - 1 - d) = 0`, with `ts = pc+1` inlined and `d` range-checked by [`add_rc`].
+fn add_ts_range<Value: IValue>(
+    context: &mut Context<Value>,
+    acc: &mut CompositionConstraintAccumulator,
+    ts: Var,
+    one: Var,
+    a: &AccessVars,
+    active: Var,
+) {
+    let recon = eval!(context, ((ts) - (a.prev_ts)) - (one));
+    let c = eval!(context, (active) * ((recon) - (a.d)));
+    acc.add_constraint(context, c);
+}
+
+#[cfg(test)]
+#[path = "circuit_statement_tests.rs"]
+mod circuit_statement_tests;
