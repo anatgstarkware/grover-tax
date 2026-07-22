@@ -31,8 +31,8 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::leaf::ProgramRows;
 use crate::{
-    pp_id, preprocessed_column_ids, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS,
-    TAG_PROGRAM, TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
+    pp_id, preprocessed_column_ids, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, TAG_PROGRAM,
+    TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
 };
 
 /// QM31 constant Var of base-field value `v` (= `(v,0,0,0)`), used for tags and literals.

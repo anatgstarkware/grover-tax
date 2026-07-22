@@ -26,11 +26,14 @@ use circuit_prover::prover::{
 };
 use std::collections::BTreeMap;
 
+use circuit_multiverifier::verify::SharedConfig;
 use recursive_aggregate::precomputes::{RecursionPrecompute, TreeSpec};
 use recursive_aggregate::{
-    multiverifier_node_preprocessed, node_preprocessed_from_shared, shared_config_for_leaf,
-    AggregateConfig, TreeProof,
+    node_preprocessed_from_shared, shared_config_from_circuit_config, AggregateConfig, TreeProof,
 };
+// RECOMPUTE (derive / drift) path only: the shape helpers the retained `derive_aggregate_config` uses.
+#[cfg(test)]
+use recursive_aggregate::{multiverifier_node_preprocessed, shared_config_for_leaf};
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
@@ -38,6 +41,7 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 
 use crate::recursion_consts::OperatingPoint;
+use crate::topology::{TopologyConfig, FOLD_ARITY, RECURSION_LOG_BLOWUP};
 
 use crate::circuit_statement::GateAirStatement;
 use crate::N_LIMBS;
@@ -100,6 +104,7 @@ pub fn leaf_pcs_config(trace_log_size: u32, log_blowup_factor: u32) -> PcsConfig
     }
 }
 
+#[cfg(test)]
 fn max_sizes(a: &ComponentSizes, b: &ComponentSizes) -> ComponentSizes {
     ComponentSizes {
         eq: a.eq.max(b.eq),
@@ -180,36 +185,120 @@ pub fn build_gate_air_leaf_circuit<Value: IValue>(
     context.finalize(false)
 }
 
-/// The witness-independent preprocessed SHAPES the recursion needs, carried out of
-/// [`derive_aggregate_config`] so [`build_recursion_precompute`] can commit the per-shape trees WITHOUT
-/// rerunning the (expensive) node fixed-point loop. Roots are NOT recomputed here — they are the pinned
-/// consts of `op` (each tree asserts against them at commit time). Per-arity `level1`/`fold` shapes are
-/// keyed by child count `2..=fold_arity`.
-pub struct AggregateShapes {
-    /// Operating point whose pinned root table the trees assert against.
-    pub op: OperatingPoint,
-    pub leaf_pp: PreprocessedCircuit,
-    /// Leaf-wrap PCS (leaf lifting).
-    pub leaf_pcs: PcsConfig,
-    /// Node PCS (node lifting) — used to commit every level1/fold node tree.
-    pub node_pcs: PcsConfig,
-    pub level1_pp: BTreeMap<usize, PreprocessedCircuit>,
-    pub fold_pp: BTreeMap<usize, PreprocessedCircuit>,
+/// Assembles the gate_air `AggregateConfig` for the pinned operating point `op` ENTIRELY from the
+/// pinned verifier consts — no fixed-point loop, no shape derivation. The leaf/level1 shared configs
+/// are reconstructed from the pinned leaf/level1 [`CircuitConfig`]s (`shared_config_from_circuit_config`);
+/// the PCS, `node_target`, and roots are read straight from the consts. This is the PRODUCTION config
+/// source: every verifier spec is a fixed constant, and `build_recursion_precompute`'s `tree.root ==
+/// pinned root` assert is the tripwire that the rebuilt shapes match.
+///
+/// The pinned points fix `fold_arity == FOLD_ARITY` (8) and the default node/leaf blowup, so `topo`
+/// must match; any deviation is not a pinned point (asserted). `cfg`/`params` are the leaf circuit's
+/// public shape (used ONLY to compute the leaf's own natural padding target — the leaf root pin is the
+/// soundness anchor).
+pub fn pinned_aggregate_config(
+    op: OperatingPoint,
+    topo: &TopologyConfig,
+    cfg: &ProofConfig,
+    params: &GateAirLeafParams,
+) -> AggregateConfig {
+    assert_eq!(
+        topo.fold_arity, FOLD_ARITY,
+        "pinned operating points fix fold_arity = {FOLD_ARITY}"
+    );
+    assert_eq!(
+        (topo.recursion_log_blowup, topo.leaf_log_blowup),
+        (RECURSION_LOG_BLOWUP, RECURSION_LOG_BLOWUP),
+        "pinned operating points fix the default node/leaf blowup"
+    );
+    let leaf_config = op.leaf_config();
+    let level1_config = op.level1_config(FOLD_ARITY);
+
+    // Leaf-tier verifier config (level1 verifies leaves against this) + the fold-tier config (a fold
+    // node verifies level1-shaped nodes against this) — both pure functions of the pinned configs.
+    let leaf_shared_config = shared_config_from_circuit_config(&leaf_config);
+    let fold_shared_config = shared_config_from_circuit_config(&level1_config);
+    let leaf_pcs = leaf_config.config;
+    let node_pcs = level1_config.config;
+
+    let level1_roots: BTreeMap<usize, HashValue<QM31>> =
+        (2..=FOLD_ARITY).map(|a| (a, op.level1_root(a))).collect();
+    let fold_roots: BTreeMap<usize, HashValue<QM31>> =
+        (2..=FOLD_ARITY).map(|a| (a, op.fold_root(a))).collect();
+
+    AggregateConfig {
+        // Shared / fold-node tier (also used by the shared up-tree fold).
+        fold_shared_config,
+        node_target_padding_sizes: op.node_target(),
+        node_pcs_config: node_pcs,
+        fold_arity: FOLD_ARITY,
+        // Leaf / level1 tier.
+        leaf_shared_config,
+        level1_roots,
+        fold_roots,
+        leaf_preprocessed_root: op.leaf_root(),
+        leaf_target_padding_sizes: leaf_target_sizes(cfg, params),
+        leaf_pcs_config: leaf_pcs,
+    }
 }
 
-/// Assembles the gate_air `AggregateConfig` + its per-arity root table for the pinned operating point
-/// `op` (roots read from the const table — NOT recomputed) and builds the witness-independent
-/// preprocessed shapes for the node arities the trees need. Resolves the leaf↔node padding decoupling:
-/// the leaf pads to its OWN natural target (~2^20), while every node variant (level1 verifies leaves,
-/// fold verifies nodes) pads to a COMMON `node_target` fixed point.
-///
-/// `build_all_shapes`: production passes `false` → build shapes ONLY for the arities THIS point's fold
-/// actually uses ([`recursive_aggregate::fold_used_arities`] of `op.n()`), since committing every
-/// unused `2..=k` arity's ~2^22 tree overruns the base-precompute overlap window. Tests pass `true` →
-/// build every `2..=k` arity (the drift test checks all pinned consts; roundtrip tests fold a small N
-/// that differs from the placeholder `op.n()`, so they need the full set).
+/// The leaf's OWN natural padding target (`compute_padded_sizes` of the NoValue leaf circuit) — a
+/// single cheap build (no fixed point). Decoupled from the node target so `t_leaf` is pinned
+/// independent of `fold_arity`. The leaf preprocessed ROOT (pinned) is the soundness anchor; this
+/// padding only sets the prover's own leaf trace shape (a drift fails the leaf root assert).
+fn leaf_target_sizes(cfg: &ProofConfig, params: &GateAirLeafParams) -> ComponentSizes {
+    compute_padded_sizes(&build_gate_air_leaf_circuit::<NoValue>(
+        empty_proof(cfg),
+        cfg,
+        params,
+    ))
+}
+
+/// One node layer's [`TreeSpec`] for `arity`: the node preprocessed circuit verifying
+/// `child_shared`-configured children (padded to `node_target`), committed at `node_pcs`, asserting
+/// `expected_root`. Shared by the level1 (leaf child) and fold (node child) tiers.
+fn node_spec(
+    child_shared: &SharedConfig,
+    node_pcs: PcsConfig,
+    node_target: &ComponentSizes,
+    arity: usize,
+    expected_root: HashValue<QM31>,
+) -> TreeSpec {
+    TreeSpec {
+        preprocessed: node_preprocessed_from_shared(child_shared, node_target.clone(), arity),
+        pcs_config: node_pcs,
+        expected_root,
+    }
+}
+
+/// Recompute the per-arity (`2..=fold_arity`) preprocessed roots for a node layer whose children have
+/// `child_shared` config, padded to `node_target`. RECOMPUTE path (derive / drift) only.
+#[cfg(test)]
+fn recompute_node_roots(
+    child_shared: &SharedConfig,
+    node_target: &ComponentSizes,
+    fold_arity: usize,
+    log_blowup_factor: u32,
+) -> BTreeMap<usize, HashValue<QM31>> {
+    (2..=fold_arity)
+        .map(|a| {
+            let node_pp = node_preprocessed_from_shared(child_shared, node_target.clone(), a);
+            (
+                a,
+                recursive_aggregate::preprocessed_root(&node_pp, log_blowup_factor),
+            )
+        })
+        .collect()
+}
+
+/// COMPUTES (not pins) the gate_air `AggregateConfig` for a fixture via the fixed-point + shape build —
+/// RETAINED ONLY for the per-layer drift tests (`recursion_consts_tests.rs`) and the tiny non-pinned
+/// wiring roundtrips (a tiny fixture is not a pinned point). Resolves the leaf↔node padding
+/// decoupling: the leaf pads to its OWN natural target (~2^20), while every node variant (level1
+/// verifies leaves, fold verifies nodes) pads to a COMMON `node_target` fixed point. NOT on the
+/// production path — production reads [`pinned_aggregate_config`].
+#[cfg(test)]
 pub fn derive_aggregate_config(
-    op: OperatingPoint,
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     fold_arity: usize,
@@ -219,15 +308,13 @@ pub fn derive_aggregate_config(
     // Only the leaf shape's own PCS takes this; the level1-node verifies leaves at this blowup
     // automatically because its child config is `shared_config_for_leaf(&leaf_pp, leaf_pcs)`.
     leaf_log_blowup: u32,
-    build_all_shapes: bool,
-) -> (AggregateConfig, AggregateShapes) {
+) -> AggregateConfig {
     assert!(fold_arity >= 2, "fold_arity k must be >= 2");
     let shape = || build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params);
-    let leaf_sizes = compute_padded_sizes(&shape());
+    let leaf_target = compute_padded_sizes(&shape());
 
     // LEAF↔NODE PADDING DECOUPLING. Pad the leaf to its OWN target (natural ~2^20), NOT max(leaf,node),
     // so `t_leaf` is pinned independent of `fold_arity`.
-    let leaf_target = leaf_sizes.clone();
     let (leaf_pp, leaf_pcs) = {
         let mut leaf_ctx = shape();
         pad_to_targets(&mut leaf_ctx, leaf_target.clone());
@@ -272,35 +359,20 @@ pub fn derive_aggregate_config(
     let node_pcs = leaf_pcs_config(node_child_trace_log, log_blowup_factor);
     let node_shared_config = shared_config_for_leaf(&level1_k_pp, node_pcs);
 
-    // Per-arity node shapes: level1 verifies LEAVES (leaf shared config), fold verifies NODES (node
-    // shared config); both pad to the common `node_target`. Production builds only the arities this
-    // point's fold uses (the rest would be dead ~2^22 commits on the critical path); tests build all.
-    let (level1_arities, fold_arities): (Vec<usize>, Vec<usize>) = if build_all_shapes {
-        ((2..=fold_arity).collect(), (2..=fold_arity).collect())
-    } else {
-        let (l, f) = recursive_aggregate::fold_used_arities(op.n(), fold_arity);
-        (l.into_iter().collect(), f.into_iter().collect())
-    };
-    let mut level1_pp: BTreeMap<usize, PreprocessedCircuit> = BTreeMap::new();
-    let mut fold_pp: BTreeMap<usize, PreprocessedCircuit> = BTreeMap::new();
-    for arity in level1_arities {
-        level1_pp.insert(
-            arity,
-            node_preprocessed_from_shared(&leaf_shared_config, node_target.clone(), arity),
-        );
-    }
-    for arity in fold_arities {
-        fold_pp.insert(
-            arity,
-            node_preprocessed_from_shared(&node_shared_config, node_target.clone(), arity),
-        );
-    }
-
-    // Per-arity pinned root tables (from the operating-point consts — NOT recomputed).
-    let level1_roots: BTreeMap<usize, HashValue<QM31>> =
-        (2..=fold_arity).map(|a| (a, op.level1_root(a))).collect();
-    let fold_roots: BTreeMap<usize, HashValue<QM31>> =
-        (2..=fold_arity).map(|a| (a, op.fold_root(a))).collect();
+    // Per-arity node roots (RECOMPUTED here — derive is the recompute path). level1 verifies leaves,
+    // fold verifies nodes; both pad to the common `node_target`.
+    let level1_roots = recompute_node_roots(
+        &leaf_shared_config,
+        &node_target,
+        fold_arity,
+        log_blowup_factor,
+    );
+    let fold_roots = recompute_node_roots(
+        &node_shared_config,
+        &node_target,
+        fold_arity,
+        log_blowup_factor,
+    );
 
     eprintln!(
         "gate-air: leaf↔node decoupling: leaf trace 2^{} (pcs lifting {:?}), node trace 2^{} (pcs lifting {:?})",
@@ -310,16 +382,7 @@ pub fn derive_aggregate_config(
         node_pcs.lifting_log_size,
     );
 
-    let shapes = AggregateShapes {
-        op,
-        leaf_pp,
-        leaf_pcs,
-        node_pcs,
-        level1_pp,
-        fold_pp,
-    };
-
-    let agg = AggregateConfig {
+    AggregateConfig {
         // Shared / fold-node tier (also used by the shared up-tree fold).
         fold_shared_config: node_shared_config,
         node_target_padding_sizes: node_target,
@@ -329,57 +392,83 @@ pub fn derive_aggregate_config(
         leaf_shared_config,
         level1_roots,
         fold_roots,
-        leaf_preprocessed_root: op.leaf_root(),
+        leaf_preprocessed_root: recursive_aggregate::preprocessed_root(&leaf_pp, leaf_log_blowup),
         leaf_target_padding_sizes: leaf_target,
         leaf_pcs_config: leaf_pcs,
-    };
-    (agg, shapes)
+    }
 }
 
-/// Builds the flat leaf/level1/fold [`RecursionPrecompute`] from the shapes carried out of
-/// [`derive_aggregate_config`] (so the node fixed-point loop is NOT recomputed). Every tree asserts its
-/// committed root equals the pinned const of `shapes.op` (the load-bearing soundness gate). Precompute
-/// is UNCONDITIONAL in production.
-pub fn build_recursion_precompute(shapes: AggregateShapes) -> RecursionPrecompute {
-    let AggregateShapes {
-        op,
-        leaf_pp,
-        leaf_pcs,
-        node_pcs,
-        level1_pp,
-        fold_pp,
-    } = shapes;
-    // Commit a tree for every shape present. `derive_aggregate_config` already restricts the shapes to
-    // the arities this point's fold uses (production), so this builds exactly the used trees; a
-    // build-all-shapes caller (tests) builds all, which is safe (extra trees are just never proved).
+/// Builds the flat leaf/level1/fold [`RecursionPrecompute`] by rebuilding each layer's preprocessed
+/// shape FROM `config` (the leaf circuit for the leaf, the leaf/fold shared configs + `node_target`
+/// for the nodes) — no fixed-point loop. Every tree asserts its committed root equals `config`'s root
+/// (the load-bearing soundness gate: a drifted pinned config / shape fails it loudly). Precompute is
+/// UNCONDITIONAL in production.
+///
+/// `build_all_arities`: production passes `false` → build shapes ONLY for the arities THIS point's
+/// fold actually uses ([`recursive_aggregate::fold_used_arities`] of `op.n()`), since committing every
+/// unused `2..=k` arity's ~2^22 tree overruns the base-precompute overlap window. Tests pass `true` →
+/// build every `2..=k` arity (roundtrip tests fold a small N that differs from the placeholder
+/// `op.n()`, so they need the full set).
+pub fn build_recursion_precompute(
+    config: &AggregateConfig,
+    op: OperatingPoint,
+    cfg: &ProofConfig,
+    params: &GateAirLeafParams,
+    build_all_arities: bool,
+) -> RecursionPrecompute {
+    let k = config.fold_arity;
+    let node_pcs = config.node_pcs_config;
+    let node_target = &config.node_target_padding_sizes;
+
+    // Leaf tree: rebuild the leaf preprocessed circuit (gate_air-specific) padded to the config's leaf
+    // target; commit at the leaf PCS; assert the pinned leaf root.
+    let leaf_pp = {
+        let mut leaf_ctx = build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params);
+        pad_to_targets(&mut leaf_ctx, config.leaf_target_padding_sizes.clone());
+        PreprocessedCircuit::preprocess_circuit(&mut leaf_ctx)
+    };
     let leaf = TreeSpec {
         preprocessed: leaf_pp,
-        pcs_config: leaf_pcs,
-        expected_root: op.leaf_root(),
+        pcs_config: config.leaf_pcs_config,
+        expected_root: config.leaf_preprocessed_root.clone(),
     };
-    let level1 = level1_pp
+
+    // Node shapes: level1 verifies LEAVES (`leaf_shared_config`), fold verifies NODES
+    // (`fold_shared_config`); both pad to the common `node_target`. Rebuilt from the shared configs —
+    // NOT re-derived — so no fixed-point loop runs here.
+    let (level1_arities, fold_arities): (Vec<usize>, Vec<usize>) = if build_all_arities {
+        ((2..=k).collect(), (2..=k).collect())
+    } else {
+        let (l, f) = recursive_aggregate::fold_used_arities(op.n(), k);
+        (l.into_iter().collect(), f.into_iter().collect())
+    };
+    let level1 = level1_arities
         .into_iter()
-        .map(|(arity, pp)| {
+        .map(|a| {
             (
-                arity,
-                TreeSpec {
-                    preprocessed: pp,
-                    pcs_config: node_pcs,
-                    expected_root: op.level1_root(arity),
-                },
+                a,
+                node_spec(
+                    &config.leaf_shared_config,
+                    node_pcs,
+                    node_target,
+                    a,
+                    config.level1_root(a),
+                ),
             )
         })
         .collect();
-    let fold = fold_pp
+    let fold = fold_arities
         .into_iter()
-        .map(|(arity, pp)| {
+        .map(|a| {
             (
-                arity,
-                TreeSpec {
-                    preprocessed: pp,
-                    pcs_config: node_pcs,
-                    expected_root: op.fold_root(arity),
-                },
+                a,
+                node_spec(
+                    &config.fold_shared_config,
+                    node_pcs,
+                    node_target,
+                    a,
+                    config.fold_root(a),
+                ),
             )
         })
         .collect();

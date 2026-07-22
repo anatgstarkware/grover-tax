@@ -2097,7 +2097,7 @@ fn prove_folded(
     use circuits_stark_verifier::proof::{Proof, ProofConfig};
     use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
     use leaf::{
-        build_recursion_precompute, derive_aggregate_config, prove_gate_air_leaf, GateAirLeafParams,
+        build_recursion_precompute, pinned_aggregate_config, prove_gate_air_leaf, GateAirLeafParams,
     };
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::precomputes::RecursionPrecompute;
@@ -2118,8 +2118,6 @@ fn prove_folded(
     // this is a byte-identical no-op. Threaded through the derive/prove calls below; the base
     // blowup, fold arity, base-fan arity, and shots-per-shard are all read off it.
     let topo = TopologyConfig::from_env();
-    let recursion_log_blowup = topo.recursion_log_blowup;
-    let leaf_log_blowup = topo.leaf_log_blowup;
 
     // Shard partition: equal-sized shards of `shots_per_shard` shots; ragged final shard is
     // padded (below) so all shards share the leaf circuit shape.
@@ -2265,20 +2263,15 @@ fn prove_folded(
         program: leaf_program.clone(),
         nonce: leaf_nonce,
     };
-    // Derive the recursion config + its up-front `RecursionPrecompute`. The heavy per-arity
-    // `PreprocessedTree` commits happen HERE (in parallel with the GPU precompute).
+    // Assemble the recursion config from the PINNED verifier consts (no fixed-point loop, no shape
+    // derivation) + build its up-front `RecursionPrecompute`. The heavy per-arity `PreprocessedTree`
+    // commits happen HERE (in parallel with the GPU precompute); each asserts its committed root
+    // equals the pinned const (the soundness tripwire).
     let t_cfg = Instant::now();
     let (leaf_cfg, recursion_pre) = {
-        let (agg, shapes) = derive_aggregate_config(
-            op,
-            &cfg,
-            &shape_params,
-            topo.fold_arity,
-            recursion_log_blowup,
-            leaf_log_blowup,
-            false, // production: build node shapes only for the arities this point's fold uses
-        );
-        let pre = build_recursion_precompute(shapes);
+        let agg = pinned_aggregate_config(op, &topo, &cfg, &shape_params);
+        // Production: build node shapes only for the arities this point's fold uses.
+        let pre = build_recursion_precompute(&agg, op, &cfg, &shape_params, false);
         eprintln!(
             "gate-air: leaf-recursion config + precompute built up front in {:.1}s (node target qm31_ops={})",
             t_cfg.elapsed().as_secs_f64(),
@@ -3892,16 +3885,15 @@ mod tests {
         let (proof0, params0, cfg, _canonical_base_pp_root) =
             prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (tests recompute their own roots)
-        let (config, shapes) = derive_aggregate_config(
-            op,
+        let config = derive_aggregate_config(
             &cfg,
             &params0,
             fold_arity,
             log_blowup_factor,
             log_blowup_factor,
-            true, // test: build all arities (placeholder op.n() differs from the small fold N)
         );
-        let pre = build_recursion_precompute(shapes);
+        // test: build all arities (placeholder op.n() differs from the small fold N)
+        let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
 
         let make_base =
             || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
@@ -4011,16 +4003,15 @@ mod tests {
         let (proof0, params0, cfg, _canonical_base_pp_root) =
             prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (tests recompute their own roots)
-        let (config, shapes) = derive_aggregate_config(
-            op,
+        let config = derive_aggregate_config(
             &cfg,
             &params0,
             fold_arity,
             log_blowup_factor,
             log_blowup_factor,
-            true, // test: build all arities (placeholder op.n() differs from the small fold N)
         );
-        let pre = build_recursion_precompute(shapes);
+        // test: build all arities (placeholder op.n() differs from the small fold N)
+        let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
 
         let make_base =
             || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
@@ -4129,9 +4120,8 @@ mod tests {
         let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
         let fold_arity = TopologyConfig::default().fold_arity;
         let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (config recomputed for tiny base)
-        let (config, shapes) =
-            leaf::derive_aggregate_config(op, &cfg, &params0, fold_arity, 1, 1, true);
-        let pre = leaf::build_recursion_precompute(shapes);
+        let config = leaf::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
+        let pre = leaf::build_recursion_precompute(&config, op, &cfg, &params0, true);
 
         for n_pools in [1usize, 2] {
             let config = &config;
@@ -4412,204 +4402,10 @@ mod tests {
         );
     }
 
-    /// CAPTURE + DRIFT (box-only, `#[ignore]`): rebuilds the REAL recursion config for each of the 3
-    /// pinned operating points, prints every root / unpacker-config field as paste-able literals, and
-    /// `assert_eq!`s them against `recursion_consts`' pinned table. Run on the box to (1) capture the
-    /// placeholder consts and (2) detect stwo-rev drift thereafter:
-    ///   GATE_AIR_FIXTURE=<path> HEAVY_RECURSION=1 cargo test --features cuda \
-    ///     recursion_consts_capture -- --ignored --nocapture --test-threads=1
-    /// Stays `#[ignore]` so laptop `cargo test`/`cargo check --tests` never runs it (it builds real
-    /// ~2^22 node preprocessed circuits per point — GBs, box-only).
-    #[test]
-    #[ignore = "box-only: rebuilds real per-point node preprocessed circuits (~2^22, GBs). Run with \
-                GATE_AIR_FIXTURE set + --ignored to capture/verify the pinned recursion consts."]
-    fn recursion_consts_capture() {
-        use circuit_statement::gate_air_components;
-        use circuits::blake::HashValue;
-        use circuits::ivalue::NoValue;
-        use circuits::wrappers::U32Wrapper;
-        use circuits_stark_verifier::proof::ProofConfig;
-        use leaf::{derive_aggregate_config, GateAirLeafParams};
-        use recursion_consts::OperatingPoint;
-        use recursive_aggregate::preprocessed_root;
-        use recursive_aggregate::root_prover::unpacker_verify_config;
-
-        if std::env::var("HEAVY_RECURSION").is_err() {
-            eprintln!(
-                "recursion_consts_capture: SKIPPED (heavy: real ~2^22 node preprocessed circuits). \
-                 Set HEAVY_RECURSION=1 + GATE_AIR_FIXTURE + --ignored on the box."
-            );
-            return;
-        }
-        // Each point needs its OWN k-matching fixture: `build_rows` re-simulates the circuit and checks
-        // the final qubit state against the fixture's `y`, so a k=500 fixture can't stand in for k=1000.
-        // `GATE_AIR_FIXTURE` points at any one fixture; sibling per-k fixtures are resolved from its dir.
-        let fixture_path = std::env::var("GATE_AIR_FIXTURE")
-            .expect("recursion_consts_capture needs GATE_AIR_FIXTURE=<a k-fixture path>");
-        let fixture_dir = std::path::Path::new(&fixture_path)
-            .parent()
-            .expect("fixture parent dir")
-            .to_path_buf();
-        // Optional point selector (comma-separated k's, e.g. `GATE_AIR_CAPTURE_KS=500`); default: all 3.
-        let want_ks: Option<Vec<usize>> = std::env::var("GATE_AIR_CAPTURE_KS").ok().map(|s| {
-            s.split(',')
-                .map(|t| {
-                    t.trim()
-                        .parse()
-                        .expect("GATE_AIR_CAPTURE_KS: comma-separated k's")
-                })
-                .collect()
-        });
-        let topo = TopologyConfig::default();
-        let fold_arity = topo.fold_arity;
-        let node_blowup = topo.recursion_log_blowup;
-        let leaf_blowup = topo.leaf_log_blowup;
-
-        // Collected drifts across all points/arities: print every captured value first, then assert
-        // once at the end (so the initial all-placeholder capture prints the full table before failing,
-        // and drift detection reports EVERY mismatch, not just the first).
-        let mut drifts: Vec<String> = Vec::new();
-
-        // The 3 pinned Tanuj curve points: (operating point, k, shots_per_shard).
-        for (op, k, shots) in [
-            (OperatingPoint::K500N174, 500usize, 52usize),
-            (OperatingPoint::K1000N348, 1000, 26),
-            (OperatingPoint::K2000N695, 2000, 13),
-        ] {
-            if let Some(ks) = &want_ks {
-                if !ks.contains(&k) {
-                    continue;
-                }
-            }
-            // This point's own k-matching fixture (see the per-k note above).
-            let fx_path = fixture_dir.join(format!("v0.3-iadd256-k{k}-n9024.json"));
-            let fixture: Fixture = {
-                let f = File::open(&fx_path).unwrap_or_else(|e| panic!("open {fx_path:?}: {e}"));
-                serde_json::from_reader(f).expect("parse fixture")
-            };
-            let gates = parse_gtv1(&fixture.circuit_byte_serialisation_hex).expect("parse gtv1");
-            let n_gates = gates.len();
-            // Real shard-0 shape at production RC_LOG for this point's (k, shots).
-            let cases: Vec<TestCase> = fixture.test_cases[..shots].to_vec();
-            let (_rows, boundary, program, _padded, log_n_rows, _mls, base0_config) =
-                shard0_shape(&gates, &cases, k, RC_LOG);
-            let cfg = ProofConfig::new(
-                &gate_air_components::<NoValue>(),
-                N_PREPROCESSED_COLS,
-                &base0_config,
-                INTERACTION_POW_BITS,
-            );
-            let boundary_xy: Vec<([u32; N_LIMBS], [u32; N_LIMBS])> = cases
-                .iter()
-                .map(|c| {
-                    let x = state_to_limbs(&hex::decode(&c.x_hex).unwrap());
-                    let y = state_to_limbs(&hex::decode(&c.y_hex).unwrap());
-                    (x, y)
-                })
-                .collect();
-            let placeholder_root: HashValue<SecureField> = HashValue(std::array::from_fn(|_| {
-                U32Wrapper::new_unsafe(SecureField::zero())
-            }));
-            let params = GateAirLeafParams {
-                main_log_size: log_n_rows,
-                program_log_size: program.log_size,
-                boundary_log_size: boundary.log_size,
-                rc_log: RC_LOG,
-                preprocessed_root: placeholder_root,
-                boundary: boundary_xy,
-                total_pc: (k * n_gates) as u32,
-                program: program_rows_from_table(&program),
-                nonce: hiding_nonce(),
-            };
-
-            // Rebuild the REAL shapes (production shape-build path); compute their real roots.
-            let (mut config, shapes) = derive_aggregate_config(
-                op,
-                &cfg,
-                &params,
-                fold_arity,
-                node_blowup,
-                leaf_blowup,
-                true,
-            );
-            let n = op.n();
-
-            // Collect the REAL shape-derived child roots so the unpacker below bakes THEM (via
-            // `constant_pp`) rather than the pinned consts — which are all-zero on the first capture.
-            // This makes the unpacker capture single-pass (no need to fill child roots then re-run).
-            let mut real_level1: std::collections::BTreeMap<usize, HashValue<SecureField>> =
-                std::collections::BTreeMap::new();
-            let mut real_fold: std::collections::BTreeMap<usize, HashValue<SecureField>> =
-                std::collections::BTreeMap::new();
-
-            let leaf_root = preprocessed_root(&shapes.leaf_pp, leaf_blowup);
-            println!("// {op:?} leaf: {:?}", hv_words(&leaf_root));
-            if leaf_root != op.leaf_root() {
-                drifts.push(format!("{op:?} leaf root"));
-            }
-
-            for arity in 2..=fold_arity {
-                let l = preprocessed_root(&shapes.level1_pp[&arity], node_blowup);
-                let f = preprocessed_root(&shapes.fold_pp[&arity], node_blowup);
-                println!("// {op:?} level1[{arity}]: {:?}", hv_words(&l));
-                println!("// {op:?} fold[{arity}]:   {:?}", hv_words(&f));
-                if l != op.level1_root(arity) {
-                    drifts.push(format!("{op:?} level1[{arity}]"));
-                }
-                if f != op.fold_root(arity) {
-                    drifts.push(format!("{op:?} fold[{arity}]"));
-                }
-                real_level1.insert(arity, l);
-                real_fold.insert(arity, f);
-            }
-
-            // Unpacker verify-config for this point's N (blinding = node n_queries, as production).
-            // Bake the REAL child roots (not the pinned consts) so this is correct on the first pass.
-            let n_queries = config.node_pcs_config.fri_config.n_queries;
-            config.leaf_preprocessed_root = leaf_root.clone();
-            config.level1_roots = real_level1;
-            config.fold_roots = real_fold;
-            let unpacker = unpacker_verify_config(n, &config, node_blowup, Some(n_queries));
-            let pcs = &unpacker.config;
-            println!("// ===== {op:?} unpacker (paste into recursion_consts.rs UnpackerConfigConst) =====");
-            println!(
-                "//   pcs: PcsConfig {{ pow_bits: {}, fri_config: FriConfig {{ log_blowup_factor: {}, \
-                 log_last_layer_degree_bound: {}, n_queries: {}, fold_step: {} }}, lifting_log_size: {:?} }},",
-                pcs.pow_bits,
-                pcs.fri_config.log_blowup_factor,
-                pcs.fri_config.log_last_layer_degree_bound,
-                pcs.fri_config.n_queries,
-                pcs.fri_config.fold_step,
-                pcs.lifting_log_size,
-            );
-            println!("//   n_outputs: {},", unpacker.n_outputs);
-            println!("//   root: {:?},", hv_words(&unpacker.preprocessed_root));
-            println!("//   preprocessed_column_log_sizes: &[");
-            for (id, log_size) in unpacker.preprocessed_column_log_sizes.iter() {
-                println!("//       ({:?}, {}),", id.id, log_size);
-            }
-            println!("//   ],");
-            if unpacker != op.unpacker_config(n) {
-                drifts.push(format!("{op:?} unpacker config"));
-            }
-        }
-
-        assert!(
-            drifts.is_empty(),
-            "recursion const drift:\n  {}",
-            drifts.join("\n  ")
-        );
-    }
-
-    /// Renders a `HashValue<QM31>`'s eight raw words for a paste-able `[u32; 8]` literal.
-    fn hv_words(h: &circuits::blake::HashValue<SecureField>) -> [u32; 8] {
-        std::array::from_fn(|i| {
-            let [lo, hi, 0, 0] = h[i].get().to_m31_array().map(|m| m.0) else {
-                return 0;
-            };
-            lo | (hi << 16)
-        })
-    }
+    // PINNED recursion-const capture + per-layer DRIFT tests (box-only, `#[ignore]`d), in their own
+    // submodule; they rebuild the REAL per-layer verifier config and assert it equals the pinned consts.
+    #[path = "recursion_consts_tests.rs"]
+    mod recursion_consts_tests;
 
     /// (T4) `incircuit_self_verify` — a standalone monolithic gate_air base proof verifies
     /// IN-CIRCUIT: the NoValue-shaped `circuit_verify` circuit `.check()`s the real assignment.

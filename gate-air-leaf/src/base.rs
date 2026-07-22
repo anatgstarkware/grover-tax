@@ -7,14 +7,17 @@
 
 use crate::*;
 
-use anyhow::{bail, Result};
 #[cfg(feature = "cuda")]
 use anyhow::Context;
+use anyhow::{bail, Result};
+use circuits_stark_verifier::proof_from_stark_proof::pack_public_claim;
 use num_traits::One;
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::ExtendedStarkProof;
+use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleHasher};
 use stwo::core::ColumnVec;
@@ -27,12 +30,7 @@ use stwo::prover::backend::CudaBackend as ProverBackend;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::{prove_ex, CommitmentSchemeProver};
-use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::proof_of_work::GrindOps;
-use circuits_stark_verifier::proof_from_stark_proof::pack_public_claim;
-use stwo_constraint_framework::{
-    EvalAtRow, FrameworkEval, RelationEntry, Relation,
-};
+use stwo_constraint_framework::{EvalAtRow, FrameworkEval, Relation, RelationEntry};
 
 // ----------------------------------------------------------------------------
 // Program-consistency table (the single hidden program)
@@ -148,7 +146,7 @@ impl BoundaryTable {
 /// that row). The table has `2^log_size` rows enumerating exactly `[0, 2^log_size)`.
 pub(crate) struct RcTable {
     pub(crate) log_size: u32,
-    pub(crate) val: Vec<u32>,          // preprocessed: val[i] = i for i in [0, 2^log_size)
+    pub(crate) val: Vec<u32>, // preprocessed: val[i] = i for i in [0, 2^log_size)
     pub(crate) multiplicity: Vec<u32>, // witness
 }
 
@@ -857,7 +855,11 @@ struct DevicePartsRef<'a> {
 /// coverage is `tests::tree0_precompute_matches_rebuild`. Absent from the release binary (its cost is
 /// a full duplicate tree0 build), so `--release` pays nothing and stays byte-identical.
 #[cfg(any(debug_assertions, test))]
-pub(crate) fn assert_tree0_matches_rebuild(pc: &BaseProverPrecompute, rows0: &[Row], n_gates: usize) {
+pub(crate) fn assert_tree0_matches_rebuild(
+    pc: &BaseProverPrecompute,
+    rows0: &[Row],
+    n_gates: usize,
+) {
     // Rebuild via the exact old path (fresh scheme/channel; columns from the same builder).
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(
@@ -1120,10 +1122,8 @@ pub(crate) fn prove_base_shard(
     let channel_salt = 0u32;
     prover_channel.mix_felts(&[BaseField::from_u32_unchecked(channel_salt).into()]);
     config.mix_into(prover_channel);
-    let mut commitment_scheme = CommitmentSchemeProver::<
-        ProverBackend,
-        Blake2sM31MerkleChannel,
-    >::new(config, twiddles);
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(config, twiddles);
 
     // Tree 0: reuse the precomputed commitment (re-mix the SAME root into THIS shard's
     // channel via `commit_tree` — no NTT/Merkle rebuild), else rebuild it the old way. Under
@@ -1197,8 +1197,7 @@ pub(crate) fn prove_base_shard(
         // `x_states` is uploaded here. On the fallback path they're uploaded per shard.
         let mut x_states = Vec::with_capacity(shard_cases.len() * N_LIMBS);
         for c in shard_cases {
-            let bytes =
-                hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
+            let bytes = hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
             x_states.extend_from_slice(&state_to_limbs(&bytes));
         }
         let (main_dev, _lo, d_cols) = match &dp {
@@ -1291,8 +1290,7 @@ pub(crate) fn prove_base_shard(
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     // H_P binding (Fork A): program supply now carries an internal (-mult, TAG_PROGRAM) AND a
     // public (+mult, TAG_PROGRAM_PUB) term, paired into one batch => still 4 interaction cols.
-    let (program_interaction, program_sum) =
-        gen_program_interaction(program, &elements.program);
+    let (program_interaction, program_sum) = gen_program_interaction(program, &elements.program);
     let (boundary_interaction, boundary_sum) =
         gen_boundary_interaction(&boundary, &elements.qubitmem);
     // rc supply: -multiplicity / combine(TAG_RC, val).
