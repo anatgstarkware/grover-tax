@@ -469,13 +469,12 @@ fn prove_tiny_base_on_gpu(
 fn leaf_recursion_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
     use circuit_verifier::verify::{verify_circuit, CircuitPublicData};
     use circuits_stark_verifier::proof::Proof;
-    use leaf::{build_recursion_precompute, prove_gate_air_leaf, GateAirLeafParams};
+    use leaf::{build_gate_air_leaf_circuit, build_recursion_precompute, GateAirLeafParams};
     use recursion_consts_tests::derive_aggregate_config;
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
     use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom};
     use recursive_aggregate::test_utils::unpacker_verify_config;
-    use recursive_aggregate::TreeProof;
 
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     // leaf-recursion uses the leaf preprocessed root (not the base-fanning canonical base root), so the
@@ -494,20 +493,20 @@ fn leaf_recursion_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity:
     // test: build all arities (placeholder op.n() differs from the small fold N)
     let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
 
-    let make_base = || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
-    let leaves: Vec<TreeProof> = (0..n_leaves)
-        .map(|_| {
-            let (p, params) = make_base();
-            prove_gate_air_leaf(p, &cfg, &params, &config, &pre)
-        })
+    let cfg_ref = &cfg;
+    let build = move |(proof, params): (Proof<QM31>, GateAirLeafParams)| {
+        build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
+    };
+    let bases: Vec<(Proof<QM31>, GateAirLeafParams)> = (0..n_leaves)
+        .map(|_| (proof0.clone(), params0.clone()))
         .collect();
-    assert_eq!(leaves.len(), n_leaves);
 
     let cores = std::thread::available_parallelism()
         .map(|c| c.get())
         .unwrap_or(2);
     let pools = PoolSet::new(1, cores.max(1));
-    let out = recursive_aggregate_prove_leaves(leaves.clone(), &config, &pre, &pools);
+    let (leaves, out) = recursive_aggregate_prove_leaves(bases, build, &config, &pre, &pools);
+    assert_eq!(leaves.len(), n_leaves);
 
     let bottom = LeafBottom { leaves };
     // Recompute the unpacker config for this tiny config (production supplies the pinned const).
@@ -587,7 +586,7 @@ fn leaf_recursion_end_to_end_with_fold() {
 /// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
 fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
     use circuits_stark_verifier::proof::Proof;
-    use leaf::{build_recursion_precompute, prove_gate_air_leaf, GateAirLeafParams};
+    use leaf::{build_gate_air_leaf_circuit, build_recursion_precompute, GateAirLeafParams};
     use recursion_consts_tests::derive_aggregate_config;
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
@@ -608,13 +607,20 @@ fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_
     // test: build all arities (placeholder op.n() differs from the small fold N)
     let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
 
-    let make_base = || -> (Proof<QM31>, GateAirLeafParams) { (proof0.clone(), params0.clone()) };
-    let leaves: Vec<TreeProof> = (0..n_leaves)
-        .map(|_| {
-            let (p, params) = make_base();
-            prove_gate_air_leaf(p, &cfg, &params, &config, &pre)
-        })
-        .collect();
+    // The same build closure both paths use per leaf (each proves the identical tiny base): only
+    // the SCHEDULE differs between sequential + streaming, so equal roots prove byte-identity. A
+    // factory hands each call site a fresh owned closure (both borrow only `cfg`).
+    let cfg_ref = &cfg;
+    let make_build = || {
+        move |(proof, params): (Proof<QM31>, GateAirLeafParams)| {
+            build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
+        }
+    };
+    let bases = || -> Vec<(Proof<QM31>, GateAirLeafParams)> {
+        (0..n_leaves)
+            .map(|_| (proof0.clone(), params0.clone()))
+            .collect()
+    };
 
     // Bit-identity signature of a folded root (proof + pp_root + outs) and its leaves. `TreeProof`
     // is only `Clone`, so compare via the same deterministic `{:?}` canonicalisation the
@@ -635,25 +641,27 @@ fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_
     let cores = std::thread::available_parallelism()
         .map(|c| c.get())
         .unwrap_or(2);
-    // (a) Sequential collect-then-fold (the reference).
+    // (a) Sequential collect-then-fold (the reference): build+prove every leaf, then fold.
     let pools_seq = PoolSet::new(1, cores.max(1));
-    let out_seq = recursive_aggregate_prove_leaves(leaves.clone(), &config, &pre, &pools_seq);
-    let seq_sig = sig(&leaves, &out_seq);
+    let (leaves_seq, out_seq) =
+        recursive_aggregate_prove_leaves(bases(), make_build(), &config, &pre, &pools_seq);
+    let seq_sig = sig(&leaves_seq, &out_seq);
 
-    // (b) Streaming, SCRAMBLED arrival order (reverse), identity `wrap` (the leaves already
-    // exist — only the schedule differs). Try n_pools 1 and 2 to cover both worker counts.
+    // (b) Streaming, SCRAMBLED arrival order (reverse), the SAME build closure (only the schedule
+    // differs). Try n_pools 1 and 2 to cover both worker counts.
     for n_pools in [1usize, 2] {
         let pools = PoolSet::new(n_pools, (cores / n_pools).max(1));
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, TreeProof)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, (Proof<QM31>, GateAirLeafParams))>();
+        let inputs = bases();
         // Scramble: send indices in reverse (a base-producer never guarantees arrival order).
         for i in (0..n_leaves).rev() {
-            tx.send((i, leaves[i].clone())).unwrap();
+            tx.send((i, inputs[i].clone())).unwrap();
         }
         drop(tx);
         let (leaves_out, out_stream) = recursive_aggregate_prove_leaves_streaming(
             rx,
             n_leaves,
-            |t: TreeProof| t, // identity wrap
+            make_build(),
             &config,
             &pre,
             &pools,
@@ -704,12 +712,12 @@ fn leaf_recursion_streaming_wrap_panic_propagates() {
         );
         return;
     }
+    use circuits::context::FinalizedContext;
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
-    use recursive_aggregate::TreeProof;
 
-    // Build the smallest valid leaf-recursion config from a tiny base. No recursion PROVE runs (wrap
-    // panics first), but the config build itself is the heavy part gated above.
+    // Build the smallest valid leaf-recursion config from a tiny base. No recursion PROVE runs (the
+    // build closure panics first), but the config build itself is the heavy part gated above.
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
     let fold_arity = TopologyConfig::default().fold_arity;
@@ -728,13 +736,15 @@ fn leaf_recursion_streaming_wrap_panic_propagates() {
                 tx.send((i, i)).unwrap();
             }
             drop(tx);
-            // Every `wrap` panics — a worker panic must re-panic on the coordinator's
+            // Every `build` panics — a worker panic must re-panic on the coordinator's
             // `thread::scope` join (not hang, not be silently dropped). The panic fires inside
-            // `wrap`, before any level1/fold node runs, so no real proving happens (laptop-safe).
+            // `build`, before any level1/fold node runs, so no real proving happens (laptop-safe).
             recursive_aggregate_prove_leaves_streaming(
                 rx,
                 n_leaves,
-                |i: usize| -> TreeProof { panic!("intentional wrap panic at leaf {i}") },
+                |i: usize| -> FinalizedContext<QM31> {
+                    panic!("intentional build panic at leaf {i}")
+                },
                 config,
                 pre,
                 &pools,
@@ -946,7 +956,7 @@ fn k4_interaction_identity() {
 /// (`Some(pc)`) is BYTE-IDENTICAL to one proved rebuild-per-shard (`None`). Replaces the removed
 /// `GATE_AIR_NO_BASE_PRECOMPUTE` A/B arm + `GATE_AIR_BASE_PROOF_HASH` compare; extends
 /// `tree0_precompute_matches_rebuild` (tree0 only) to the full base proof via
-/// `diag::base_proof_fingerprint`.
+/// `fingerprint::base_proof_fingerprint`.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
 #[serial]
@@ -988,8 +998,8 @@ fn base_precompute_identity() {
     let rebuild = prove_base_shard(None, &cases, &gates, k, n_gates, &topo, &rc_lo)
         .expect("prove_base_shard(None)");
     assert_eq!(
-        diag::base_proof_fingerprint(std::slice::from_ref(&with_pc)),
-        diag::base_proof_fingerprint(std::slice::from_ref(&rebuild)),
+        fingerprint::base_proof_fingerprint(std::slice::from_ref(&with_pc)),
+        fingerprint::base_proof_fingerprint(std::slice::from_ref(&rebuild)),
         "base precompute-ON base proof != rebuild-per-shard base proof"
     );
 }

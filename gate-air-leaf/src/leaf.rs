@@ -15,24 +15,15 @@ use circuits::ops::Guess;
 use circuits_stark_verifier::proof::{empty_proof, Proof, ProofConfig};
 use circuits_stark_verifier::verify::verify;
 
-use circuit_common::finalize::{compute_padded_sizes, pad_to_targets, ComponentSizes};
-use circuit_common::preprocessed::PreprocessedCircuit;
+use circuit_common::finalize::{compute_padded_sizes, ComponentSizes};
 use circuit_common::N_RESERVED;
-use circuit_prover::prover::{
-    prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute,
-};
 
-use circuit_multiverifier::verify::SharedConfig;
 use recursive_aggregate::pinned_configs::assemble_aggregate_config;
-use recursive_aggregate::precomputes::{
-    fold_used_arities, node_preprocessed_from_shared, RecursionPrecompute, TreeSpec,
-};
-use recursive_aggregate::{AggregateConfig, TreeProof};
+use recursive_aggregate::precomputes::RecursionPrecompute;
+use recursive_aggregate::AggregateConfig;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
-use stwo::core::utils::MaybeOwned;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 
 use crate::recursion_consts::OperatingPoint;
 use crate::topology::{TopologyConfig, FOLD_ARITY, RECURSION_LOG_BLOWUP};
@@ -174,14 +165,13 @@ pub fn pinned_aggregate_config(
     assemble_aggregate_config(&derived, leaf_target_sizes(cfg, params), FOLD_ARITY)
 }
 
-/// Builds the flat leaf/level1/fold [`RecursionPrecompute`] by rebuilding each layer's preprocessed
-/// shape from `config` — no fixed-point loop. Every tree asserts its committed root equals `config`'s
-/// root (the load-bearing soundness check: a drifted pinned config fails it loudly).
+/// Builds the flat leaf/level1/fold [`RecursionPrecompute`]: builds the AIR-specific leaf circuit
+/// (the only gate_air-specific ingredient) and hands it to the generic
+/// [`recursive_aggregate::precomputes::build_recursion_precompute`], which rebuilds every held tree
+/// from `config` and asserts each committed root equals `config`'s pinned root.
 ///
 /// `build_all_arities`: production passes `false` → build shapes only for the arities this point's
-/// fold uses ([`fold_used_arities`] of `op.n()`), since committing every unused `2..=k` arity's ~2^22
-/// tree overruns the base-precompute overlap window. Tests pass `true` (they fold a small N differing
-/// from the placeholder `op.n()`, so they need every `2..=k` arity).
+/// fold uses ([`op.n()`] leaves); tests pass `true`. See the proving-utils fn for details.
 pub fn build_recursion_precompute(
     config: &AggregateConfig,
     op: OperatingPoint,
@@ -189,97 +179,12 @@ pub fn build_recursion_precompute(
     params: &GateAirLeafParams,
     build_all_arities: bool,
 ) -> RecursionPrecompute {
-    let k = config.fold_arity;
-    let node_pcs = config.node_pcs_config;
-    let node_target = &config.node_target_padding_sizes;
-
-    // Leaf tree: rebuild the leaf preprocessed circuit padded to the config's leaf target.
-    let leaf_pp = {
-        let mut leaf_ctx = build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params);
-        pad_to_targets(&mut leaf_ctx, config.leaf_target_padding_sizes.clone());
-        PreprocessedCircuit::preprocess_circuit(&mut leaf_ctx)
-    };
-    let leaf = TreeSpec {
-        preprocessed: leaf_pp,
-        pcs_config: config.leaf_pcs_config,
-        expected_root: config.leaf_preprocessed_root.clone(),
-    };
-
-    // Node shapes: level1 verifies leaves (`leaf_shared_config`), fold verifies nodes
-    // (`fold_shared_config`); both pad to the common `node_target`, rebuilt (not re-derived).
-    let (level1_arities, fold_arities): (Vec<usize>, Vec<usize>) = if build_all_arities {
-        ((2..=k).collect(), (2..=k).collect())
-    } else {
-        let (l, f) = fold_used_arities(op.n(), k);
-        (l.into_iter().collect(), f.into_iter().collect())
-    };
-    let level1 = level1_arities
-        .into_iter()
-        .map(|a| {
-            (
-                a,
-                node_spec(
-                    &config.leaf_shared_config,
-                    node_pcs,
-                    node_target,
-                    a,
-                    config.level1_root(a),
-                ),
-            )
-        })
-        .collect();
-    let fold = fold_arities
-        .into_iter()
-        .map(|a| {
-            (
-                a,
-                node_spec(
-                    &config.fold_shared_config,
-                    node_pcs,
-                    node_target,
-                    a,
-                    config.fold_root(a),
-                ),
-            )
-        })
-        .collect();
-    RecursionPrecompute::new(leaf, level1, fold)
-}
-
-/// Builds + proves one gate_air single-base LEAF, padded to its OWN target so `t_leaf` stays pinned
-/// independent of `fold_arity`. `real_proof` is the gate_air proof as circuit values.
-pub fn prove_gate_air_leaf(
-    real_proof: Proof<QM31>,
-    cfg: &ProofConfig,
-    params: &GateAirLeafParams,
-    config: &AggregateConfig,
-    pre: &RecursionPrecompute,
-) -> TreeProof {
-    let leaf_target = config.leaf_target_padding_sizes.clone();
-    let leaf_preprocessed_root = config.leaf_preprocessed_root.clone();
-    let mut context = build_gate_air_leaf_circuit::<QM31>(real_proof, cfg, params);
-    pad_to_targets(&mut context, leaf_target);
-    let leaf_tree = &pre.leaf;
-    let circuit_proof = prove_circuit_with_precompute::<Blake2sM31MerkleChannel>(
-        &pre.base_column_pool,
-        &pre.twiddles,
-        &leaf_tree.preprocessed,
-        MaybeOwned::Borrowed(&leaf_tree.tree),
-        context.values(),
-        leaf_tree.pcs_config,
+    recursive_aggregate::precomputes::build_recursion_precompute(
+        build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params),
+        config,
+        op.n(),
+        build_all_arities,
     )
-    .expect("gate_air leaf prove failed");
-    let (proof, public_data) = prepare_circuit_proof_for_circuit_verifier(circuit_proof);
-    let output_values = public_data
-        .output_values
-        .try_into()
-        .expect("leaf emits N_RESERVED outputs");
-
-    TreeProof {
-        proof,
-        preprocessed_root: leaf_preprocessed_root,
-        output_values,
-    }
 }
 
 /// The leaf's OWN natural padding target, decoupled from the node target so `t_leaf` is pinned
@@ -291,21 +196,4 @@ fn leaf_target_sizes(cfg: &ProofConfig, params: &GateAirLeafParams) -> Component
         cfg,
         params,
     ))
-}
-
-/// One node layer's [`TreeSpec`] for `arity`: the node preprocessed circuit verifying
-/// `child_shared`-configured children (padded to `node_target`), committed at `node_pcs`, asserting
-/// `expected_root`. Shared by the level1 (leaf child) and fold (node child) tiers.
-fn node_spec(
-    child_shared: &SharedConfig,
-    node_pcs: PcsConfig,
-    node_target: &ComponentSizes,
-    arity: usize,
-    expected_root: HashValue<QM31>,
-) -> TreeSpec {
-    TreeSpec {
-        preprocessed: node_preprocessed_from_shared(child_shared, node_target.clone(), arity),
-        pcs_config: node_pcs,
-        expected_root,
-    }
 }

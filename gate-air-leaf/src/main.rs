@@ -11,7 +11,7 @@
 
 mod base; // Base (per-shard) gate_air prover, extracted from this file (mirrors `leaf.rs`).
 mod circuit_statement; // In-circuit verifier of the gate_air STARK proof.
-mod diag; // Diagnostic observation helpers behind the env-gated fingerprint hooks.
+mod fingerprint; // Proof-fingerprint helpers behind the env-gated hooks (distinct from the `diag` feature).
 #[cfg(feature = "gpu-cuda")]
 mod gpu_tracegen;
 mod leaf;
@@ -1923,12 +1923,14 @@ fn prove_folded(
 ) -> Result<()> {
     use circuit_statement::gate_air_components;
     use circuits::blake::HashValue;
+    use circuits::context::FinalizedContext;
     use circuits::ivalue::NoValue;
     use circuits::wrappers::U32Wrapper;
     use circuits_stark_verifier::proof::{Proof, ProofConfig};
     use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
     use leaf::{
-        build_recursion_precompute, pinned_aggregate_config, prove_gate_air_leaf, GateAirLeafParams,
+        build_gate_air_leaf_circuit, build_recursion_precompute, pinned_aggregate_config,
+        GateAirLeafParams,
     };
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::precomputes::RecursionPrecompute;
@@ -2266,12 +2268,12 @@ fn prove_folded(
     // observation hook (off by default; ~free when off), NOT a path toggle. The precompute-ON ==
     // rebuild-per-shard A/B comparison this print used to anchor is now the `base_precompute_identity`
     // test (T2), which drives `prove_base_shard` `Some(pc)` vs `None` and compares
-    // `diag::base_proof_fingerprint` directly. Prints on the sequential path (all bases up front) and
-    // continues into the fold (no early exit).
+    // `fingerprint::base_proof_fingerprint` directly. Prints on the sequential path (all bases up
+    // front) and continues into the fold (no early exit).
     if !pipeline && std::env::var("GATE_AIR_BASE_PROOF_HASH").is_ok() {
         println!(
             "gate-air: base_proof_fingerprint={}",
-            diag::base_proof_fingerprint(&shard_bases)
+            fingerprint::base_proof_fingerprint(&shard_bases)
         );
     }
 
@@ -2448,19 +2450,20 @@ fn prove_folded(
             if overlap_leaves {
                 // OVERLAP (Model 1): feed each base into `recursive_aggregate_prove_leaves_streaming`
                 // AS IT ARRIVES, concurrent with the GPU producers still proving later shards. The
-                // coordinator owns the single wrap+level1+fold-node pool and folds progressively; the injected
-                // `wrap` closure (make_base + prove_gate_air_leaf) runs INSIDE its pool workers, so
-                // GPU base-proving overlaps BOTH the leaf-wrap and the fold. Leaf i = shard i
-                // (index-tagged), byte-identical to the sequential wrap+fold.
+                // coordinator owns the single build+prove+level1+fold-node pool and folds progressively;
+                // the injected `build` closure (make_base + build_gate_air_leaf_circuit) runs INSIDE its
+                // pool workers, with proving-utils running `prove_leaf` on the SAME worker right after,
+                // so GPU base-proving overlaps BOTH the leaf build+prove and the fold. Leaf i = shard i
+                // (index-tagged), byte-identical to the sequential build+prove+fold.
                 let agg = &leaf_cfg;
                 let pre = recursion_pre_ref;
                 let make_base_ref = &make_base;
                 let pools_ref = &pools;
-                // The wrap closure the coordinator runs per leaf (heavy — runs inside a pool
-                // worker via the crate's `pool.install`). Keeps the crate leaf-agnostic.
-                let wrap = move |base: BaseShardOutput| -> TreeProof {
+                // The build closure the coordinator runs per leaf (heavy — runs inside a pool
+                // worker via the crate's `pool.install`); proving-utils proves it in the same worker.
+                let build = move |base: BaseShardOutput| -> FinalizedContext<QM31> {
                     let (proof, params) = make_base_ref(&base);
-                    prove_gate_air_leaf(proof, cfg_ref, &params, agg, pre)
+                    build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
                 };
                 // The coordinator reads `(shard_idx, base)`; a small forward loop on THIS thread
                 // pulls tagged producer results and forwards the Ok bases, so a base `Err` still
@@ -2469,7 +2472,7 @@ fn prove_folded(
                 let (leaf_tx, leaf_rx) = std::sync::mpsc::channel::<(usize, BaseShardOutput)>();
                 let fold_handle = scope.spawn(move || {
                     recursive_aggregate_prove_leaves_streaming(
-                        leaf_rx, n_shards, wrap, agg, pre, pools_ref,
+                        leaf_rx, n_shards, build, agg, pre, pools_ref,
                     )
                 });
                 let mut base_err: Option<anyhow::Error> = None;
@@ -2576,52 +2579,34 @@ fn prove_folded(
         // proves its own base proof against the immutable shared `cfg`/`agg`, no shared mutable
         // state — so we dispatch one job per leaf across the recursion `pools` (`pools.map`
         // preserves input order, so leaf `i` stays shard `i`); this changes only wall time.
-        let (leaves, out): (Vec<TreeProof>, AggregateOutput) = if let Some((leaves, out)) =
-            overlapped_fold
-        {
-            eprintln!(
+        let (leaves, out): (Vec<TreeProof>, AggregateOutput) =
+            if let Some((leaves, out)) = overlapped_fold {
+                eprintln!(
                 "gate-air: reusing {} leaves + folded root from base-proving overlap ({} levels)",
                 leaves.len(),
                 out.n_levels
             );
-            (leaves, out)
-        } else {
-            let cfg_ref = &cfg;
-            let agg_ref = &agg;
-            let pre_ref = recursion_pre_ref;
-            let tg = Instant::now();
-            let jobs: Vec<_> = bases
-                .into_iter()
-                .enumerate()
-                .map(|(i, (proof, params))| {
-                    move || {
-                        let tl = Instant::now();
-                        let leaf = prove_gate_air_leaf(proof, cfg_ref, &params, agg_ref, pre_ref);
-                        eprintln!(
-                            "gate-air: MEASURE t_leaf[{i}]={:.3}s",
-                            tl.elapsed().as_secs_f64()
-                        );
-                        leaf
-                    }
-                })
-                .collect();
-            let leaves: Vec<TreeProof> = pools.map(jobs);
-            eprintln!(
-                "gate-air: {} leaf/leaves proved in {:.1}s",
-                leaves.len(),
-                tg.elapsed().as_secs_f64()
-            );
-            // Fold: level-0 level1-node layer over the leaves + shared fold-node up-tree fold.
-            let tf = Instant::now();
-            let out =
-                recursive_aggregate_prove_leaves(leaves.clone(), &agg, recursion_pre_ref, &pools);
-            eprintln!(
-                "gate-air: folded to root in {:.1}s ({} levels)",
-                tf.elapsed().as_secs_f64(),
-                out.n_levels
-            );
-            (leaves, out)
-        };
+                (leaves, out)
+            } else {
+                let cfg_ref = &cfg;
+                // Build+prove each leaf + fold: proving-utils builds each leaf circuit (via the
+                // injected `build` closure), proves it (build+prove+drop per leaf, never all resident),
+                // then runs the level-0 level1-node layer + shared fold-node up-tree fold. Leaf `i`
+                // stays shard `i` (input order preserved).
+                let build = move |(proof, params): (Proof<QM31>, GateAirLeafParams)| {
+                    build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
+                };
+                let tf = Instant::now();
+                let (leaves, out) =
+                    recursive_aggregate_prove_leaves(bases, build, &agg, recursion_pre_ref, &pools);
+                eprintln!(
+                    "gate-air: {} leaf/leaves proved + folded to root in {:.1}s ({} levels)",
+                    leaves.len(),
+                    tf.elapsed().as_secs_f64(),
+                    out.n_levels
+                );
+                (leaves, out)
+            };
         eprintln!("gate-air: multiverifier fold OK");
 
         // Root verification: unpack from the raw leaves + self-verify.
@@ -2677,7 +2662,7 @@ fn prove_folded(
     if std::env::var("GATE_AIR_RECURSION_FP").is_ok() {
         println!(
             "gate-air: recursion_fingerprint={}",
-            diag::recursion_fingerprint(&base_nodes, &out, &rv)
+            fingerprint::recursion_fingerprint(&base_nodes, &out, &rv)
         );
     }
     // The fold completing = every leaf proof verified in-circuit by its parent node; the root
@@ -3054,7 +3039,7 @@ fn prove_monolithic(
     // The CPU/SimdBackend run is the golden oracle; a `--features cuda` run on the same
     // fixture+samples must print the SAME hex. See P5_GPU_CONSTRAINT_SCOPE.md Deliverable 2 §2.1.
     if std::env::var("GATE_AIR_PROOF_HASH").is_ok() {
-        diag::emit_proof_fingerprint(&extended);
+        fingerprint::emit_proof_fingerprint(&extended);
     }
 
     // The in-circuit self-verification (standalone monolithic base proof `circuit_verify(...).check()`

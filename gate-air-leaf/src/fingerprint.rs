@@ -1,7 +1,9 @@
-//! Diagnostic observation helpers behind the prove path's env-gated hooks (`GATE_AIR_PROOF_HASH`,
-//! `GATE_AIR_BASE_PROOF_HASH`, `GATE_AIR_RECURSION_FP`). READ-ONLY taps: each is a stable SHA over an
-//! already-produced proof, feeding no committed value, so leaving them off is byte-neutral. Compiled
-//! unconditionally so `GATE_AIR_*` can be flipped at run time on the production-fast binary.
+//! Proof-fingerprint observation helpers behind the prove path's env-gated hooks
+//! (`GATE_AIR_PROOF_HASH`, `GATE_AIR_BASE_PROOF_HASH`, `GATE_AIR_RECURSION_FP`). READ-ONLY taps: each
+//! is a stable SHA over an already-produced proof, feeding no committed value, so leaving them off is
+//! byte-neutral. Compiled unconditionally so `GATE_AIR_*` can be flipped at run time on the
+//! production-fast binary. Distinct from the `diag` Cargo FEATURE (which gates the separate
+//! `cuda,diag` byte-identity test harness): this module is always compiled and runtime env-gated.
 
 use recursive_aggregate::root_prover::RootVerificationOutput;
 use recursive_aggregate::{AggregateOutput, TreeProof};
