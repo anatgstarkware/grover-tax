@@ -18,7 +18,6 @@ use circuits_stark_verifier::verify::verify;
 use circuit_common::finalize::{compute_padded_sizes, ComponentSizes};
 use circuit_common::N_RESERVED;
 
-use recursive_aggregate::pinned_configs::assemble_aggregate_config;
 use recursive_aggregate::precomputes::RecursionPrecompute;
 use recursive_aggregate::AggregateConfig;
 use stwo::core::fields::qm31::QM31;
@@ -91,7 +90,7 @@ pub fn leaf_pcs_config(trace_log_size: u32, log_blowup_factor: u32) -> PcsConfig
 
 /// Verifies ONE gate_air base proof in-circuit and returns the eight `H_i` digest words the leaf
 /// sets as outputs. The whole security-relevant binding lives here.
-pub fn emit_one_base<Value: IValue>(
+fn emit_one_base<Value: IValue>(
     context: &mut Context<Value>,
     proof: Proof<Value>,
     cfg: &ProofConfig,
@@ -159,10 +158,12 @@ pub fn pinned_aggregate_config(
         (RECURSION_LOG_BLOWUP, RECURSION_LOG_BLOWUP),
         "pinned operating points fix the default node/leaf blowup"
     );
-    let derived = op
-        .pinned()
-        .to_derived(topo.leaf_log_blowup, topo.recursion_log_blowup);
-    assemble_aggregate_config(&derived, leaf_target_sizes(cfg, params), FOLD_ARITY)
+    op.pinned().to_aggregate_config(
+        leaf_target_sizes(cfg, params),
+        topo.leaf_log_blowup,
+        topo.recursion_log_blowup,
+        FOLD_ARITY,
+    )
 }
 
 /// Builds the flat leaf/level1/fold [`RecursionPrecompute`]: builds the AIR-specific leaf circuit
