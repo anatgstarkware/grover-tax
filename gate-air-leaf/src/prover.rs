@@ -10,15 +10,15 @@ use crate::*;
 // glob-imported so this module's bare references keep resolving.
 use crate::air::*;
 // Relation ids now live with their owning components (module reorg). Only `TAG_RC` is used bare here.
-use crate::components::range_check::TAG_RC;
+use crate::air::components::range_check::TAG_RC;
 // Trace/witness-gen items relocated to `tracegen` (Step-1 reorg). Imported explicitly rather than
 // glob so `tracegen`'s gate-local `TRACE_COLUMNS`/`GATE_REL_WIDTH` gpu consts don't shadow the
 // crate-root shared consts this module uses via `use crate::*`.
 use crate::tracegen::{
-    build_rc_table, build_rows, build_tree0_columns, cell_at, gen_boundary_interaction,
-    gen_program_interaction, gen_table_interaction, generate_boundary_witness,
-    generate_program_witness, generate_rc_witness, pack_seq, state_to_limbs, to_prover,
-    BoundaryTable, RcIndex, Row,
+    build_program_table, build_rc_table, build_rows, build_tree0_columns, cell_at,
+    gen_boundary_interaction, gen_program_interaction, gen_table_interaction,
+    generate_boundary_witness, generate_program_witness, generate_rc_witness, pack_seq,
+    program_log_size, state_to_limbs, to_prover, BoundaryTable, ProgramTable, RcIndex, Row,
 };
 // Only the non-cuda base path calls the CPU main-interaction generator (the cuda path uses the GPU
 // K4 kernel), so gate its import to match.
@@ -55,67 +55,6 @@ use stwo_constraint_framework::Relation;
 /// Env override `BASE_BLOWUP` is parsed in `main`.
 pub const BASE_LOG_BLOWUP: u32 = 1;
 
-/// Program-consistency table (the single hidden program): one row per program slot (gate) i in
-/// 0..n_gates, padded to a power of two. Row i stores the canonical op tuple as WITNESS plus a
-/// multiplicity = samples*K executions of that slot. Inactive controls canonicalise to 0 (matching the
-/// use side). Slot index is PREPROCESSED. Padding rows carry multiplicity 0, so their op contents are
-/// inert (never addressed: pc_in_prog stays in 0..n_gates).
-pub(crate) struct ProgramTable {
-    pub(crate) log_size: u32,
-    pub(crate) slot: Vec<u32>,          // preprocessed slot index 0..size
-    pub(crate) opcode_scalar: Vec<u32>, // witness
-    pub(crate) target: Vec<u32>,        // witness
-    pub(crate) ctrl_a: Vec<u32>,        // witness
-    pub(crate) ctrl_b: Vec<u32>,        // witness
-    pub(crate) multiplicity: Vec<u32>,  // witness: samples*K on real slots, 0 on padding
-}
-
-/// Log-size of the program table (one row per gate, padded to a power of two, floored at LANE_COUNT).
-/// Pure function of `n_gates` (shard-invariant), so it can be recovered without the table itself.
-pub(crate) fn program_log_size(n_gates: usize) -> u32 {
-    n_gates.next_power_of_two().max(LANE_COUNT).ilog2()
-}
-
-pub(crate) fn build_program_table(gates: &[Gate], samples: usize, k: usize) -> ProgramTable {
-    let n_gates = gates.len();
-    let padded = n_gates.next_power_of_two().max(LANE_COUNT);
-    let log_size = padded.ilog2();
-    let mut slot = vec![0u32; padded];
-    let mut opcode_scalar = vec![0u32; padded];
-    let mut target = vec![0u32; padded];
-    let mut ctrl_a = vec![0u32; padded];
-    let mut ctrl_b = vec![0u32; padded];
-    let mut multiplicity = vec![0u32; padded];
-    let mult = (samples * k) as u32;
-    for (i, g) in gates.iter().enumerate() {
-        slot[i] = i as u32;
-        let (sc, a_active, b_active) = match g.opcode {
-            OP_NOP => (0u32, false, false),
-            OP_NOT => (1u32, false, false),
-            OP_CNOT => (2u32, true, false),
-            OP_TOFFOLI => (3u32, true, true),
-            _ => (0u32, false, false),
-        };
-        opcode_scalar[i] = sc;
-        target[i] = g.target as u32;
-        ctrl_a[i] = if a_active { g.ctrl_a as u32 } else { 0 };
-        ctrl_b[i] = if b_active { g.ctrl_b as u32 } else { 0 };
-        multiplicity[i] = mult;
-    }
-    // Padding slots keep an in-range index sequence (inert; multiplicity 0).
-    for (i, s) in slot.iter_mut().enumerate().skip(n_gates) {
-        *s = i as u32;
-    }
-    ProgramTable {
-        log_size,
-        slot,
-        opcode_scalar,
-        target,
-        ctrl_a,
-        ctrl_b,
-        multiplicity,
-    }
-}
 /// Pack the scalar `Vec<Row>` main trace into `PackedM31` columns, in parallel over columns: each task
 /// owns one column's whole buffer, so no two threads touch the same packed word (a non-16-aligned shot
 /// block can't race). Bit-identical to a serial per-cell fill.
@@ -275,7 +214,7 @@ impl BaseProverPrecompute {
         );
 
         #[cfg(feature = "cuda")]
-        let dev = tracegen::cuda_device().map_err(|e| anyhow::anyhow!(e))?;
+        let dev = gpu_tracegen::cuda_device().map_err(|e| anyhow::anyhow!(e))?;
         #[cfg(feature = "cuda")]
         let d_gates = dev
             .htod_copy(gates_flat.to_vec())
@@ -356,7 +295,7 @@ impl BaseProverPrecompute {
             self.config.lifting_log_size,
             &pool,
         );
-        let dev = tracegen::cuda_device().map_err(|e| anyhow::anyhow!(e))?;
+        let dev = gpu_tracegen::cuda_device().map_err(|e| anyhow::anyhow!(e))?;
         let d_gates = dev
             .htod_copy(self.gates_flat.clone())
             .map_err(|e| anyhow::anyhow!("htod gates (device precompute): {e}"))?;
@@ -380,7 +319,7 @@ impl BaseProverPrecompute {
     /// first use. tree0 is shard-invariant, so every replica commits the identical root.
     #[cfg(feature = "cuda")]
     fn device_parts(&self) -> DevicePartsRef<'_> {
-        let ord = tracegen::base_gpu_ordinal();
+        let ord = gpu_tracegen::base_gpu_ordinal();
         if ord == 0 {
             return DevicePartsRef {
                 twiddles: &self.twiddles,
@@ -586,7 +525,7 @@ pub(crate) fn prove_base_shard(
         let (main_dev, _lo, d_cols) = match &dp {
             // Multi-GPU: use THIS device's N3 buffers (feeding device-0 buffers to a device-n kernel
             // would be an illegal cross-device access).
-            Some(dp) => tracegen::gpu_gen_main_trace_device_d(
+            Some(dp) => gpu_tracegen::gpu_gen_main_trace_device_d(
                 dp.d_gates,
                 &x_states,
                 dp.d_off_lo,
@@ -600,7 +539,7 @@ pub(crate) fn prove_base_shard(
             None => {
                 let (gates_flat, _x, off_lo, off_hi) =
                     gpu_flat_inputs(gates, shard_cases, rc_lo_index, rc_lo_index)?;
-                tracegen::gpu_gen_main_trace_device(
+                gpu_tracegen::gpu_gen_main_trace_device(
                     &gates_flat,
                     &x_states,
                     &off_lo,
@@ -629,8 +568,8 @@ pub(crate) fn prove_base_shard(
 
     // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
     #[cfg(feature = "cuda")]
-    let main_k1: tracegen::MainTrace =
-        tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
+    let main_k1: gpu_tracegen::MainTrace =
+        gpu_tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
 
     let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
     prover_channel.mix_u64(interaction_pow_nonce);
@@ -639,14 +578,14 @@ pub(crate) fn prove_base_shard(
     #[cfg(feature = "cuda")]
     {
         gate_air_cuda_kernel::register();
-        let (z, alpha_powers) = tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
         gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
     }
 
     // Interaction traces (device K4 unconditional under `cuda`; CPU arm survives only on non-cuda).
     #[cfg(feature = "cuda")]
     let main_interaction_device = {
-        let (cols, claimed) = tracegen::gpu_gen_interaction_device(
+        let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
             &main_k1,
             n_gates as u32,
             padded_rows,

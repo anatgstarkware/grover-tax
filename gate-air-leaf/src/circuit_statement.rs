@@ -24,10 +24,10 @@ use indexmap::IndexMap;
 use stwo::core::fields::qm31::QM31;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
+use crate::air::components::program::{TAG_PROGRAM, TAG_PROGRAM_PUB};
+use crate::air::components::qubitmem::TAG_QUBITMEM;
+use crate::air::components::range_check::TAG_RC;
 use crate::air::{ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, TRACE_COLUMNS, TS_FINAL};
-use crate::components::program::{TAG_PROGRAM, TAG_PROGRAM_PUB};
-use crate::components::qubitmem::TAG_QUBITMEM;
-use crate::components::range_check::TAG_RC;
 use crate::leaf::ProgramRows;
 use crate::preprocessed::{pp_id, preprocessed_column_ids};
 

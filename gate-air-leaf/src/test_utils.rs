@@ -8,8 +8,8 @@
 // former `tests.rs` did) so this module's varied cuda/non-cuda helpers never trip an unused-import
 // warning on the subset a given build compiles; the gate-local `TRACE_COLUMNS`/`GATE_REL_WIDTH` gpu
 // consts are never named here, so no ambiguity with the crate-root consts pulled in via `air::*`.
+use crate::air::components::gate::GateEval;
 use crate::air::*;
-use crate::components::gate::GateEval;
 use crate::preprocessed::{
     generate_enabler_preprocessed, generate_pc_in_prog_preprocessed, generate_pc_preprocessed,
     generate_shot_id_preprocessed,
@@ -30,7 +30,7 @@ use stwo_constraint_framework::{assert_constraints_on_trace, FrameworkEval};
 // Imports named ONLY by the `cuda,diag` base-prove byte-identity oracles below (not compiled on the
 // default SimdBackend test build), so gated to match and avoid unused-import warnings there.
 #[cfg(all(feature = "cuda", feature = "diag"))]
-use crate::components::range_check::TAG_RC;
+use crate::air::components::range_check::TAG_RC;
 #[cfg(all(feature = "cuda", feature = "diag"))]
 use crate::preprocessed::N_PREPROCESSED_COLS;
 #[cfg(all(feature = "cuda", feature = "diag"))]
@@ -442,7 +442,7 @@ pub(crate) fn prove_tiny_base_on_gpu(
     let elements = LookupElements::draw(prover_channel);
 
     // Thread the drawn (z, alpha) to the GPU kernel.
-    let (z, alpha_powers) = crate::tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+    let (z, alpha_powers) = crate::gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
     gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
 
     let (main_interaction, main_sum) =

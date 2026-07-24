@@ -7,10 +7,10 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
+use crate::air::components::program::TAG_PROGRAM;
+use crate::air::components::qubitmem::TAG_QUBITMEM;
+use crate::air::components::range_check::TAG_RC;
 use crate::air::{GateRel, LookupElements};
-use crate::components::program::TAG_PROGRAM;
-use crate::components::qubitmem::TAG_QUBITMEM;
-use crate::components::range_check::TAG_RC;
 use crate::preprocessed::pp_id;
 
 /// Main gate constraint. One trace row per gate; per-row accesses (target + up to two controls)

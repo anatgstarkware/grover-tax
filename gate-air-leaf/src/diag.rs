@@ -107,7 +107,7 @@ pub(crate) fn assert_tree0_matches_rebuild(
 #[cfg(debug_assertions)]
 pub(crate) fn assert_claimed_sums_net(
     boundary: &crate::tracegen::BoundaryTable,
-    program: &crate::prover::ProgramTable,
+    program: &crate::tracegen::ProgramTable,
     elements: &crate::air::LookupElements,
     main_sum: SecureField,
     program_sum: SecureField,

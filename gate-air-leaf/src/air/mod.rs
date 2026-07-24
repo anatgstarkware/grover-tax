@@ -2,11 +2,13 @@
 //! (type aliases + `build_components` + component/prover refs + trace_log_sizes), and the AIR
 //! constants (widths, encoding sizes). The preprocessed column layout + generators live in
 //! `crate::preprocessed`. The per-component `FrameworkEval`s
-//! and their relation ids live in `crate::components::{gate,program,qubitmem,range_check}`; this file
+//! and their relation ids live in `crate::air::components::{gate,program,qubitmem,range_check}`; this file
 //! is the verifier-facing assembly they are wired into.
 //!
 //! `GateRel` (the single drawn LogUp relation, `relation!(GateRel, 6)`) lives here (the AIR is its
 //! near-sole user); the prover pipeline stays in `prover.rs`, trace/witness generation in `tracegen.rs`.
+
+pub(crate) mod components;
 
 use stwo::core::air::Component;
 use stwo::core::channel::Channel;
@@ -21,10 +23,10 @@ use stwo::prover::backend::simd::SimdBackend as ProverBackend;
 use stwo::prover::backend::CudaBackend as ProverBackend;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 
-use crate::components::gate::GateEval;
-use crate::components::program::ProgramEval;
-use crate::components::qubitmem::QubitMemEval;
-use crate::components::range_check::RangeCheckEval;
+use crate::air::components::gate::GateEval;
+use crate::air::components::program::ProgramEval;
+use crate::air::components::qubitmem::QubitMemEval;
+use crate::air::components::range_check::RangeCheckEval;
 use crate::preprocessed::{preprocessed_column_ids, N_PREPROCESSED_COLS};
 
 // The single drawn LogUp relation (shared by qubitmem / rc / program via a prepended tag; see

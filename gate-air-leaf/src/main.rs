@@ -11,8 +11,9 @@
 
 mod air; // AIR assembly (Components + shared LookupElements/GateRel + preprocessed layout + AIR consts).
 mod circuit_statement; // In-circuit verifier of the gate_air STARK proof.
-mod components; // Per-component FrameworkEvals + their relation ids (gate/program/qubitmem/range_check).
 mod fingerprint; // Proof-fingerprint helpers behind the env-gated hooks (distinct from the `diag` feature).
+#[cfg(feature = "gpu-cuda")]
+mod gpu_tracegen; // GPU (CUDA) trace-gen (sibling of tracegen; gpu-cuda-gated, pulls in cudarc).
 mod leaf;
 mod preprocessed; // PUBLIC preprocessed columns (verifier-known, positional): identity/order + shape-derived generators.
 mod prover; // Base (per-shard) gate_air prover, extracted from this file (mirrors `leaf.rs`).
@@ -58,11 +59,11 @@ use prover::*;
 // (not a glob) so the gate-local `tracegen::{TRACE_COLUMNS,GATE_REL_WIDTH}` gpu consts don't collide
 // with the crate-root shared consts of the same name.
 use tracegen::{
-    boundary_public_sum, boundary_public_term, build_rc_lo, build_rc_table, build_rows,
-    build_tree0_columns, gen_boundary_interaction, gen_program_interaction, gen_table_interaction,
-    generate_boundary_witness, generate_program_witness, generate_rc_witness, pack_seq,
-    program_claimed_sum, program_public_term, state_to_limbs, table_public_sum, to_prover,
-    BoundaryTable, RcIndex, Row,
+    boundary_public_sum, boundary_public_term, build_program_table, build_rc_lo, build_rc_table,
+    build_rows, build_tree0_columns, gen_boundary_interaction, gen_program_interaction,
+    gen_table_interaction, generate_boundary_witness, generate_program_witness,
+    generate_rc_witness, pack_seq, program_claimed_sum, program_public_term, state_to_limbs,
+    table_public_sum, to_prover, BoundaryTable, ProgramTable, RcIndex, Row,
 };
 // The CPU main-interaction generator is used only on the non-cuda prove path (the cuda path uses the
 // GPU K4 kernel), so gate its import to match.
@@ -634,7 +635,7 @@ fn prove_folded(
         #[cfg(feature = "cuda")]
         {
             if requested > 1 {
-                let visible = tracegen::backend_device_count();
+                let visible = gpu_tracegen::backend_device_count();
                 assert!(
                     visible >= requested,
                     "GATE_AIR_BASE_GPUS={requested} but only {visible} CUDA device(s) visible \
@@ -845,7 +846,7 @@ fn prove_folded(
                     let base_tx = base_tx.clone();
                     scope.spawn(move || {
                         #[cfg(feature = "cuda")]
-                        tracegen::set_base_gpu(gpu);
+                        gpu_tracegen::set_base_gpu(gpu);
                         // Class-1 SIGSEGV fix: a PRIVATE rayon pool whose workers are all bound to
                         // THIS producer's device (`gpu`), so the OODS-phase fan-outs inside
                         // `prove_base_shard` (`pcs/mod.rs` `build_weights_hash_map` par_iter + OODS
@@ -853,7 +854,8 @@ fn prove_folded(
                         // device-0 workers (which deref device-`gpu` pointers => SIGSEGV). Built
                         // once per producer; each `prove_base_shard` runs inside `pool.install`.
                         #[cfg(feature = "gpu-cuda")]
-                        let oods_pool = tracegen::build_device_bound_pool(gpu, oods_pool_threads);
+                        let oods_pool =
+                            gpu_tracegen::build_device_bound_pool(gpu, oods_pool_threads);
                         // Shards `s` in 0..n_shards with `s % g == gpu` are proved on this gpu.
                         for shard_idx in (0..n_shards).filter(|s| s % g == gpu) {
                             let tb = Instant::now();
@@ -1275,7 +1277,7 @@ fn prove_monolithic(
         // Device K1: 191 main columns generated on the GPU, fed in as device-resident BaseFieldVecs.
         let (gates_flat, x_states, off_lo, off_hi) =
             gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_lo_index)?;
-        let (main_dev, _lo, d_cols) = tracegen::gpu_gen_main_trace_device(
+        let (main_dev, _lo, d_cols) = gpu_tracegen::gpu_gen_main_trace_device(
             &gates_flat,
             &x_states,
             &off_lo,
@@ -1315,8 +1317,8 @@ fn prove_monolithic(
     // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
     // See `MainTrace::from_k1` / `gpu_gen_interaction_device`.
     #[cfg(feature = "cuda")]
-    let main_k1: tracegen::MainTrace =
-        tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
+    let main_k1: gpu_tracegen::MainTrace =
+        gpu_tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
 
     // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
     let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
@@ -1333,7 +1335,7 @@ fn prove_monolithic(
         // Install the downstream gate_air GPU constraint kernel into the generic CudaBackend prover,
         // then thread the drawn (z, alpha) challenges to it.
         gate_air_cuda_kernel::register();
-        let (z, alpha_powers) = tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
         gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
     }
 
@@ -1344,7 +1346,7 @@ fn prove_monolithic(
     // becomes `main_sum`. The CPU (SimdBackend) interaction gen survives only on the non-cuda build.
     #[cfg(feature = "cuda")]
     let main_interaction_device = {
-        let (cols, claimed) = tracegen::gpu_gen_interaction_device(
+        let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
             &main_k1,
             n_gates as u32,
             padded_rows,

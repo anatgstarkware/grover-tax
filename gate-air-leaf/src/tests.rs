@@ -27,9 +27,9 @@ use crate::preprocessed::{
     generate_boundary_preprocessed, generate_prog_slot_preprocessed, generate_rc_preprocessed,
 };
 // Per-component evals + relation ids (module reorg); imported from their owning component files.
-use crate::components::program::ProgramEval;
-use crate::components::qubitmem::QubitMemEval;
-use crate::components::range_check::{RangeCheckEval, TAG_RC};
+use crate::air::components::program::ProgramEval;
+use crate::air::components::qubitmem::QubitMemEval;
+use crate::air::components::range_check::{RangeCheckEval, TAG_RC};
 // Serializes the concurrent GPU byte-identity tests; only referenced by the `cuda,diag` tests.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 use serial_test::serial;
@@ -211,7 +211,7 @@ fn on_trace_constraints_all() {
 // ========================================================================
 
 /// (T1a) `k1_trace_identity` — GPU K1 main trace == CPU recompute, cell-by-cell + rc histogram.
-/// Promotes the `tracegen::k1_byte_identity` harness (formerly reachable only via the removed
+/// Promotes the `gpu_tracegen::k1_byte_identity` harness (formerly reachable only via the removed
 /// `GATE_AIR_GPU_TEST=k1` prove-path flag) to a real test.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
@@ -219,19 +219,19 @@ fn on_trace_constraints_all() {
 fn k1_trace_identity() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let rc_lo = build_rc_lo();
-    tracegen::k1_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
+    gpu_tracegen::k1_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
         .expect("GPU K1 main trace != CPU recompute");
 }
 
 /// (T1b) `k4_interaction_identity` — GPU K4 LogUp interaction == CPU recompute. Promotes the
-/// `tracegen::k4_byte_identity` harness (formerly `GATE_AIR_GPU_TEST=k4`) to a real test.
+/// `gpu_tracegen::k4_byte_identity` harness (formerly `GATE_AIR_GPU_TEST=k4`) to a real test.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
 #[serial]
 fn k4_interaction_identity() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let rc_lo = build_rc_lo();
-    tracegen::k4_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
+    gpu_tracegen::k4_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
         .expect("GPU K4 interaction != CPU recompute");
 }
 
