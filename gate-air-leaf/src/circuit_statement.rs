@@ -24,17 +24,20 @@ use indexmap::IndexMap;
 use stwo::core::fields::qm31::QM31;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
-use crate::leaf::ProgramRows;
-use crate::{
-    pp_id, preprocessed_column_ids, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, TAG_PROGRAM,
-    TAG_PROGRAM_PUB, TAG_QUBITMEM, TAG_RC, TRACE_COLUMNS, TS_FINAL,
+use crate::air::{
+    pp_id, preprocessed_column_ids, ACCESS_BLOCK, ACCESS_COLS, LIMB_BITS, N_LIMBS, TRACE_COLUMNS,
+    TS_FINAL,
 };
+use crate::components::program::{TAG_PROGRAM, TAG_PROGRAM_PUB};
+use crate::components::qubitmem::TAG_QUBITMEM;
+use crate::components::range_check::TAG_RC;
+use crate::leaf::ProgramRows;
 
 // Table components consume no relation, so `relation_uses_per_row` is empty (like cairo's range_check_12).
 const NO_RELATION_USES: [RelationUse; 0] = [];
 const ONE_TERM_INTERACTION_COLUMNS: usize = 4;
 
-/// Program-consistency table (supply). Mirrors main.rs `ProgramTableEval`: emits an internal `-mult`
+/// Program-consistency table (supply). Mirrors `components::program::ProgramEval`: emits an internal `-mult`
 /// term on TAG_PROGRAM (cancels main's demand) and a public `+mult` term on TAG_PROGRAM_PUB (the
 /// dangling P_pub), paired into one batch (4 interaction cols).
 pub struct ProgramTable;
@@ -82,7 +85,7 @@ impl<Value: IValue> CircuitEval<Value> for ProgramTable {
 }
 
 /// Qubit-memory boundary table (supply). `shot`/`addr` preprocessed; `x`/`y`/`ts_last` witness.
-/// PHASE-3 re-keyed boundary (mirrors main.rs `BoundaryTableEval`): emits on TAG_QUBITMEM the internal
+/// PHASE-3 re-keyed boundary (mirrors `components::qubitmem::QubitMemEval`): emits on TAG_QUBITMEM the internal
 /// final Use[+1](shot,addr,ts_last,y) + the PUBLIC final Yield[-1](shot,addr,TS_FINAL,y). `x` is
 /// booleanity-checked only (main carries x publicly at ts=0). Two terms/row => 1 batch => 4 cols.
 pub struct BoundaryTable;
@@ -114,7 +117,7 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
         let shot = acc.get_preprocessed_column(&pp_id("gate_bnd_shot"));
         let addr = acc.get_preprocessed_column(&pp_id("gate_bnd_addr"));
         // Real-row enabler (1 real, 0 padding): gates the emission so non-power-of-two n_shots*512
-        // padding rows inject no unmatched LogUp terms. Mirrors main.rs BoundaryTableEval.
+        // padding rows inject no unmatched LogUp terms. Mirrors QubitMemEval.
         let bnd_enabler = acc.get_preprocessed_column(&pp_id("gate_bnd_enabler"));
         let one = context.one();
         // Booleanity of the boundary values.
@@ -135,7 +138,7 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
 }
 
 /// ts-ordering range-check table (supply). `val` preprocessed (val[i]=i over [0,2^R)); `multiplicity`
-/// witness. Mirrors main.rs `RcTableEval`: emits -multiplicity / (TAG_RC, val). One term/row => 4 cols.
+/// witness. Mirrors `components::range_check::RangeCheckEval`: emits -multiplicity / (TAG_RC, val). One term/row => 4 cols.
 pub struct RcTable;
 impl<Value: IValue> CircuitEval<Value> for RcTable {
     fn name(&self) -> String {

@@ -9,14 +9,14 @@
 //! This binary is self-contained so the existing `native-iadd-air` binary
 //! (src/main.rs) keeps building unchanged.
 
-mod base; // Base (per-shard) gate_air prover, extracted from this file (mirrors `leaf.rs`).
+mod air; // AIR assembly (Components + shared LookupElements/GateRel + preprocessed layout + AIR consts).
 mod circuit_statement; // In-circuit verifier of the gate_air STARK proof.
+mod components; // Per-component FrameworkEvals + their relation ids (gate/program/qubitmem/range_check).
 mod fingerprint; // Proof-fingerprint helpers behind the env-gated hooks (distinct from the `diag` feature).
-#[cfg(feature = "gpu-cuda")]
-mod gpu_tracegen;
 mod leaf;
-mod recursion_consts; // PINNED recursion constants, keyed per operating point.
-mod topology; // Free topology params + env-var knob layer.
+mod prover; // Base (per-shard) gate_air prover, extracted from this file (mirrors `leaf.rs`).
+mod recursion_consts;
+mod tracegen; // Trace / witness generation (CPU column builders + LogUp gens + absorbed GPU trace-gen). // PINNED recursion constants, keyed per operating point.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -26,59 +26,57 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 #[allow(unused_imports)]
 use itertools::Itertools;
-use num_traits::{One, Zero};
+use num_traits::Zero;
 use serde::Deserialize;
-use stwo::core::air::Component;
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::fields::FieldExpOps;
-use stwo::core::pcs::{CommitmentSchemeVerifier, TreeVec};
+use stwo::core::pcs::CommitmentSchemeVerifier;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::verify;
-use stwo::core::ColumnVec;
-use stwo::prover::backend::simd::m31::{PackedM31, LOG_N_LANES};
-use stwo::prover::backend::simd::qm31::PackedSecureField;
+use stwo::prover::backend::simd::m31::LOG_N_LANES;
 // Trace-gen backend is ALWAYS SimdBackend (columns are built with CPU column ops); `to_prover`
 // bridges to `ProverBackend` at the `extend_evals` boundary (a real host->device upload under cuda).
 use circuits_stark_verifier::proof_from_stark_proof::pack_public_claim;
 use stwo::core::proof_of_work::GrindOps;
-use stwo::prover::backend::simd::SimdBackend as TraceBackend;
 #[cfg(not(feature = "cuda"))]
 use stwo::prover::backend::simd::SimdBackend as ProverBackend;
 #[cfg(feature = "cuda")]
 use stwo::prover::backend::CudaBackend as ProverBackend;
-use stwo::prover::backend::{Col, Column};
-use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
-use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::{prove_ex, CommitmentSchemeProver};
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
-use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator, Relation, RelationEntry,
-    TraceLocationAllocator,
+use stwo_constraint_framework::Relation;
+
+use air::*;
+use components::range_check::TAG_RC;
+use prover::*;
+
+// Trace/witness-generation items relocated to `tracegen` (Step-1 module reorg). Imported explicitly
+// (not a glob) so the gate-local `tracegen::{TRACE_COLUMNS,GATE_REL_WIDTH}` gpu consts don't collide
+// with the crate-root shared consts of the same name.
+use tracegen::{
+    boundary_public_sum, boundary_public_term, build_rc_lo, build_rc_table, build_rows,
+    build_tree0_columns, gen_boundary_interaction, gen_program_interaction, gen_table_interaction,
+    generate_boundary_witness, generate_program_witness, generate_rc_witness, pack_seq,
+    program_claimed_sum, program_public_term, state_to_limbs, table_public_sum, to_prover,
+    BoundaryTable, RcIndex, Row,
 };
-// Only used by the `#[cfg(test)]` on-trace constraint helpers (T5).
-#[cfg(test)]
-use stwo_constraint_framework::assert_constraints_on_trace;
+// The CPU main-interaction generator is used only on the non-cuda prove path (the cuda path uses the
+// GPU K4 kernel), so gate its import to match.
+#[cfg(not(feature = "cuda"))]
+use tracegen::gen_main_interaction;
+#[cfg(feature = "cuda")]
+use tracegen::gpu_flat_inputs;
 
-use base::*;
-use topology::TopologyConfig;
+/// Default shots per base shard (partition knob). `n_shards = ceil(samples / shots_per_shard)`.
+/// Env override `RECURSION_SHARD_SHOTS` (`> 0`) is parsed in `main`.
+const SHOTS_PER_SHARD: usize = 2;
 
-// Encoding constants
-const N_QUBITS: usize = 512;
-const LIMB_BITS: usize = 16;
-const N_LIMBS: usize = N_QUBITS / LIMB_BITS; // 32
-const STATE_BYTES: usize = N_QUBITS / 8; // 64
-
-/// Production log-size `R` of the ts-ordering range-check (rc) supply table: a single block
-/// enumerating `[0, 2^RC_LOG)` with `val[i] = i`, so one lookup per access checks
-/// `d = pc - prev_ts ∈ [0, 2^RC_LOG)`. FIXED at 2^25 (sized for the k≈8000 target). The PUBLIC,
-/// trusted `R` (never read from a proof), threaded into the base prover + `GateAirStatement`; tests
-/// pass their own small `R`. Sound while every honest `d` fits: `d_max = k*n_gates - 1 < 2^RC_LOG`
-/// (k ≲ 8000; base prove-entry `debug_assert` guards it). `LOG_N_LANES <= rc_log <= log_n_rows` and
-/// `2^RC_LOG < p`, so no SIMD underflow, field wrap, or raised FRI floor.
-pub(crate) const RC_LOG: u32 = 25;
+/// Parse env var `k` into `T`, `None` if unset or unparseable. The binary's sole env-parsing helper.
+fn parse_env<T: std::str::FromStr>(k: &str) -> Option<T> {
+    std::env::var(k).ok().and_then(|s| s.parse().ok())
+}
 
 /// Log-size of the tree-0 twiddle / eval (committed) domain: the MAX over every committed column's
 /// log-size (`main` = `log_n_rows`, the `rc` membership table = `rc_log`, the `program` table, the
@@ -98,91 +96,6 @@ pub(crate) fn tree0_max_log_size(
         .max(rc_log)
         .max(program_log_size)
         .max(boundary_log_size)
-}
-
-// Interaction-trace proof-of-work bits (canonical transcript; matches the in-circuit verifier's
-// ProofConfig). Tiny grind (~2^8), present so the in-circuit verifier can replay the transcript.
-const INTERACTION_POW_BITS: u32 = 8;
-
-const NO_CTRL: u16 = 0xFFFF;
-
-// Timestamp/range-check soundness (authoritative spot). `ts = pc + 1`, `pc` the PREPROCESSED,
-// verifier-pinned per-shot program counter — so ts is a fixed affine function of pc the prover cannot
-// reorder, and ts is inlined (not a witness column). The `+1` keeps the smallest real ts = 1 > 0 =
-// the init boundary node's ts (plain `pc` would collide pc=0's accesses with init). Within a gate step
-// the (<=3) accesses hit distinct addresses, so sharing ts = pc+1 never collides two on one chain;
-// same-address accesses are in different steps (distinct pc), so their ts strictly increases.
-//
-// The diff `d = pc - prev_ts` is a SINGLE 25-bit column, proven in [0, 2^RC_LOG) by one LogUp lookup
-// into the EXACT-range rc table (no slack). Honest `d <= k*n_gates - 1 < 2^RC_LOG` (completeness); the
-// bound < p (RC_LOG <= TS_RC_BITS = 25) means the field subtraction cannot wrap, so a cyclic stale-read
-// chain is impossible. pc-pinned ts (program order) + `prev_ts < ts` on every access ⇒ forward DAG.
-const TS_RC_BITS: usize = 25;
-
-const M31_MODULUS_U32: u32 = (1 << 31) - 1;
-const LANE_COUNT: usize = 1 << LOG_N_LANES;
-
-// ONE shared LogUp relation (single drawn (z,α)); logical relations are distinguished by a distinct id
-// TAG prepended as the first tuple element, matching the in-circuit verifier's single-relation model
-// one acc.interaction_elements, relation id as a constant in the tuple). Width =
-// widest payload (program = slot,opcode,target,ctrl_a,ctrl_b = 5) + 1 tag = 6.
-#[allow(dead_code)]
-const GATE_REL_WIDTH: usize = 6;
-stwo_constraint_framework::relation!(GateRel, 6);
-
-// Relation id tags (distinct constants; prover and in-circuit verifier must agree). TAG_QUBITMEM =
-// per-qubit chain-lookup relation; TAG_RC = ts-ordering range-check (main looks up `d` as (TAG_RC, d),
-// the rc table supplies (TAG_RC, value) for value in [0, 2^RC_LOG)).
-const TAG_QUBITMEM: u32 = 1;
-const TAG_RC: u32 = 2;
-const TAG_PROGRAM: u32 = 5;
-// H_P program binding. The program table emits `-mult` on TAG_PROGRAM (internal, cancels main's
-// demand) and `+mult` on TAG_PROGRAM_PUB (public dangling term P_pub in `program_sum`). The leaf
-// supplies −P_pub over its guessed program Vars — which it also hashes into H_P — binding H_P to the
-// executed program. A distinct tag is required (reusing TAG_PROGRAM would make the +mult cancel the
-// −mult, vacuous). CPU-side (`gen_program_interaction`), not in the GPU K4 (MAIN-only) kernel.
-const TAG_PROGRAM_PUB: u32 = 6;
-
-// x/y binding: the boundary's final `y` is re-keyed to a FIXED public ts `TS_FINAL` so it surfaces as
-// an unconsumed public LogUp term (the leaf supplies the matching term over its guessed x/y, forcing
-// guessed == committed). TS_FINAL must exceed every real ts (0..=k*n_gates) and be a valid M31, so the
-// public tuples never alias an interior chain node: 2^30 < p and >> any real ts.
-const TS_FINAL: u32 = 1 << 30;
-
-/// The logical relations share the SAME drawn `(z,α)` (clones of one `GateRel`); the tag prepended at
-/// each combine is what keeps them separate.
-#[derive(Clone)]
-struct LookupElements {
-    qubitmem: GateRel,
-    rc: GateRel,
-    program: GateRel,
-}
-
-impl LookupElements {
-    fn draw(channel: &mut impl Channel) -> Self {
-        let rel = GateRel::draw(channel);
-        Self {
-            qubitmem: rel.clone(),
-            rc: rel.clone(),
-            program: rel,
-        }
-    }
-
-    /// Fixed challenges for byte-identity tests. Used by the K4 GPU interaction validation.
-    #[cfg(feature = "gpu-cuda")]
-    fn dummy() -> Self {
-        let rel = GateRel::dummy();
-        Self {
-            qubitmem: rel.clone(),
-            rc: rel.clone(),
-            program: rel,
-        }
-    }
-}
-
-/// Packed tag constant for prover-side `combine` tuples.
-fn ptag(tag: u32) -> PackedM31 {
-    PackedM31::broadcast(BaseField::from_u32_unchecked(tag))
 }
 
 // CLI / fixture
@@ -232,11 +145,6 @@ struct Gate {
     ctrl_b: u16,
 }
 
-const OP_NOP: u8 = 0;
-const OP_NOT: u8 = 1;
-const OP_CNOT: u8 = 2;
-const OP_TOFFOLI: u8 = 3;
-
 fn parse_gtv1(hex_str: &str) -> Result<Vec<Gate>> {
     let bytes = hex::decode(hex_str).context("decoding circuit hex")?;
     if bytes.len() < 8 || &bytes[0..4] != b"GTV1" {
@@ -272,336 +180,6 @@ fn parse_gtv1(hex_str: &str) -> Result<Vec<Gate>> {
 
 // State helpers (16-bit limbs)
 
-fn state_to_limbs(bytes: &[u8]) -> [u32; N_LIMBS] {
-    debug_assert_eq!(bytes.len(), STATE_BYTES);
-    let mut limbs = [0u32; N_LIMBS];
-    for (j, limb) in limbs.iter_mut().enumerate() {
-        let lo = bytes[2 * j] as u32;
-        let hi = bytes[2 * j + 1] as u32;
-        *limb = lo | (hi << 8);
-    }
-    limbs
-}
-
-#[allow(dead_code)] // used by the cuda/gpu-cuda trace-gen + byte-identity paths
-fn limbs_to_state(limbs: &[u32; N_LIMBS]) -> [u8; STATE_BYTES] {
-    let mut out = [0u8; STATE_BYTES];
-    for (j, &limb) in limbs.iter().enumerate() {
-        out[2 * j] = (limb & 0xFF) as u8;
-        out[2 * j + 1] = ((limb >> 8) & 0xFF) as u8;
-    }
-    out
-}
-
-#[inline]
-#[allow(dead_code)] // used by the cuda/gpu-cuda trace-gen + byte-identity paths
-fn qubit_decode(q: u16) -> (u32, u32, u32) {
-    let limb_idx = (q as u32) / LIMB_BITS as u32;
-    let bit_pos = (q as u32) % LIMB_BITS as u32;
-    let mask = 1u32 << bit_pos;
-    (limb_idx, bit_pos, mask)
-}
-
-// Witness row
-
-/// One qubit-memory access (chain lookup) for target / ctrl_a / ctrl_b.
-/// The access timestamp is NOT a witness column: it is the affine function `ts = pc + 1` of the
-/// verifier-pinned preprocessed `pc`, inlined at every use site. `prev_ts` is the ts of the previous
-/// access to this addr (0 = the init boundary node). `d` is the ordering diff
-/// `d = ts - prev_ts - 1 = (pc+1) - prev_ts - 1 = pc - prev_ts`, range-checked by a SINGLE LogUp
-/// lookup into the dynamic rc supply table (`d ∈ [0, 2^RC_LOG_SIZE)`), proving `prev_ts < ts`
-/// (forward-DAG / no-stale-read). `active` gates the terms.
-#[derive(Clone, Copy)]
-struct AccessCols {
-    addr: u32,    // qubit index 0..511 (0 when inactive, matches program canon)
-    prev_ts: u32, // predecessor's ts at this addr (0 if this is the first access)
-    v: u32,       // v_before (the value read); for a control this is also v_after
-    d: u32, // ts-ordering diff d = ts - prev_ts - 1 = pc - prev_ts (range-checked into [0,2^RC_LOG_SIZE))
-}
-
-impl AccessCols {
-    fn inactive() -> Self {
-        Self {
-            addr: 0,
-            prev_ts: 0,
-            v: 0,
-            d: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Row {
-    enabler: u32,
-    is_nop: u32,
-    is_not: u32,
-    is_cnot: u32,
-    is_toffoli: u32,
-    shot_id: u32,
-    pc: u32,
-    target: AccessCols,
-    // NOTE: the target's post-gate value `v_after` is NOT a witness column — it equals
-    // `v_before + delta` (a pinned equality), inlined at every use site.
-    ctrl_a: AccessCols,
-    ctrl_b: AccessCols,
-    ab: u32,
-    fire: u32,
-    delta: u32, // v_after - v_before, signed in {-1,0,1}; stored as M31.
-}
-
-impl Row {
-    fn padding() -> Self {
-        Self {
-            enabler: 0,
-            is_nop: 0,
-            is_not: 0,
-            is_cnot: 0,
-            is_toffoli: 0,
-            shot_id: 0,
-            pc: 0,
-            target: AccessCols::inactive(),
-            ctrl_a: AccessCols::inactive(),
-            ctrl_b: AccessCols::inactive(),
-            ab: 0,
-            fire: 0,
-            delta: 0,
-        }
-    }
-}
-
-// Column layout. Per row, one access block = ACCESS_COLS core + 1 rc diff col:
-//   is_nop,is_not,is_cnot,is_toffoli                                 (4)
-//   target access: addr,prev_ts,v_before, d                         (ACCESS_BLOCK)
-//   ctrl_a access: addr,prev_ts,v, d                                 (ACCESS_BLOCK)
-//   ctrl_b access: addr,prev_ts,v, d                                 (ACCESS_BLOCK)
-//   ab, fire, delta                                                  (3)
-// `enabler`/`shot_id`/`pc` are shard-invariant positional values in the preprocessed tree0. `ts =
-// pc + 1` and the target `v_after = v_before + delta` are NOT columns — inlined (see TS_RC_BITS above).
-const ACCESS_COLS: usize = 3; // addr, prev_ts, v (core access cols; ts inlined = pc+1)
-const ACCESS_BLOCK: usize = ACCESS_COLS + 1; // core cols + the single rc diff col `d`
-const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS_BLOCK + 3; // 4 + 3*4 + 3 = 19
-
-fn delta_to_m31(delta: i64) -> u32 {
-    // delta in {-1,0,1}, represented in M31.
-    if delta >= 0 {
-        delta as u32
-    } else {
-        (M31_MODULUS_U32 as i64 + delta) as u32
-    }
-}
-
-// Witness generation + self-check
-
-/// Build all witness rows for the selected shots, asserting each shot's final state matches y_hex.
-/// Parallelizes over SHOTS (each owns a disjoint contiguous row block, chained in order within the
-/// shot), trace-bit-identical to serial; packing into `PackedM31` happens later single-threaded/word.
-fn build_rows(gates: &[Gate], cases: &[TestCase], k: usize) -> Result<(Vec<Row>, BoundaryTable)> {
-    use rayon::prelude::*;
-
-    let n_gates = gates.len();
-    let shot_rows = k * n_gates;
-    let total_rows = cases.len() * shot_rows;
-
-    // LOUD completeness guard (not debug_assert): the max honest ts diff d_max = k*n_gates - 1 must
-    // stay below 2^TS_RC_BITS, else the rc-table range-check would silently REJECT honest proofs.
-    let d_max: u64 = (k as u64) * (n_gates as u64) - 1;
-    if d_max >= (1u64 << TS_RC_BITS) {
-        bail!(
-            "ts-ordering range-check budget exceeded: k*n_gates = {}*{} makes the max ts diff d_max = {} >= 2^{} \
-             (the rc-table bound); honest proofs would silently fail the range-check. Widen TS_RC_BITS / the rc-limb split.",
-            k, n_gates, d_max, TS_RC_BITS
-        );
-    }
-
-    // Pre-allocate the full scalar row buffer; each shot fills a disjoint block.
-    let mut rows = vec![Row::padding(); total_rows];
-    // Per-shot boundary rows: 512 entries per shot, holding init/final (x, y, ts_last).
-    let mut boundary = BoundaryTable::new(cases.len());
-
-    // Phase 1: simulate every shot in parallel into its own disjoint row block +
-    // boundary block. Returns Err on the first shot whose simulation fails or whose
-    // final state mismatches y_hex.
-    let per_shot: Vec<Result<()>> = rows
-        .par_chunks_mut(shot_rows)
-        .zip(boundary.per_shot_mut().par_iter_mut())
-        .zip(cases.par_iter())
-        .enumerate()
-        .map(|(shot_id, ((block, bnd), case))| simulate_shot(gates, k, shot_id, case, block, bnd))
-        .collect();
-
-    for result in per_shot {
-        result?;
-    }
-
-    Ok((rows, boundary))
-}
-
-/// One memory access: reads (prev_ts, v_before) from `last_*[addr]`; the access ts is the inlined
-/// program-order `pc + 1`. Returns the `AccessCols` with `v = v_before` and the single rc diff
-/// `d = ts - prev_ts - 1 = pc - prev_ts` (>= 0) that the rc-table lookup range-checks. The caller
-/// updates `last_*[addr]` to the post-access ts/value.
-fn do_access(addr: u32, pc: u32, last_ts: &[u32], last_val: &[u32]) -> AccessCols {
-    let a = addr as usize;
-    let prev_ts = last_ts[a];
-    let v_before = last_val[a];
-    let ts = pc + 1;
-    debug_assert!(
-        ts > prev_ts,
-        "ts {ts} must exceed prev_ts {prev_ts} (program order)"
-    );
-    let d = ts - prev_ts - 1; // = pc - prev_ts; completeness (d < 2^TS_RC_BITS) checked in build_rows.
-    debug_assert!(
-        (d as u64) < (1u64 << TS_RC_BITS),
-        "diff {d} exceeds range-check bound"
-    );
-    AccessCols {
-        addr,
-        prev_ts,
-        v: v_before,
-        d,
-    }
-}
-
-/// Simulate a single shot sequentially, filling its row block: the chain (K reps * n_gates gates) is
-/// run strictly in order, threading the 512-bit state from x_s to y_s, checked against y_hex.
-fn simulate_shot(
-    gates: &[Gate],
-    k: usize,
-    shot_id: usize,
-    case: &TestCase,
-    block: &mut [Row],
-    bnd: &mut [BoundaryRow],
-) -> Result<()> {
-    let n_gates = gates.len();
-    let x = hex::decode(&case.x_hex).context("decoding x_hex")?;
-    let y = hex::decode(&case.y_hex).context("decoding y_hex")?;
-    if x.len() != STATE_BYTES || y.len() != STATE_BYTES {
-        bail!("state must be {STATE_BYTES} bytes");
-    }
-    debug_assert_eq!(bnd.len(), N_QUBITS);
-
-    // Per-shot qubit-memory state: last[addr] = (ts, value). Reset each shot.
-    // `ts` is the PROGRAM-ORDER timestamp `pc + 1`: an affine function of the preprocessed pc, so an
-    // address's accesses are timestamped in program order and cannot be reordered by the prover.
-    let x_bit = |addr: usize| -> u32 { qubit_bit(&x, addr) };
-    let mut last_ts = vec![0u32; N_QUBITS];
-    let mut last_val: Vec<u32> = (0..N_QUBITS).map(x_bit).collect();
-    let mut pc: u32 = 0;
-    let mut row_idx = 0usize;
-
-    for _rep in 0..k {
-        for gate in gates {
-            let (is_nop, is_not, is_cnot, is_toffoli) = match gate.opcode {
-                OP_NOP => (1, 0, 0, 0),
-                OP_NOT => (0, 1, 0, 0),
-                OP_CNOT => (0, 0, 1, 0),
-                OP_TOFFOLI => (0, 0, 0, 1),
-                other => bail!("unknown opcode {other}"),
-            };
-            let a_active = is_cnot + is_toffoli;
-            let b_active = is_toffoli;
-
-            // Control reads first (they feed the gate-apply), then target read+write. ts is the
-            // program-order timestamp `pc + 1`, shared by all accesses of this gate step (no slot).
-            // The three accesses of a gate touch DISTINCT addrs (a reversible gate can't use its
-            // target as a control), so sharing ts within the step never collides two accesses on the
-            // same per-address chain; two accesses to the same addr are in different steps (distinct
-            // pc), so they still get strictly increasing ts. In iadd the three accesses touch distinct
-            // addrs.
-            let ts = pc + 1;
-            let ctrl_a = if a_active == 1 {
-                debug_assert_ne!(gate.ctrl_a, NO_CTRL);
-                let ac = do_access(gate.ctrl_a as u32, pc, &last_ts, &last_val);
-                last_ts[gate.ctrl_a as usize] = ts;
-                // read: value propagates unchanged.
-                ac
-            } else {
-                AccessCols::inactive()
-            };
-            let ctrl_b = if b_active == 1 {
-                debug_assert_ne!(gate.ctrl_b, NO_CTRL);
-                let ac = do_access(gate.ctrl_b as u32, pc, &last_ts, &last_val);
-                last_ts[gate.ctrl_b as usize] = ts;
-                ac
-            } else {
-                AccessCols::inactive()
-            };
-            let target = do_access(gate.target as u32, pc, &last_ts, &last_val);
-
-            let a_bit = ctrl_a.v;
-            let b_bit = ctrl_b.v;
-            let t_bit = target.v;
-            let ab = a_bit * b_bit;
-            let fire = is_not + is_cnot * a_bit + is_toffoli * ab;
-            debug_assert!(fire <= 1);
-            let v_after = t_bit ^ fire;
-            let delta_signed = v_after as i64 - t_bit as i64;
-
-            // Commit the target write to memory (ts = pc+1, inlined).
-            last_ts[gate.target as usize] = ts;
-            last_val[gate.target as usize] = v_after;
-
-            block[row_idx] = Row {
-                enabler: 1,
-                is_nop,
-                is_not,
-                is_cnot,
-                is_toffoli,
-                shot_id: shot_id as u32,
-                pc,
-                target,
-                ctrl_a,
-                ctrl_b,
-                ab,
-                fire,
-                delta: delta_to_m31(delta_signed),
-            };
-
-            pc += 1;
-            row_idx += 1;
-        }
-    }
-    debug_assert_eq!(row_idx, k * n_gates);
-
-    // Boundary rows: init x, final y (== last_val), ts_last (0 if untouched).
-    for addr in 0..N_QUBITS {
-        let y_bit = qubit_bit(&y, addr);
-        // Self-check: simulated final value equals y's bit at this addr.
-        if last_val[addr] != y_bit {
-            bail!(
-                "shot {shot_id}: simulated final qubit {addr} = {} != y bit {}",
-                last_val[addr],
-                y_bit
-            );
-        }
-        bnd[addr] = BoundaryRow {
-            shot_id: shot_id as u32,
-            addr: addr as u32,
-            x: x_bit(addr),
-            y: y_bit,
-            ts_last: last_ts[addr],
-        };
-    }
-
-    Ok(())
-}
-
-/// Bit `addr` of a little-endian byte state (bit `addr` = byte `addr/8`, bit `addr%8`).
-#[inline]
-fn qubit_bit(bytes: &[u8], addr: usize) -> u32 {
-    ((bytes[addr / 8] >> (addr % 8)) & 1) as u32
-}
-
-// rc supply table: a single 2^R-row block enumerating exactly [0, 2^R) with `val[i] = i` (R = rc_log;
-// no pos selector, no split). Main looks up (TAG_RC, d) per active access; the table supplies
-// -multiplicity / (TAG_RC, value), pinning d < 2^R with no slack (see RC_LOG / TS_RC_BITS above).
-
-// Boundary table: per (shot, addr) emits on TAG_QUBITMEM the INTERNAL final Use[+1](shot,addr,ts_last,y)
-// (cancels main's last chain Yield) and the PUBLIC final Yield[-1](shot,addr,TS_FINAL,y) (re-keys y to
-// the fixed public ts). `shot`/`addr` preprocessed; `x`/`y`/`ts_last` witness (`x` booleanity-only —
-// main carries x publicly via its ts=0 init Use). Nets to the public term B = Σ(+[0,x] − [TS_FINAL,y]),
-// which the leaf's public_logup_sum matches over guessed x/y.
-
 /// Convert a committed `ProgramTable` into the leaf's `ProgramRows`. Same per-slot
 /// tuple the base commits + the leaf binds via TAG_PROGRAM_PUB and hashes into H_P.
 fn program_rows_from_table(prog: &ProgramTable) -> leaf::ProgramRows {
@@ -628,1083 +206,6 @@ fn hiding_nonce() -> [u32; 2] {
     [0x1234_5678, 0x9abc_def0]
 }
 
-// FrameworkEval
-
-// Table FrameworkEvals (supply side of each lookup table)
-
-/// Qubit-memory boundary table (supply side). Per (shot, addr) — `shot`/`addr` preprocessed,
-/// `x`/`y`/`ts_last` witness — emits on TAG_QUBITMEM the chain head + tail:
-///   init  Yield[-1](shot, addr, 0, x)
-///   final Use [+1](shot, addr, ts_last, y)
-/// Two terms/row => 1 batch. Booleanity on x, y (1-bit values).
-#[derive(Clone)]
-struct BoundaryTableEval {
-    log_size: u32,
-    elements: GateRel,
-}
-
-impl FrameworkEval for BoundaryTableEval {
-    fn log_size(&self) -> u32 {
-        self.log_size
-    }
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size + 1
-    }
-    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let one = E::F::one();
-        let shot = eval.get_preprocessed_column(pp_id("gate_bnd_shot"));
-        let addr = eval.get_preprocessed_column(pp_id("gate_bnd_addr"));
-        // Real-row enabler (1 on real (shot,addr), 0 on padding). Gates the boundary emission so
-        // padding rows (non-power-of-two n_shots*N_QUBITS) inject no unmatched LogUp terms.
-        let bnd_enabler = eval.get_preprocessed_column(pp_id("gate_bnd_enabler"));
-        let x = eval.next_trace_mask();
-        let y = eval.next_trace_mask();
-        let ts_last = eval.next_trace_mask();
-        // Booleanity of the boundary values.
-        eval.add_constraint(x.clone() * (x.clone() - one.clone()));
-        eval.add_constraint(y.clone() * (y.clone() - one.clone()));
-
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_QUBITMEM);
-        let ts_final = E::F::one() * BaseField::from_u32_unchecked(TS_FINAL);
-        // Phase-3 x/y binding (re-keyed boundary). The init anchor is NO LONGER consumed here:
-        // main's first Use +1/(shot,addr,0,x) is left DANGLING as a PUBLIC term. The boundary now
-        //   (B) INTERNAL final Use  +1 / (shot, addr, ts_last, y)  -> cancels main's last Yield.
-        //   (D) PUBLIC  final Yield -1 / (shot, addr, TS_FINAL, y)  -> re-keys y to a fixed public ts.
-        // Net base claimed_sum (per shot,addr) = +[0,x] − [TS_FINAL,y]; the leaf's public_logup_sum
-        // supplies −that over its guessed x/y, so the verifier balance forces guessed == committed.
-        // (`x` is retained as a witness column with its booleanity constraint above; it is no longer
-        // emitted by the boundary — it lives only on main's dangling init term.)
-        // (B) internal final Use[+bnd_enabler]: +bnd_enabler / (shot, addr, ts_last, y).
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            E::EF::from(bnd_enabler.clone()),
-            &[tag.clone(), shot.clone(), addr.clone(), ts_last, y.clone()],
-        ));
-        // (D) public final Yield[-bnd_enabler]: -bnd_enabler / (shot, addr, TS_FINAL, y).
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            -E::EF::from(bnd_enabler),
-            &[tag, shot, addr, ts_final, y],
-        ));
-        eval.finalize_logup_in_pairs();
-        eval
-    }
-}
-
-/// Program-consistency table (supply side). Slot index is preprocessed; the op
-/// fields (opcode_scalar, target, ctrl_a, ctrl_b) are WITNESS (the hidden
-/// program) and the multiplicity column counts executions of that slot (K*N on
-/// real slots, 0 on padding). Emits -multiplicity / combine(slot, op...).
-#[derive(Clone)]
-struct ProgramTableEval {
-    log_size: u32,
-    elements: GateRel,
-}
-
-impl FrameworkEval for ProgramTableEval {
-    fn log_size(&self) -> u32 {
-        self.log_size
-    }
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size + 1
-    }
-    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let slot = eval.get_preprocessed_column(pp_id("gate_prog_slot"));
-        let opcode_scalar = eval.next_trace_mask();
-        let target = eval.next_trace_mask();
-        let ctrl_a = eval.next_trace_mask();
-        let ctrl_b = eval.next_trace_mask();
-        let multiplicity = eval.next_trace_mask();
-        // H_P binding (Fork A): two supply terms, paired into ONE batch (so the program interaction
-        // stays 4 columns — no tree2 layout shift, no GPU K4 change):
-        //   (internal, -mult) / combine(TAG_PROGRAM,     slot, op, t, a, b)  -> cancels main's demand
-        //   (public,   +mult) / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)  -> dangling P_pub
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_PROGRAM);
-        let tag_pub = E::F::one() * BaseField::from_u32_unchecked(TAG_PROGRAM_PUB);
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            -E::EF::from(multiplicity.clone()),
-            &[
-                tag,
-                slot.clone(),
-                opcode_scalar.clone(),
-                target.clone(),
-                ctrl_a.clone(),
-                ctrl_b.clone(),
-            ],
-        ));
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            E::EF::from(multiplicity),
-            &[tag_pub, slot, opcode_scalar, target, ctrl_a, ctrl_b],
-        ));
-        eval.finalize_logup_in_pairs();
-        eval
-    }
-}
-
-/// ts-ordering range-check table (supply side). `val` is preprocessed (the table membership,
-/// val[i]=i over [0,2^log_size)); `multiplicity` is witness (count of real `d` lookups landing on
-/// this row). Emits -multiplicity / combine(TAG_RC, val) — one term/row => 1 batch => 4 interaction
-/// columns. `log_size` is the trusted construction input `R = rc_log` (production: RC_LOG = 25).
-#[derive(Clone)]
-struct RcTableEval {
-    log_size: u32,
-    elements: GateRel,
-}
-
-impl FrameworkEval for RcTableEval {
-    fn log_size(&self) -> u32 {
-        self.log_size
-    }
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.log_size() + 1
-    }
-    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let val = eval.get_preprocessed_column(pp_id("gate_rc_val"));
-        let multiplicity = eval.next_trace_mask();
-        let tag = E::F::one() * BaseField::from_u32_unchecked(TAG_RC);
-        eval.add_to_relation(RelationEntry::new(
-            &self.elements,
-            -E::EF::from(multiplicity),
-            &[tag, val],
-        ));
-        eval.finalize_logup();
-        eval
-    }
-}
-
-fn pp_id(id: &str) -> PreProcessedColumnId {
-    PreProcessedColumnId { id: id.to_owned() }
-}
-
-/// Number of preprocessed columns (count-only uses; the order is `preprocessed_column_ids`).
-/// prog_slot + (enabler/shot_id/pc/pc_in_prog) + (bnd_shot/bnd_addr/bnd_enabler) + rc_val = 9.
-const N_PREPROCESSED_COLS: usize = 9;
-
-/// Each preprocessed column paired with its log_size, in canonical order then STABLE-sorted ascending
-/// by size — the committed tree MUST be size-sorted (stwo's lifted Merkle sorts by length; the
-/// in-circuit verifier does not re-sort). `gate_rc_val` is sized at the trusted `rc_log` (see RC_LOG),
-/// never read from the proof — it sizes the [0,2^rc_log) table pinned by the preprocessed root.
-fn preprocessed_columns_sorted(
-    main_log_size: u32,
-    program_log_size: u32,
-    boundary_log_size: u32,
-    rc_log: u32,
-) -> Vec<(PreProcessedColumnId, u32)> {
-    let mut cols = vec![
-        (pp_id("gate_prog_slot"), program_log_size),
-        // Shard-invariant positional main-trace columns (tree0). Sized with the main trace.
-        (pp_id("gate_enabler"), main_log_size),
-        (pp_id("gate_shot_id"), main_log_size),
-        (pp_id("gate_pc"), main_log_size),
-        (pp_id("gate_pc_in_prog"), main_log_size),
-        // Qubit-memory boundary positional columns. Sized with the boundary table.
-        (pp_id("gate_bnd_shot"), boundary_log_size),
-        (pp_id("gate_bnd_addr"), boundary_log_size),
-        (pp_id("gate_bnd_enabler"), boundary_log_size),
-        // ts-ordering range-check table membership (val[i]=i). Sized at the DYNAMIC rc_log.
-        (pp_id("gate_rc_val"), rc_log),
-    ];
-    cols.sort_by_key(|&(_, s)| s); // stable: ties keep the listing order above
-    cols
-}
-
-fn preprocessed_column_ids(
-    main_log_size: u32,
-    program_log_size: u32,
-    boundary_log_size: u32,
-    rc_log: u32,
-) -> Vec<PreProcessedColumnId> {
-    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size, rc_log)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect()
-}
-
-// Components bundle
-
-type GateComponent = FrameworkComponent<GateEval>;
-type ProgramComponent = FrameworkComponent<ProgramTableEval>;
-type BoundaryComponent = FrameworkComponent<BoundaryTableEval>;
-type RcComponent = FrameworkComponent<RcTableEval>;
-
-struct Components {
-    main: GateComponent,
-    program: ProgramComponent,
-    boundary: BoundaryComponent,
-    rc: RcComponent,
-}
-
-impl Components {
-    fn component_refs(&self) -> Vec<&dyn Component> {
-        vec![
-            &self.main as &dyn Component,
-            &self.program as &dyn Component,
-            &self.boundary as &dyn Component,
-            &self.rc as &dyn Component,
-        ]
-    }
-
-    fn prover_refs(&self) -> Vec<&dyn stwo::prover::ComponentProver<ProverBackend>> {
-        vec![
-            &self.main as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.program as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.boundary as &dyn stwo::prover::ComponentProver<ProverBackend>,
-            &self.rc as &dyn stwo::prover::ComponentProver<ProverBackend>,
-        ]
-    }
-
-    /// Component provers bound to `SimdBackend` — the host/SIMD oracle path the cross-backend
-    /// byte-identity tests (T6/T7) prove against under a `cuda` build (where `ProverBackend` is the
-    /// CudaBackend). `FrameworkComponent<E>` implements `ComponentProver` for both backends. Only
-    /// referenced from test code (`prove_tiny_base`), hence `cfg(test)` + `cuda`.
-    #[cfg(all(test, feature = "cuda"))]
-    fn prover_refs_simd(
-        &self,
-    ) -> Vec<&dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::SimdBackend>> {
-        use stwo::prover::backend::simd::SimdBackend;
-        vec![
-            &self.main as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.program as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.boundary as &dyn stwo::prover::ComponentProver<SimdBackend>,
-            &self.rc as &dyn stwo::prover::ComponentProver<SimdBackend>,
-        ]
-    }
-
-    fn trace_log_sizes(&self) -> TreeVec<ColumnVec<u32>> {
-        // Use stwo's CANONICAL column sizes (not a plain component-concat). stwo's verifier
-        // reindexes the PREPROCESSED tree GLOBALLY by each component's preprocessed_column_indices
-        // (i.e. into preprocessed_column_ids() order), so the preprocessed sizes land in the
-        // committed order — which the lifted Merkle commits sorted by size and the in-circuit
-        // verifier (circuits_stark_verifier) does NOT re-sort. A naive concat would order the
-        // preprocessed sizes by component instead, mismatching the committed tree ("Root mismatch").
-        stwo::core::air::Components {
-            components: self.component_refs(),
-            n_preprocessed_columns: N_PREPROCESSED_COLS,
-        }
-        .column_log_sizes()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_components(
-    log_n_rows: u32,
-    program_log_size: u32,
-    boundary_log_size: u32,
-    rc_log: u32,
-    elements: &LookupElements,
-    main_sum: SecureField,
-    program_sum: SecureField,
-    boundary_sum: SecureField,
-    rc_sum: SecureField,
-) -> Components {
-    let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(
-        &preprocessed_column_ids(log_n_rows, program_log_size, boundary_log_size, rc_log),
-    );
-    let main = GateComponent::new(
-        &mut allocator,
-        GateEval {
-            log_n_rows,
-            elements: elements.clone(),
-        },
-        main_sum,
-    );
-    let program = ProgramComponent::new(
-        &mut allocator,
-        ProgramTableEval {
-            log_size: program_log_size,
-            elements: elements.program.clone(),
-        },
-        program_sum,
-    );
-    let boundary = BoundaryComponent::new(
-        &mut allocator,
-        BoundaryTableEval {
-            log_size: boundary_log_size,
-            elements: elements.qubitmem.clone(),
-        },
-        boundary_sum,
-    );
-    let rc = RcComponent::new(
-        &mut allocator,
-        RcTableEval {
-            log_size: rc_log,
-            elements: elements.rc.clone(),
-        },
-        rc_sum,
-    );
-    Components {
-        main,
-        program,
-        boundary,
-        rc,
-    }
-}
-
-// Trace generation (column-major)
-
-/// Single scalar cell of `row` at canonical column index `col`. The column order
-/// matches the order `evaluate` reads masks (each access block = ACCESS_COLS core + 1 rc diff col):
-///   is_{nop,not,cnot,toffoli}(4),
-///   target(addr,prev_ts,v, d),
-///   ctrl_a(addr,prev_ts,v, d), ctrl_b(addr,prev_ts,v, d),
-///   ab, fire, delta (3).
-/// NOTE: enabler, shot_id, pc are NOT here — they are preprocessed (tree0). ts (= pc+1) and the
-/// target's v_after (= v_before+delta) are NOT columns either — they are inlined in `evaluate`.
-#[inline]
-fn cell_at(row: &Row, col: usize) -> u32 {
-    debug_assert!(col < TRACE_COLUMNS);
-    #[inline]
-    fn access_cell(a: &AccessCols, i: usize) -> u32 {
-        // 0..ACCESS_COLS: addr, prev_ts, v ; then d.
-        match i {
-            0 => a.addr,
-            1 => a.prev_ts,
-            2 => a.v,
-            _ => a.d,
-        }
-    }
-    let mut c = col;
-    // Header (4 cols).
-    const HEADER: [fn(&Row) -> u32; 4] =
-        [|r| r.is_nop, |r| r.is_not, |r| r.is_cnot, |r| r.is_toffoli];
-    if c < HEADER.len() {
-        return HEADER[c](row);
-    }
-    c -= HEADER.len();
-    // target block: ACCESS_BLOCK access cols (no v_after column — inlined as v_before+delta).
-    if c < ACCESS_BLOCK {
-        return access_cell(&row.target, c);
-    }
-    c -= ACCESS_BLOCK;
-    // ctrl_a block.
-    if c < ACCESS_BLOCK {
-        return access_cell(&row.ctrl_a, c);
-    }
-    c -= ACCESS_BLOCK;
-    // ctrl_b block.
-    if c < ACCESS_BLOCK {
-        return access_cell(&row.ctrl_b, c);
-    }
-    c -= ACCESS_BLOCK;
-    // Tail: ab, fire, delta.
-    match c {
-        0 => row.ab,
-        1 => row.fire,
-        _ => row.delta,
-    }
-}
-
-fn col_from_values(values: &[u32]) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let log_size = values.len().ilog2();
-    let mut col = Col::<TraceBackend, BaseField>::zeros(values.len());
-    for (i, &v) in values.iter().enumerate() {
-        col.set(i, BaseField::from_u32_unchecked(v));
-    }
-    CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
-}
-
-/// Converts trace-gen (SimdBackend) columns to the prover backend at the `extend_evals` boundary.
-///
-/// * default / `gpu`: `ProverBackend == SimdBackend`, or obelyzk `GpuBackend` whose columns are
-///   layout-identical to SimdBackend — a cheap rewrap (`CircleEvaluation::new(domain, values)`).
-/// * `cuda`: `ProverBackend == CudaBackend` with device-resident `BaseFieldVec` columns; copy each
-///   column's host values into a device column via `FromIterator<BaseField> for BaseFieldVec`
-///   (`to_cpu()` is a no-op on SimdBackend host data, then `.collect()` uploads to the device).
-#[cfg(not(feature = "cuda"))]
-fn to_prover(
-    cols: Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
-    cols.into_iter()
-        .map(|e| CircleEvaluation::new(e.domain, e.values))
-        .collect()
-}
-
-#[cfg(feature = "cuda")]
-fn to_prover(
-    cols: Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
-    cols.into_iter()
-        .map(|e| {
-            let domain = e.domain;
-            let values: Col<ProverBackend, BaseField> = e.values.to_cpu().into_iter().collect();
-            CircleEvaluation::new(domain, values)
-        })
-        .collect()
-}
-
-/// Preprocessed positional columns for the boundary table: (shot, addr) per row.
-fn generate_boundary_preprocessed(
-    bnd: &BoundaryTable,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let shot: Vec<u32> = bnd.rows.iter().map(|r| r.shot_id).collect();
-    let addr: Vec<u32> = bnd.rows.iter().map(|r| r.addr).collect();
-    // Real-row enabler: 1 for the first `n_shots*N_QUBITS` rows, 0 on padding. POSITIONAL /
-    // shard-invariant (depends only on the shot count). Gates the boundary emission so a non-power-of-
-    // two `n_shots*N_QUBITS` (e.g. 9024 shots) does not inject unmatched LogUp terms on padding rows.
-    let real = bnd.n_shots * N_QUBITS;
-    let enabler: Vec<u32> = (0..bnd.rows.len()).map(|i| (i < real) as u32).collect();
-    vec![
-        col_from_values(&shot),
-        col_from_values(&addr),
-        col_from_values(&enabler),
-    ]
-}
-
-/// Boundary-table witness (x, y, ts_last), in the order BoundaryTableEval reads them.
-fn generate_boundary_witness(
-    bnd: &BoundaryTable,
-) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let x: Vec<u32> = bnd.rows.iter().map(|r| r.x).collect();
-    let y: Vec<u32> = bnd.rows.iter().map(|r| r.y).collect();
-    let ts_last: Vec<u32> = bnd.rows.iter().map(|r| r.ts_last).collect();
-    vec![
-        col_from_values(&x),
-        col_from_values(&y),
-        col_from_values(&ts_last),
-    ]
-}
-
-/// Preprocessed `enabler` column: 1 on real rows, 0 on padding. SHARD-INVARIANT and POSITIONAL —
-/// depends only on how many real rows the (k, n_gates, n_shots) shape produces, never on secret
-/// content. Used by the AIR both in the opcode one-hot constraint and as the LogUp numerator.
-fn generate_enabler_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.enabler;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed `shot_id` column: shot index of each row (= row / (k*n_gates)), 0 on padding.
-/// SHARD-INVARIANT and POSITIONAL (positional payload in the state-relation tuple).
-fn generate_shot_id_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.shot_id;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed `pc` column: monotonic per-shot program counter (= row % (k*n_gates)), 0 on
-/// padding. SHARD-INVARIANT and POSITIONAL (positional payload in the state-relation tuple).
-fn generate_pc_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.pc;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed pc_in_prog column for the main trace: pc mod n_gates on real
-/// rows, 0 on padding (inert: padding has enabler 0).
-fn generate_pc_in_prog_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-    n_gates: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let ng = n_gates as u32;
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.pc % ng;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed slot-index column for the program table.
-fn generate_prog_slot_preprocessed(
-    prog: &ProgramTable,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    col_from_values(&prog.slot)
-}
-
-/// Program-table witness (multiplicity tree): op columns then multiplicity, in
-/// the order ProgramTableEval reads them.
-fn generate_program_witness(
-    prog: &ProgramTable,
-) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![
-        col_from_values(&prog.opcode_scalar),
-        col_from_values(&prog.target),
-        col_from_values(&prog.ctrl_a),
-        col_from_values(&prog.ctrl_b),
-        col_from_values(&prog.multiplicity),
-    ]
-}
-
-/// Preprocessed rc-table membership column (val), the single column RcTableEval reads.
-fn generate_rc_preprocessed(
-    rc: &RcTable,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(&rc.val)]
-}
-
-/// rc-table witness (multiplicity tree): a single multiplicity column.
-fn generate_rc_witness(
-    rc: &RcTable,
-) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(&rc.multiplicity)]
-}
-
-// Interaction traces
-
-#[inline]
-fn pack(lane: &[&Row; LANE_COUNT], get: impl Fn(&Row) -> u32) -> PackedM31 {
-    PackedM31::from_array(std::array::from_fn(|l| {
-        BaseField::from_u32_unchecked(get(lane[l]))
-    }))
-}
-
-/// Main component interaction trace. Logup batches mirror the relation entries
-/// emitted in `evaluate`, finalized in pairs. Order must match (5 batches -> 4 columns each):
-///   pair0: qubitmem target Use (+enabler), target Yield (-enabler)
-///   pair1: qubitmem ctrl_a Use (+a_active), ctrl_a Yield (-a_active)
-///   pair2: qubitmem ctrl_b Use (+b_active), ctrl_b Yield (-b_active)
-///   pair3: rc target d (+enabler), rc ctrl_a d (+a_active)
-///   pair4: rc ctrl_b d (+b_active), program (+enabler)
-/// 10 relation entries -> 5 pairs => 5 batches => 20 interaction columns. The rc terms are the
-/// ts-ordering range-check single-`d` lookups (TAG_RC, d) mirroring `add_rc_lookup`.
-fn gen_main_interaction(
-    rows: &[Row],
-    padded_rows: usize,
-    log_n_rows: u32,
-    n_gates: usize,
-    el: &LookupElements,
-) -> (
-    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-    SecureField,
-) {
-    let mut gen = LogupTraceGenerator::new(log_n_rows);
-
-    fn sel_t(r: &Row) -> &AccessCols {
-        &r.target
-    }
-    fn sel_a(r: &Row) -> &AccessCols {
-        &r.ctrl_a
-    }
-    fn sel_b(r: &Row) -> &AccessCols {
-        &r.ctrl_b
-    }
-
-    // Chain USE (predecessor): (shot, addr, prev_ts, v_before).
-    let qm_use = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
-        el.qubitmem.combine(&[
-            ptag(TAG_QUBITMEM),
-            pack(lane, |r| r.shot_id),
-            pack(lane, |r| sel(r).addr),
-            pack(lane, |r| sel(r).prev_ts),
-            pack(lane, |r| sel(r).v),
-        ])
-    };
-    // Chain YIELD (successor): (shot, addr, ts=pc+1, v_after). ts is the inlined `pc + 1` (not a
-    // column). For the target, v_after = v_before + delta; for controls the value propagates (== v).
-    let qm_yield_t = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        el.qubitmem.combine(&[
-            ptag(TAG_QUBITMEM),
-            pack(lane, |r| r.shot_id),
-            pack(lane, |r| r.target.addr),
-            pack(lane, |r| r.pc + 1),
-            // v_after = v_before + delta, computed as the exact bit v_before ^ fire (canonical M31,
-            // avoids the non-canonical p that a raw `v_before + delta_to_m31(-1)` would produce).
-            pack(lane, |r| r.target.v ^ r.fire),
-        ])
-    };
-    let qm_yield_ctrl =
-        |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
-            el.qubitmem.combine(&[
-                ptag(TAG_QUBITMEM),
-                pack(lane, |r| r.shot_id),
-                pack(lane, |r| sel(r).addr),
-                pack(lane, |r| r.pc + 1),
-                pack(lane, |r| sel(r).v),
-            ])
-        };
-    let enabler = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.enabler);
-    let a_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_cnot + r.is_toffoli);
-    let b_active = |lane: &[&Row; LANE_COUNT]| pack(lane, |r| r.is_toffoli);
-
-    // ts-ordering range-check use-side denominator: (TAG_RC, d) — single `d` per access.
-    let rc_d = |lane: &[&Row; LANE_COUNT], sel: fn(&Row) -> &AccessCols| -> PackedSecureField {
-        el.rc.combine(&[ptag(TAG_RC), pack(lane, |r| sel(r).d)])
-    };
-
-    // Program use-side denominator. pc_in_prog = pc mod n_gates (preprocessed in
-    // the AIR; recomputed here for the prover). opcode_scalar from the one-hot.
-    let ng = n_gates as u32;
-    let program = |lane: &[&Row; LANE_COUNT]| -> PackedSecureField {
-        el.program.combine(&[
-            ptag(TAG_PROGRAM),
-            pack(lane, |r| r.pc % ng),
-            pack(lane, |r| r.is_not + 2 * r.is_cnot + 3 * r.is_toffoli),
-            pack(lane, |r| r.target.addr),
-            pack(lane, |r| r.ctrl_a.addr),
-            pack(lane, |r| r.ctrl_b.addr),
-        ])
-    };
-
-    // Write one logup column for a pair of relation entries: fraction = m0/d0 + m1/d1.
-    // PARALLEL over vec_rows: the per-row combine (35-element dot products) is the cost; computing
-    // the (num, den) fractions in a rayon par_iter and feeding `col_from_par_iter` fans it over all
-    // cores (the old sequential packed_rows loop ran this on one core — the trace-gen bottleneck).
-    // Generic over the closure types (not &dyn) so the Sync bound holds without lifetime grief.
-    #[allow(clippy::too_many_arguments)]
-    fn write_pair_par<N0, D0, N1, D1>(
-        gen: &mut LogupTraceGenerator,
-        rows: &[Row],
-        n_vec: usize,
-        num0: N0,
-        den0: D0,
-        sign0: i32,
-        num1: N1,
-        den1: D1,
-        sign1: i32,
-    ) where
-        N0: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
-        D0: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
-        N1: Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync,
-        D1: Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync,
-    {
-        use rayon::prelude::*;
-        let pad = Row::padding();
-        let col_iter = (0..n_vec).into_par_iter().map(|vec_row| {
-            let lane: [&Row; LANE_COUNT] =
-                std::array::from_fn(|l| rows.get(vec_row * LANE_COUNT + l).unwrap_or(&pad));
-            let m0 = PackedSecureField::from(num0(&lane));
-            let m0 = if sign0 < 0 { -m0 } else { m0 };
-            let d0 = den0(&lane);
-            let m1 = PackedSecureField::from(num1(&lane));
-            let m1 = if sign1 < 0 { -m1 } else { m1 };
-            let d1 = den1(&lane);
-            (m0 * d1 + m1 * d0, d0 * d1)
-        });
-        gen.col_from_par_iter(col_iter);
-    }
-    let n_vec = padded_rows / LANE_COUNT;
-    let write_pair = |gen: &mut LogupTraceGenerator,
-                      num0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
-                      den0: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync),
-                      sign0: i32,
-                      num1: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedM31 + Sync),
-                      den1: &(dyn Fn(&[&Row; LANE_COUNT]) -> PackedSecureField + Sync),
-                      sign1: i32| {
-        write_pair_par(gen, rows, n_vec, num0, den0, sign0, num1, den1, sign1);
-    };
-
-    // pair0: qubitmem target Use (+enabler), target Yield (-enabler).
-    write_pair(
-        &mut gen,
-        &enabler,
-        &|l| qm_use(l, sel_t),
-        1,
-        &enabler,
-        &qm_yield_t,
-        -1,
-    );
-    // pair1: qubitmem ctrl_a Use (+a_active), ctrl_a Yield (-a_active).
-    write_pair(
-        &mut gen,
-        &a_active,
-        &|l| qm_use(l, sel_a),
-        1,
-        &a_active,
-        &|l| qm_yield_ctrl(l, sel_a),
-        -1,
-    );
-    // pair2: qubitmem ctrl_b Use (+b_active), ctrl_b Yield (-b_active).
-    write_pair(
-        &mut gen,
-        &b_active,
-        &|l| qm_use(l, sel_b),
-        1,
-        &b_active,
-        &|l| qm_yield_ctrl(l, sel_b),
-        -1,
-    );
-    // pair3: rc target d (+enabler), rc ctrl_a d (+a_active).
-    write_pair(
-        &mut gen,
-        &enabler,
-        &|l| rc_d(l, sel_t),
-        1,
-        &a_active,
-        &|l| rc_d(l, sel_a),
-        1,
-    );
-    // pair4: rc ctrl_b d (+b_active), program (+enabler). The trailing 3 rc + 1 program fold into
-    // these two pairs (matches `finalize_logup_in_pairs` on the 10-entry stream).
-    write_pair(
-        &mut gen,
-        &b_active,
-        &|l| rc_d(l, sel_b),
-        1,
-        &enabler,
-        &program,
-        1,
-    );
-
-    // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
-    // prover backend happens later via `to_prover` at the `extend_evals` boundary.
-    let (cols, sum) = gen.finalize_last();
-    (cols, sum)
-}
-
-/// Assert the main component's AIR constraints (algebraic + logup) directly on the committed trace
-/// columns, pinpointing the first violated constraint index. Builds the trees
-/// `[preprocessed(empty), main, interaction]` the main `GateEval` expects and runs
-/// `assert_constraints_on_trace`. Test-support (drives the `on_trace_constraints_all` test, T5),
-/// out of the prove path — hence `#[cfg(test)]`.
-#[cfg(test)]
-fn assert_main_constraints(
-    rows: &[Row],
-    padded_rows: usize,
-    log_n_rows: u32,
-    n_gates: usize,
-    elements: &LookupElements,
-    main_interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
-    main_sum: SecureField,
-) {
-    // Main trace columns as plain M31 vectors (circle-domain / bit-reversed
-    // order, matching what `assert_constraints_on_trace` expects).
-    let main_cols = generate_main_trace(rows, padded_rows, log_n_rows);
-    let main_vals: Vec<Vec<BaseField>> = main_cols.iter().map(|c| c.values.to_cpu()).collect();
-    let interaction_vals: Vec<Vec<BaseField>> =
-        main_interaction.iter().map(|c| c.values.to_cpu()).collect();
-    // The main component reads four preprocessed columns IN THIS ORDER (matching
-    // `GateEval::evaluate`'s `get_preprocessed_column` calls): enabler, shot_id, pc, pc_in_prog.
-    // `assert_constraints_on_trace` feeds them positionally to the eval's preprocessed reads.
-    let pp_vals: Vec<Vec<BaseField>> = vec![
-        generate_enabler_preprocessed(rows, padded_rows)
-            .values
-            .to_cpu(),
-        generate_shot_id_preprocessed(rows, padded_rows)
-            .values
-            .to_cpu(),
-        generate_pc_preprocessed(rows, padded_rows).values.to_cpu(),
-        generate_pc_in_prog_preprocessed(rows, padded_rows, n_gates)
-            .values
-            .to_cpu(),
-    ];
-
-    // Tree layout: [preprocessed, original, interaction].
-    let preprocessed: Vec<&Vec<BaseField>> = pp_vals.iter().collect();
-    let original: Vec<&Vec<BaseField>> = main_vals.iter().collect();
-    let interaction: Vec<&Vec<BaseField>> = interaction_vals.iter().collect();
-    let trace = TreeVec::new(vec![preprocessed, original, interaction]);
-
-    let eval = GateEval {
-        log_n_rows,
-        elements: elements.clone(),
-    };
-    assert_constraints_on_trace(
-        &trace,
-        log_n_rows,
-        |assert_eval| {
-            eval.evaluate(assert_eval);
-        },
-        main_sum,
-    );
-}
-
-/// Assert a table (supply-side) component's constraints directly on its committed columns. Trees:
-/// `[preprocessed, multiplicity, interaction]`. Test-support (T5), out of the prove path.
-#[cfg(test)]
-fn assert_table_constraints<Ev: FrameworkEval + Sync>(
-    log_size: u32,
-    preprocessed: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
-    multiplicity: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
-    interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
-    claimed_sum: SecureField,
-    eval: Ev,
-) {
-    let pp_vals: Vec<Vec<BaseField>> = preprocessed.iter().map(|c| c.values.to_cpu()).collect();
-    let mult_vals: Vec<Vec<BaseField>> = multiplicity.iter().map(|c| c.values.to_cpu()).collect();
-    let int_vals: Vec<Vec<BaseField>> = interaction.iter().map(|c| c.values.to_cpu()).collect();
-    let trace = TreeVec::new(vec![
-        pp_vals.iter().collect::<Vec<_>>(),
-        mult_vals.iter().collect::<Vec<_>>(),
-        int_vals.iter().collect::<Vec<_>>(),
-    ]);
-    assert_constraints_on_trace(
-        &trace,
-        log_size,
-        |assert_eval| {
-            eval.evaluate(assert_eval);
-        },
-        claimed_sum,
-    );
-}
-
-/// Supply-side interaction trace for a multi-column table looked up with a
-/// single relation. `combine_row(i)` returns the combined denominator for row i.
-fn gen_table_interaction(
-    counts: &[u32],
-    log_size: u32,
-    combine_row: impl Fn(usize) -> PackedSecureField,
-) -> (
-    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-    SecureField,
-) {
-    let mut gen = LogupTraceGenerator::new(log_size);
-    let mut col = gen.new_col();
-    for vec_row in 0..(1usize << (log_size - LOG_N_LANES)) {
-        let denom = combine_row(vec_row);
-        let packed_counts = PackedM31::from_array(std::array::from_fn(|lane| {
-            BaseField::from_u32_unchecked(counts[(vec_row << LOG_N_LANES) + lane])
-        }));
-        col.write_frac(vec_row, -PackedSecureField::from(packed_counts), denom);
-    }
-    col.finalize_col();
-    // LogupTraceGenerator already emits SimdBackend (== TraceBackend) columns; conversion to the
-    // prover backend happens later via `to_prover` at the `extend_evals` boundary.
-    let (cols, sum) = gen.finalize_last();
-    (cols, sum)
-}
-
-/// Packs one boundary field over a vec_row's lanes.
-fn pack_boundary(
-    bnd: &BoundaryTable,
-    vec_row: usize,
-    f: &dyn Fn(&BoundaryRow) -> u32,
-) -> PackedM31 {
-    PackedM31::from_array(std::array::from_fn(|lane| {
-        BaseField::from_u32_unchecked(f(&bnd.rows[(vec_row << LOG_N_LANES) + lane]))
-    }))
-}
-
-/// Boundary component interaction trace: per (shot, addr) row emit the internal final
-/// Use[+1](shot, addr, ts_last, y) and the PUBLIC final Yield[-1](shot, addr, TS_FINAL, y) on
-/// TAG_QUBITMEM. Two terms per row -> one batch (paired), matching `BoundaryTableEval`. CPU-only in
-/// both the CPU and cuda paths (the CUDA kernel covers only the gate_air MAIN component).
-fn gen_boundary_interaction(
-    bnd: &BoundaryTable,
-    el: &GateRel,
-) -> (
-    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-    SecureField,
-) {
-    let mut gen = LogupTraceGenerator::new(bnd.log_size);
-    let mut col = gen.new_col();
-    let n_vec = 1usize << (bnd.log_size - LOG_N_LANES);
-    let pack_f = |vec_row: usize, f: &dyn Fn(&BoundaryRow) -> u32| pack_boundary(bnd, vec_row, f);
-    let ts_final = PackedM31::broadcast(BaseField::from_u32_unchecked(TS_FINAL));
-    let real = bnd.n_shots * N_QUBITS;
-    for vec_row in 0..n_vec {
-        let tag = ptag(TAG_QUBITMEM);
-        let shot = pack_f(vec_row, &|r| r.shot_id);
-        let addr = pack_f(vec_row, &|r| r.addr);
-        let y = pack_f(vec_row, &|r| r.y);
-        let ts_last = pack_f(vec_row, &|r| r.ts_last);
-        // Real-row enabler per lane (mirrors the gate_bnd_enabler preprocessed column).
-        let enabler = PackedM31::from_array(std::array::from_fn(|lane| {
-            BaseField::from_u32_unchecked(((vec_row << LOG_N_LANES) + lane < real) as u32)
-        }));
-        let enabler = PackedSecureField::from(enabler);
-        // Phase-3 re-keyed boundary (mirrors BoundaryTableEval), gated by the real-row enabler:
-        //   (B) internal final Use[+enabler] / (shot, addr, ts_last, y).
-        let d_use: PackedSecureField = el.combine(&[tag, shot, addr, ts_last, y]);
-        //   (D) public   final Yield[-enabler] / (shot, addr, TS_FINAL, y).
-        let d_pub: PackedSecureField = el.combine(&[tag, shot, addr, ts_final, y]);
-        // fraction = (+enabler)/d_use + (-enabler)/d_pub.
-        col.write_frac(vec_row, enabler * d_pub + (-enabler) * d_use, d_use * d_pub);
-    }
-    col.finalize_col();
-    let (cols, sum) = gen.finalize_last();
-    (cols, sum)
-}
-
-/// Program-table interaction (H_P binding, Fork A). Mirrors `gen_boundary_interaction`'s two-term/
-/// one-batch shape so the program component stays 4 interaction columns. Per real slot row emits:
-///   (internal, -mult) / combine(TAG_PROGRAM,     slot, op, t, a, b)  — cancels main's demand,
-///   (public,   +mult) / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)  — the dangling P_pub.
-/// Padding rows carry multiplicity 0, so both fractions vanish (numerator 0). The returned claimed
-/// sum is `program_sum` = Σ_slot [ -mult/d_int + mult/d_pub ] = P_pub (the internal part is cancelled
-/// by main's demand only in the GLOBAL sum, not within this component; `program_sum` itself carries
-/// BOTH terms, and the global identity becomes main + program + boundary + rc == B + P_pub, where the
-/// `-mult/d_int` inside program_sum cancels main's `+enabler/d_int`, leaving net P_pub).
-fn gen_program_interaction(
-    prog: &ProgramTable,
-    el: &GateRel,
-) -> (
-    ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
-    SecureField,
-) {
-    let mut gen = LogupTraceGenerator::new(prog.log_size);
-    let mut col = gen.new_col();
-    let n_vec = 1usize << (prog.log_size - LOG_N_LANES);
-    let tag = ptag(TAG_PROGRAM);
-    let tag_pub = ptag(TAG_PROGRAM_PUB);
-    for vec_row in 0..n_vec {
-        let slot = pack_seq(&prog.slot, vec_row);
-        let op = pack_seq(&prog.opcode_scalar, vec_row);
-        let t = pack_seq(&prog.target, vec_row);
-        let a = pack_seq(&prog.ctrl_a, vec_row);
-        let b = pack_seq(&prog.ctrl_b, vec_row);
-        let mult = PackedSecureField::from(pack_seq(&prog.multiplicity, vec_row));
-        let d_int: PackedSecureField = el.combine(&[tag, slot, op, t, a, b]);
-        let d_pub: PackedSecureField = el.combine(&[tag_pub, slot, op, t, a, b]);
-        // fraction = (-mult)/d_int + (+mult)/d_pub.
-        col.write_frac(vec_row, (-mult) * d_pub + mult * d_int, d_int * d_pub);
-    }
-    col.finalize_col();
-    let (cols, sum) = gen.finalize_last();
-    (cols, sum)
-}
-
-/// Program-table PUBLIC term P_pub = Σ_slot mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b) — the
-/// dangling public part the leaf's `public_logup_sum` supplies the negation of (binding the guessed
-/// program to the committed one). Recomputed from the committed program witness.
-fn program_public_term(prog: &ProgramTable, el: &GateRel) -> SecureField {
-    let mut sum = SecureField::zero();
-    let tag_pub = BaseField::from_u32_unchecked(TAG_PROGRAM_PUB);
-    for i in 0..prog.multiplicity.len() {
-        let count = prog.multiplicity[i];
-        if count == 0 {
-            continue;
-        }
-        let denom: SecureField = el.combine(&[
-            tag_pub,
-            BaseField::from_u32_unchecked(prog.slot[i]),
-            BaseField::from_u32_unchecked(prog.opcode_scalar[i]),
-            BaseField::from_u32_unchecked(prog.target[i]),
-            BaseField::from_u32_unchecked(prog.ctrl_a[i]),
-            BaseField::from_u32_unchecked(prog.ctrl_b[i]),
-        ]);
-        sum += SecureField::from(BaseField::from_u32_unchecked(count)) * denom.inverse();
-    }
-    sum
-}
-
-/// Program component claimed sum (H_P binding): Σ_slot [ -mult/combine(TAG_PROGRAM,...) +
-/// mult/combine(TAG_PROGRAM_PUB,...) ]. Must equal `program_sum`; recomputed from the committed
-/// program witness so a mistranscribed term is caught before FRI.
-fn program_claimed_sum(prog: &ProgramTable, el: &GateRel) -> SecureField {
-    let internal = table_public_sum(&prog.multiplicity, el, TAG_PROGRAM, |i| {
-        vec![
-            BaseField::from_u32_unchecked(prog.slot[i]),
-            BaseField::from_u32_unchecked(prog.opcode_scalar[i]),
-            BaseField::from_u32_unchecked(prog.target[i]),
-            BaseField::from_u32_unchecked(prog.ctrl_a[i]),
-            BaseField::from_u32_unchecked(prog.ctrl_b[i]),
-        ]
-    });
-    // `table_public_sum` returns the NEGATED supply (-Σ count/denom), i.e. exactly the -mult internal
-    // term. The public term adds +Σ mult/denom_pub = program_public_term.
-    internal + program_public_term(prog, el)
-}
-
-/// Boundary component claimed sum (supply side): Σ_rows [ +1/combine(ts_last,y) − 1/combine(TS_FINAL,y) ]
-/// — the re-keyed final terms (B)+(D). Must equal `boundary_sum`; recomputed from the committed
-/// boundary table (y/ts_last witness) so a mistranscribed term is caught before FRI.
-fn boundary_public_sum(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
-    let mut sum = SecureField::zero();
-    let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
-    let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
-    // Only REAL rows emit (gated by gate_bnd_enabler); padding rows contribute nothing.
-    let real = bnd.n_shots * N_QUBITS;
-    for r in &bnd.rows[..real] {
-        let shot = BaseField::from_u32_unchecked(r.shot_id);
-        let addr = BaseField::from_u32_unchecked(r.addr);
-        let y = BaseField::from_u32_unchecked(r.y);
-        let ts_last = BaseField::from_u32_unchecked(r.ts_last);
-        // (B) internal final Use[+1] and (D) public final Yield[-1]: +1/d_use − 1/d_pub.
-        let d_use: SecureField = el.combine(&[tag, shot, addr, ts_last, y]);
-        let d_pub: SecureField = el.combine(&[tag, shot, addr, ts_final, y]);
-        sum += d_use.inverse() - d_pub.inverse();
-    }
-    sum
-}
-
-/// Phase-3 PUBLIC boundary term B = Σ_rows [ +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ].
-/// This is exactly the base's total dangling (unconsumed) LogUp sum: main leaves +[0,x] & −[ts_last,y]
-/// per touched (shot,addr), the boundary consumes [ts_last,y] and re-emits −[TS_FINAL,y], so the net is
-/// +[0,x] − [TS_FINAL,y]. The base's committed claimed sums must satisfy
-/// `main_sum + program_sum + boundary_sum == B` (was `== 0`), and the LEAF's `public_logup_sum` equals
-/// `−B` over its GUESSED x/y — so the verifier balance `public_logup_sum + Σ claimed_sums == 0` forces
-/// guessed == committed. For UNTOUCHED addrs (ts_last=0) the prover's `x == y`, so the ts=0 term here
-/// (using `x`) faithfully matches the actual dangling +[0,y]; the equality thus also checks x==y there.
-fn boundary_public_term(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
-    let mut sum = SecureField::zero();
-    let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
-    let zero = BaseField::zero();
-    let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
-    // Only REAL rows are dangling; padding rows emit no main NOR boundary term (gated by enablers).
-    let real = bnd.n_shots * N_QUBITS;
-    for r in &bnd.rows[..real] {
-        let shot = BaseField::from_u32_unchecked(r.shot_id);
-        let addr = BaseField::from_u32_unchecked(r.addr);
-        let x = BaseField::from_u32_unchecked(r.x);
-        let y = BaseField::from_u32_unchecked(r.y);
-        let d_init: SecureField = el.combine(&[tag, shot, addr, zero, x]);
-        let d_pub: SecureField = el.combine(&[tag, shot, addr, ts_final, y]);
-        sum += d_init.inverse() - d_pub.inverse();
-    }
-    sum
-}
-
-/// Supply (table-side) public sum for a single-relation table: sum_i count_i / denom_i.
-/// Returns the negated value (matching the supply emission of -multiplicity).
-fn table_public_sum<R: Relation<BaseField, SecureField>>(
-    counts: &[u32],
-    elements: &R,
-    tag: u32,
-    row_tuple: impl Fn(usize) -> Vec<BaseField>,
-) -> SecureField {
-    let mut sum = SecureField::zero();
-    for (i, &count) in counts.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let mut tuple = vec![BaseField::from_u32_unchecked(tag)];
-        tuple.extend(row_tuple(i));
-        let denom: SecureField = elements.combine(&tuple);
-        sum += SecureField::from(BaseField::from_u32_unchecked(count)) * denom.inverse();
-    }
-    -sum
-}
-
-// GPU trace-gen inputs (device path)
-
-/// Flatten the host-side inputs the K1/K4 device kernels consume: the gate list
-/// (opcode, target, ctrl_a, ctrl_b per gate), each shot's initial 32-limb state,
-/// and the RcIndex lo/hi offsets. Mirrors the prep in `gpu_tracegen::k1_byte_identity`.
-#[cfg(feature = "cuda")]
-fn gpu_flat_inputs(
-    gates: &[Gate],
-    cases: &[TestCase],
-    rc_lo_index: &RcIndex,
-    rc_hi_index: &RcIndex,
-) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
-    let mut gates_flat = Vec::with_capacity(gates.len() * 4);
-    for g in gates {
-        gates_flat.push(g.opcode as u32);
-        gates_flat.push(g.target as u32);
-        gates_flat.push(g.ctrl_a as u32);
-        gates_flat.push(g.ctrl_b as u32);
-    }
-    let mut x_states = Vec::with_capacity(cases.len() * N_LIMBS);
-    for c in cases {
-        let bytes = hex::decode(&c.x_hex).context("decoding x_hex for GPU trace-gen")?;
-        x_states.extend_from_slice(&state_to_limbs(&bytes));
-    }
-    let off_lo: Vec<u32> = (0..LIMB_BITS)
-        .map(|p| rc_lo_index.offset[p] as u32)
-        .collect();
-    let off_hi: Vec<u32> = (0..LIMB_BITS)
-        .map(|p| rc_hi_index.offset[p] as u32)
-        .collect();
-    Ok((gates_flat, x_states, off_lo, off_hi))
-}
-
 /// Multi-shard resident OOM fix (opt-in `GATE_AIR_POOL_TRIM`, default OFF). At a shard boundary,
 /// trims the calling thread's device mem pool (`cudaMemPoolTrimTo` after a stream-0 sync) so the next
 /// shard starts clean and can run fully resident. Byte-identical: trims only already-free segments,
@@ -1715,51 +216,6 @@ fn pool_trim_at_shard_boundary_if_enabled() {
         // SAFETY: FFI. Sync (stream 0) + trim the current device's pool. No args, no pointers.
         unsafe { stwo::stwo_cuda::bindings::cuda_pool_trim() };
     }
-}
-
-/// Build the (size-sorted) preprocessed tree-0 columns for one shard shape. Shared by the
-/// per-shard rebuild path AND the precompute build, so the committed column order/sizes are
-/// IDENTICAL by construction. tree-0 is SHARD-INVARIANT: every column is POSITIONAL
-/// (enabler/shot_id/pc/pc_in_prog from row index, prog_slot/program witness from the shared program
-/// with constant multiplicity = shots_per_shard*k, bnd_shot/bnd_addr from the boundary layout), so
-/// for a fixed (k, n_gates, shots_per_shard) shape these columns are the same for every shard. The
-/// rc-table membership columns (pos, val) are also shard-invariant (fixed [0,range) table).
-fn build_tree0_columns(
-    program: &ProgramTable,
-    rows: &[Row],
-    padded_rows: usize,
-    log_n_rows: u32,
-    n_gates: usize,
-    rc_log: u32,
-    boundary: &BoundaryTable,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let mut tagged: Vec<(
-        u32,
-        CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>,
-    )> = vec![
-        (program.log_size, generate_prog_slot_preprocessed(program)),
-        (log_n_rows, generate_enabler_preprocessed(rows, padded_rows)),
-        (log_n_rows, generate_shot_id_preprocessed(rows, padded_rows)),
-        (log_n_rows, generate_pc_preprocessed(rows, padded_rows)),
-        (
-            log_n_rows,
-            generate_pc_in_prog_preprocessed(rows, padded_rows, n_gates),
-        ),
-    ];
-    tagged.extend(
-        generate_boundary_preprocessed(boundary)
-            .into_iter()
-            .map(|c| (boundary.log_size, c)),
-    );
-    // rc membership table sized at the DYNAMIC rc_log (single [0,2^rc_log) val column).
-    let rc = RcTable::new(rc_log);
-    tagged.extend(
-        generate_rc_preprocessed(&rc)
-            .into_iter()
-            .map(|c| (rc_log, c)),
-    );
-    tagged.sort_by_key(|(s, _)| *s); // stable: identical key+listing order as preprocessed_columns_sorted
-    tagged.into_iter().map(|(_, c)| c).collect()
 }
 
 /// The PINNED per-operating-point unpacker verify [`CircuitConfig`] — `op`'s `PinnedConfigs` rebuilt
@@ -1775,12 +231,7 @@ fn pinned_unpacker_config(
         "unpacker config requested for n={n} but this operating point has N={}",
         op.n()
     );
-    op.pinned()
-        .to_derived(
-            topology::RECURSION_LOG_BLOWUP,
-            topology::RECURSION_LOG_BLOWUP,
-        )
-        .unpacker
+    op.pinned().unpacker_config()
 }
 
 fn verify_gate_air_root_leaves(
@@ -1861,7 +312,7 @@ fn main() -> Result<()> {
 
     // The GPU K1/K4 trace-gen byte-identity self-checks (GPU trace == CPU recompute) are NOT a
     // prove-path hook: they run as the `diag`-gated `#[test]`s `k1_trace_identity` (T1a) /
-    // `k4_interaction_identity` (T1b), which call the `gpu_tracegen::k1_byte_identity` /
+    // `k4_interaction_identity` (T1b), which call the `tracegen::k1_byte_identity` /
     // `k4_byte_identity` harnesses directly on the box.
 
     // `trace_gen_start` marks the beginning of the full witness build (shot
@@ -1926,35 +377,34 @@ fn prove_folded(
     use circuits::context::FinalizedContext;
     use circuits::ivalue::NoValue;
     use circuits::wrappers::U32Wrapper;
-    use circuits_stark_verifier::proof::{Proof, ProofConfig};
+    use circuits_stark_verifier::proof::{empty_proof, Proof, ProofConfig};
     use circuits_stark_verifier::proof_from_stark_proof::proof_from_stark_proof;
-    use leaf::{
-        build_gate_air_leaf_circuit, build_recursion_precompute, pinned_aggregate_config,
-        GateAirLeafParams,
-    };
+    use leaf::{build_gate_air_leaf_circuit, GateAirLeafParams};
     use recursive_aggregate::pools::PoolSet;
     use recursive_aggregate::precomputes::RecursionPrecompute;
     use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
     use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
     use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom, ZkBlind};
     use recursive_aggregate::AggregateOutput;
-    use recursive_aggregate::{AggregateConfig, TreeProof};
+    use recursive_aggregate::TreeProof;
     use stwo::core::fields::qm31::QM31;
 
     // The base-proof tuple `prove_base_shard` returns (defined in `base.rs`, imported here so the
     // fold block's unqualified references resolve). `prove_ex` yields `ExtendedStarkProof<MC::H>`
     // with `MC::H = Blake2sMerkleHasher`, so this is backend-independent (cuda vs simd).
-    use base::BaseShardOutput;
+    use prover::BaseShardOutput;
 
-    // All FREE topology params in one place, honoring the existing env sweep knobs (BASE_BLOWUP,
-    // BASE_FAN_ARITY, RECURSION_SHARD_SHOTS). Defaults reproduce the current production values, so
-    // this is a byte-identical no-op. Threaded through the derive/prove calls below; the base
-    // blowup, fold arity, base-fan arity, and shots-per-shard are all read off it.
-    let topo = TopologyConfig::from_env();
+    // Free base/partition params, honoring the existing env sweep knobs (BASE_BLOWUP,
+    // RECURSION_SHARD_SHOTS). Defaults reproduce the current production values, so this is a
+    // byte-identical no-op. Threaded through the derive/prove calls below.
+    let base_log_blowup: u32 = parse_env("BASE_BLOWUP").unwrap_or(prover::BASE_LOG_BLOWUP);
+    let shots_per_shard_raw: usize = parse_env::<usize>("RECURSION_SHARD_SHOTS")
+        .filter(|&n| n > 0)
+        .unwrap_or(SHOTS_PER_SHARD);
 
     // Shard partition: equal-sized shards of `shots_per_shard` shots; ragged final shard is
     // padded (below) so all shards share the leaf circuit shape.
-    let shots_per_shard: usize = topo.shots_per_shard.min(samples);
+    let shots_per_shard: usize = shots_per_shard_raw.min(samples);
     let n_shards = samples.div_ceil(shots_per_shard);
     eprintln!(
         "gate-air: sharding {samples} shots into {n_shards} shard(s) of {shots_per_shard} shot(s) each \
@@ -1963,7 +413,7 @@ fn prove_folded(
 
     // The pinned operating point (k, shots_per_shard → N). Gates to the 3 Tanuj curve points; any other
     // (k, shots) panics (unsupported). The recursion consts (roots + unpacker config) key off this.
-    let op = recursion_consts::OperatingPoint::from_params(k, topo.shots_per_shard);
+    let op = recursion_consts::OperatingPoint::from_params(k, shots_per_shard_raw);
 
     // Build each shard's equal-sized `cases` slice. The final shard repeats its last real shot
     // up to `shots_per_shard` so it shares the shape; padding shots are extra independent (x->y)
@@ -2007,18 +457,9 @@ fn prove_folded(
     // verify (a self-check, not prover output). This is the SP1-comparable prover time.
     let t_prove_window = Instant::now();
     #[allow(clippy::type_complexity)]
-    let (
-        base_precompute,
-        cfg,
-        leaf_cfg,
-        recursion_pre,
-        boundary_log_size,
-        leaf_program,
-        leaf_nonce,
-    ): (
+    let (base_precompute, cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce): (
         Option<std::sync::Arc<BaseProverPrecompute>>,
         ProofConfig,
-        AggregateConfig,
         RecursionPrecompute,
         u32,
         leaf::ProgramRows,
@@ -2040,7 +481,7 @@ fn prove_folded(
     // read off the proved base, which used `base0_log_n_rows.max(base0_rc_log)`).
     let base0_config = leaf::leaf_pcs_config(
         shape_log_n_rows0.max(shape_rc_log0),
-        topo.base_log_blowup,
+        base_log_blowup,
     );
     let cfg = ProofConfig::new(
         &gate_air_components::<NoValue>(),
@@ -2087,18 +528,23 @@ fn prove_folded(
     // commits happen HERE (in parallel with the GPU precompute); each asserts its committed root
     // equals the pinned const (the soundness tripwire).
     let t_cfg = Instant::now();
-    let (leaf_cfg, recursion_pre) = {
-        let agg = pinned_aggregate_config(op, &topo, &cfg, &shape_params);
-        // Production: build node shapes only for the arities this point's fold uses.
-        let pre = build_recursion_precompute(&agg, op, &cfg, &shape_params, false);
+    let recursion_pre = {
+        // Production: build node shapes only for the arities this point's fold uses. The runtime
+        // config is assembled + cached inside the returned precompute (prove entry points read it
+        // from there); gate-air holds only the pinned const `op.pinned()`.
+        let pre = recursive_aggregate::precomputes::build_recursion_precompute(
+            build_gate_air_leaf_circuit::<NoValue>(empty_proof(&cfg), &cfg, &shape_params),
+            op.pinned(),
+            false,
+        );
         eprintln!(
             "gate-air: leaf-recursion config + precompute built up front in {:.1}s (node target qm31_ops={})",
             t_cfg.elapsed().as_secs_f64(),
-            agg.node_target_padding_sizes.qm31_ops,
+            pre.node_target_padding_sizes().qm31_ops,
         );
-        (agg, pre)
+        pre
     };
-        Ok((cfg, leaf_cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce))
+        Ok((cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce))
     });
 
         // --- MAIN THREAD (GPU): base precompute build (unconditional). ---
@@ -2113,7 +559,7 @@ fn prove_folded(
             let rc_log0 = RC_LOG;
             let max_log_size0 =
                 tree0_max_log_size(log_n_rows0, rc_log0, program0.log_size, boundary0.log_size);
-            let base_blowup: u32 = topo.base_log_blowup;
+            let base_blowup: u32 = base_log_blowup;
             let config0 = leaf::leaf_pcs_config(max_log_size0, base_blowup);
             #[cfg(feature = "cuda")]
             let (gates_flat0, _x0, off_lo0, off_hi0) =
@@ -2150,13 +596,12 @@ fn prove_folded(
         };
 
         // --- JOIN: both precomputes complete here, before any proving. ---
-        let (cfg, leaf_cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce) = cpu_build
+        let (cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce) = cpu_build
             .join()
             .expect("recursion config/precompute thread panicked")?;
         Ok((
             base_precompute,
             cfg,
-            leaf_cfg,
             recursion_pre,
             boundary_log_size,
             leaf_program,
@@ -2187,7 +632,7 @@ fn prove_folded(
         #[cfg(feature = "cuda")]
         {
             if requested > 1 {
-                let visible = gpu_tracegen::backend_device_count();
+                let visible = tracegen::backend_device_count();
                 assert!(
                     visible >= requested,
                     "GATE_AIR_BASE_GPUS={requested} but only {visible} CUDA device(s) visible \
@@ -2237,13 +682,13 @@ fn prove_folded(
                 shard_cases.len()
             );
             let tb = Instant::now();
-            shard_bases.push(base::prove_base_shard(
+            shard_bases.push(prover::prove_base_shard(
                 base_precompute_ref,
                 shard_cases,
                 gates,
                 k,
                 n_gates,
-                &topo,
+                base_log_blowup,
                 rc_lo_index,
             )?);
             eprintln!(
@@ -2298,7 +743,9 @@ fn prove_folded(
     } else {
         pool_threads
     };
-    let pools = PoolSet::new(n_pools, threads_per_pool);
+    // Byte-neutral tuning knob: optionally deprioritize pool workers (`None` = off).
+    let pool_nice = std::env::var("RECURSION_POOL_NICE").ok();
+    let pools = PoolSet::new(n_pools, threads_per_pool, pool_nice);
 
     // Per-shard distinct leaf: build the GateAirLeafParams for THIS shard (its own boundary +
     // preprocessed root), convert THIS shard's base proof to circuit values, and prove the leaf.
@@ -2380,18 +827,23 @@ fn prove_folded(
             // PRODUCERS: `g` threads, one per GPU. Producer-shard `s` is proved on gpu `s % g`
             // (round-robin keyed on shard index; g == 1 ⇒ all on gpu 0). Each producer binds its device
             // once via `set_base_gpu(gpu)`, so its `device_parts()`/pool/trim act on ITS device. Shared
-            // borrows (read-only `gates`/`topo`/`rc_lo_index`/`shard_case_sets`, Copy `base_precompute`)
-            // outlive this `thread::scope`.
+            // borrows (read-only `gates`/`rc_lo_index`/`shard_case_sets`, Copy `base_precompute` and
+            // `base_log_blowup`) outlive this `thread::scope`.
             let gates_ref = &gates;
-            let topo_ref = &topo;
             let rc_lo_index_ref = &rc_lo_index;
             let shard_case_sets_ref = &shard_case_sets;
+            // OODS pool thread count — byte-neutral tuning knob (default 4). Read once here (this
+            // region owns the producer loop) so the value is passed into each device-bound pool.
+            #[cfg(feature = "gpu-cuda")]
+            let oods_pool_threads: usize = parse_env::<usize>("GATE_AIR_OODS_POOL_THREADS")
+                .filter(|&n| n > 0)
+                .unwrap_or(4);
             let producers: Vec<_> = (0..g)
                 .map(|gpu| {
                     let base_tx = base_tx.clone();
                     scope.spawn(move || {
                         #[cfg(feature = "cuda")]
-                        gpu_tracegen::set_base_gpu(gpu);
+                        tracegen::set_base_gpu(gpu);
                         // Class-1 SIGSEGV fix: a PRIVATE rayon pool whose workers are all bound to
                         // THIS producer's device (`gpu`), so the OODS-phase fan-outs inside
                         // `prove_base_shard` (`pcs/mod.rs` `build_weights_hash_map` par_iter + OODS
@@ -2399,30 +851,30 @@ fn prove_folded(
                         // device-0 workers (which deref device-`gpu` pointers => SIGSEGV). Built
                         // once per producer; each `prove_base_shard` runs inside `pool.install`.
                         #[cfg(feature = "gpu-cuda")]
-                        let oods_pool = gpu_tracegen::build_device_bound_pool(gpu);
+                        let oods_pool = tracegen::build_device_bound_pool(gpu, oods_pool_threads);
                         // Shards `s` in 0..n_shards with `s % g == gpu` are proved on this gpu.
                         for shard_idx in (0..n_shards).filter(|s| s % g == gpu) {
                             let tb = Instant::now();
                             #[cfg(feature = "gpu-cuda")]
                             let r = oods_pool.install(|| {
-                                base::prove_base_shard(
+                                prover::prove_base_shard(
                                     base_precompute_ref,
                                     &shard_case_sets_ref[shard_idx],
                                     gates_ref,
                                     k,
                                     n_gates,
-                                    topo_ref,
+                                    base_log_blowup,
                                     rc_lo_index_ref,
                                 )
                             });
                             #[cfg(not(feature = "gpu-cuda"))]
-                            let r = base::prove_base_shard(
+                            let r = prover::prove_base_shard(
                                 base_precompute_ref,
                                 &shard_case_sets_ref[shard_idx],
                                 gates_ref,
                                 k,
                                 n_gates,
-                                topo_ref,
+                                base_log_blowup,
                                 rc_lo_index_ref,
                             );
                             eprintln!(
@@ -2455,7 +907,6 @@ fn prove_folded(
                 // pool workers, with proving-utils running `prove_leaf` on the SAME worker right after,
                 // so GPU base-proving overlaps BOTH the leaf build+prove and the fold. Leaf i = shard i
                 // (index-tagged), byte-identical to the sequential build+prove+fold.
-                let agg = &leaf_cfg;
                 let pre = recursion_pre_ref;
                 let make_base_ref = &make_base;
                 let pools_ref = &pools;
@@ -2472,7 +923,7 @@ fn prove_folded(
                 let (leaf_tx, leaf_rx) = std::sync::mpsc::channel::<(usize, BaseShardOutput)>();
                 let fold_handle = scope.spawn(move || {
                     recursive_aggregate_prove_leaves_streaming(
-                        leaf_rx, n_shards, build, agg, pre, pools_ref,
+                        leaf_rx, n_shards, build, pre, pools_ref,
                     )
                 });
                 let mut base_err: Option<anyhow::Error> = None;
@@ -2566,8 +1017,7 @@ fn prove_folded(
     // inputs), `out`, and `rv` for the shared fingerprint block below.
     let (base_nodes, out, rv) = {
         // Config + precompute already built up front from PUBLIC params (reused whether or not
-        // the pipeline overlap wrapped leaves early).
-        let agg = leaf_cfg;
+        // the pipeline overlap wrapped leaves early); the runtime config is cached in the precompute.
 
         // Leaves + folded root. Under the pipeline overlap (Model 1, "hide the fold behind
         // base-proving"), the coordinator ALREADY wrapped every leaf AND folded the whole tree
@@ -2598,7 +1048,7 @@ fn prove_folded(
                 };
                 let tf = Instant::now();
                 let (leaves, out) =
-                    recursive_aggregate_prove_leaves(bases, build, &agg, recursion_pre_ref, &pools);
+                    recursive_aggregate_prove_leaves(bases, build, recursion_pre_ref, &pools);
                 eprintln!(
                     "gate-air: {} leaf/leaves proved + folded to root in {:.1}s ({} levels)",
                     leaves.len(),
@@ -2612,7 +1062,7 @@ fn prove_folded(
         // Root verification: unpack from the raw leaves + self-verify.
         let zk = ZkBlind {
             seed: [7u8; 32],
-            n_padding: agg.node_pcs_config.fri_config.n_queries,
+            n_padding: recursion_pre_ref.node_pcs_config().fri_config.n_queries,
         };
         let bottom = LeafBottom {
             leaves: leaves.clone(),
@@ -2621,8 +1071,13 @@ fn prove_folded(
         // tree asserts its committed root == this const's `preprocessed_root`.
         let unpacker_config = pinned_unpacker_config(op, leaves.len());
         let t = Instant::now();
-        let rv =
-            prove_root_verification_leaves(&out.root, &bottom, &agg, &unpacker_config, Some(zk));
+        let rv = prove_root_verification_leaves(
+            &out.root,
+            &bottom,
+            recursion_pre_ref,
+            &unpacker_config,
+            Some(zk),
+        );
         eprintln!(
                 "gate-air: root verification OK in {:.1}s (trace 2^{}, {} leaf outputs unpacked + zk-blinded)",
                 t.elapsed().as_secs_f64(),
@@ -2740,9 +1195,9 @@ fn prove_monolithic(
     // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
     // the base proof passes the privacy-verifier security test. The in-circuit verifier replays this
     // exact config, so its verification circuit now reflects the real (secure) decommitment cost.
-    // Base blowup is a sweep knob (env BASE_BLOWUP overrides the default), read off the unified
-    // TopologyConfig so this monolithic (non-fold) path resolves the same value as the recursion path.
-    let base_blowup: u32 = TopologyConfig::from_env().base_log_blowup;
+    // Base blowup is a sweep knob (env BASE_BLOWUP overrides the default); resolved identically to
+    // the recursion path so this monolithic (non-fold) path uses the same value.
+    let base_blowup: u32 = parse_env("BASE_BLOWUP").unwrap_or(prover::BASE_LOG_BLOWUP);
     let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + config.fri_config.log_blowup_factor)
@@ -2818,7 +1273,7 @@ fn prove_monolithic(
         // Device K1: 191 main columns generated on the GPU, fed in as device-resident BaseFieldVecs.
         let (gates_flat, x_states, off_lo, off_hi) =
             gpu_flat_inputs(&gates, cases, &rc_lo_index, &rc_lo_index)?;
-        let (main_dev, _lo, d_cols) = gpu_tracegen::gpu_gen_main_trace_device(
+        let (main_dev, _lo, d_cols) = tracegen::gpu_gen_main_trace_device(
             &gates_flat,
             &x_states,
             &off_lo,
@@ -2858,8 +1313,8 @@ fn prove_monolithic(
     // Hold the ~24 GB main-trace device buffer resident from the tree1 commit through K4.
     // See `MainTrace::from_k1` / `gpu_gen_interaction_device`.
     #[cfg(feature = "cuda")]
-    let main_k1: gpu_tracegen::MainTrace =
-        gpu_tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
+    let main_k1: tracegen::MainTrace =
+        tracegen::MainTrace::from_k1(d_main_cols).map_err(|e| anyhow::anyhow!(e))?;
 
     // Interaction-trace PoW grind, then mix the nonce (canonical transcript).
     let interaction_pow_nonce = ProverBackend::grind(prover_channel, INTERACTION_POW_BITS);
@@ -2876,7 +1331,7 @@ fn prove_monolithic(
         // Install the downstream gate_air GPU constraint kernel into the generic CudaBackend prover,
         // then thread the drawn (z, alpha) challenges to it.
         gate_air_cuda_kernel::register();
-        let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+        let (z, alpha_powers) = tracegen::gate_air_relation_m31x4(&elements.qubitmem);
         gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
     }
 
@@ -2887,7 +1342,7 @@ fn prove_monolithic(
     // becomes `main_sum`. The CPU (SimdBackend) interaction gen survives only on the non-cuda build.
     #[cfg(feature = "cuda")]
     let main_interaction_device = {
-        let (cols, claimed) = gpu_tracegen::gpu_gen_interaction_device(
+        let (cols, claimed) = tracegen::gpu_gen_interaction_device(
             &main_k1,
             n_gates as u32,
             padded_rows,
@@ -3106,21 +1561,6 @@ fn prove_monolithic(
     );
 
     Ok(())
-}
-
-// Pack a flat sequence column for a vec_row.
-fn pack_seq(values: &[u32], vec_row: usize) -> PackedM31 {
-    PackedM31::from_array(std::array::from_fn(|lane| {
-        BaseField::from_u32_unchecked(values[(vec_row << LOG_N_LANES) + lane])
-    }))
-}
-
-// Pack a decoded value computed from the qubit index for the qdecode table.
-#[allow(dead_code)] // used by the cuda/gpu-cuda interaction paths
-fn pack_decode(vec_row: usize, f: impl Fn(usize) -> u32) -> PackedM31 {
-    PackedM31::from_array(std::array::from_fn(|lane| {
-        BaseField::from_u32_unchecked(f((vec_row << LOG_N_LANES) + lane))
-    }))
 }
 
 fn normalize(path: PathBuf) -> PathBuf {

@@ -9,7 +9,7 @@ use recursive_aggregate::root_prover::RootVerificationOutput;
 use recursive_aggregate::{AggregateOutput, TreeProof};
 use sha2::{Digest, Sha256};
 
-use crate::base::BaseShardOutput;
+use crate::prover::BaseShardOutput;
 
 /// Deterministic SHA-256 over the serde-serialized `StarkProof` — the full-proof byte-identity
 /// fingerprint (`GATE_AIR_PROOF_HASH`). Cross-run/-backend stable, so the backend under test is the

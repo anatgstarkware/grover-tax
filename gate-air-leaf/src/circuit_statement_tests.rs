@@ -2,7 +2,8 @@
 //! trace row, cross-checking the `FrameworkEval` → `CircuitEval` constraint translation.
 
 use super::*;
-use crate::{build_rows, cell_at, parse_gtv1, Fixture};
+use crate::tracegen::{build_rows, cell_at};
+use crate::{parse_gtv1, Fixture};
 use circuits::context::Context;
 use circuits_stark_verifier::test_utils::TestComponentData;
 use std::collections::HashMap;

@@ -7,45 +7,16 @@ use super::*;
 
 use circuit_common::finalize::{compute_padded_sizes, pad_to_targets, ComponentSizes};
 use circuit_common::preprocessed::PreprocessedCircuit;
-use circuit_verifier::verify::CircuitConfig;
 use circuits::blake::HashValue;
 use circuits::ivalue::NoValue;
 use circuits_stark_verifier::proof::{empty_proof, ProofConfig};
-use recursion_consts::OperatingPoint;
-use recursive_aggregate::pinned_configs::{assemble_aggregate_config, DerivedConfigs};
-use recursive_aggregate::test_utils::derive_configs;
-use recursive_aggregate::AggregateConfig;
+use recursion_consts::{OperatingPoint, FOLD_ARITY, RECURSION_LOG_BLOWUP};
 
 use leaf::{build_gate_air_leaf_circuit, GateAirLeafParams};
 
-/// COMPUTES (not pins) the gate_air `AggregateConfig` for a fixture — a thin wrapper over
-/// `derive_configs` + `assemble_aggregate_config`, for the tiny non-pinned wiring roundtrips (a tiny
-/// fixture is not a pinned point). `n = 1` placeholder (only feeds the discarded unpacker field;
-/// callers recompute the real per-N unpacker). Production reads `leaf::pinned_aggregate_config`.
-pub(super) fn derive_aggregate_config(
-    cfg: &ProofConfig,
-    params: &GateAirLeafParams,
-    fold_arity: usize,
-    // Node (level1-/fold-node/root) FRI blowup.
-    log_blowup_factor: u32,
-    // Leaf-wrap FRI blowup, decoupled from the node blowup (equal to it unless `LEAF_BLOWUP` is set).
-    leaf_log_blowup: u32,
-) -> AggregateConfig {
-    let (leaf_pp, leaf_pcs_cfg, leaf_target) = build_leaf_pp(cfg, params, leaf_log_blowup);
-    let derived = derive_configs(
-        &leaf_pp,
-        leaf_pcs_cfg,
-        leaf_log_blowup,
-        log_blowup_factor,
-        fold_arity,
-        1,
-    );
-    assemble_aggregate_config(&derived, leaf_target, fold_arity)
-}
-
 /// Builds the leaf preprocessed circuit padded to its OWN natural target (the leaf↔node padding
 /// decoupling), returning it with its PCS and that natural target.
-fn build_leaf_pp(
+pub(super) fn build_leaf_pp(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     leaf_log_blowup: u32,
@@ -122,35 +93,13 @@ fn leaf_shape(k: usize, shots: usize) -> (ProofConfig, GateAirLeafParams) {
     (cfg, params)
 }
 
-/// Renders a `HashValue<QM31>`'s eight raw words for a paste-able `[u32; 8]` literal.
-fn hv_words(h: &HashValue<SecureField>) -> [u32; 8] {
-    std::array::from_fn(|i| {
-        let [lo, hi, 0, 0] = h[i].get().to_m31_array().map(|m| m.0) else {
-            return 0;
-        };
-        lo | (hi << 16)
-    })
-}
-
 /// Runs the whole fresh cascade for one point and asserts it equals the pinned `PinnedConfigs` table
 /// (via `check_configs`, which re-derives + per-field/per-arity `assert_eq`). Builds the real
 /// ~2^22 node preprocessed circuits, so box-only.
 fn drift(op: OperatingPoint, k: usize, shots: usize) {
-    let topo = TopologyConfig::default();
     let (cfg, params) = leaf_shape(k, shots);
-    let (leaf_pp, leaf_pcs_cfg, _leaf_target) = build_leaf_pp(&cfg, &params, topo.leaf_log_blowup);
-    let expected = op
-        .pinned()
-        .to_derived(topo.leaf_log_blowup, topo.recursion_log_blowup);
-    recursive_aggregate::test_utils::check_configs(
-        &leaf_pp,
-        leaf_pcs_cfg,
-        topo.leaf_log_blowup,
-        topo.recursion_log_blowup,
-        topo.fold_arity,
-        op.n(),
-        &expected,
-    );
+    let (leaf_pp, leaf_pcs_cfg, _leaf_target) = build_leaf_pp(&cfg, &params, RECURSION_LOG_BLOWUP);
+    recursive_aggregate::test_utils::check_configs(&leaf_pp, leaf_pcs_cfg, op.pinned());
 }
 
 #[test]
@@ -173,93 +122,25 @@ fn k2000_drift() {
 
 /// SINGLE-PASS capture of the ENTIRE pinned-const table (all 3 points, all layers) — the from-scratch
 /// capture tool feeding `scripts/gen_recursion_consts.py`. Recomputes every layer FRESH from the
-/// fixture in one pass via the shared `derive_configs`, so a whole-table (re)capture is a single box
+/// fixture in one pass via the shared `capture_point`, so a whole-table (re)capture is a single box
 /// run. Emits `@@`-prefixed lines the generator parses. Run:
 /// `cargo test --release --features cuda capture_all -- --ignored --nocapture`.
 #[test]
 #[ignore = "box-only: single-pass full-table capture (real per-point cascade)"]
 fn capture_all() {
-    let topo = TopologyConfig::default();
     for (op, k, shots) in POINTS {
         println!("@@POINT {op:?}");
         let (cfg, params) = leaf_shape(k, shots);
         let (leaf_pp, leaf_pcs_cfg, _leaf_target) =
-            build_leaf_pp(&cfg, &params, topo.leaf_log_blowup);
-        let derived = derive_configs(
+            build_leaf_pp(&cfg, &params, RECURSION_LOG_BLOWUP);
+        recursive_aggregate::test_utils::capture_point(
             &leaf_pp,
             leaf_pcs_cfg,
-            topo.leaf_log_blowup,
-            topo.recursion_log_blowup,
-            topo.fold_arity,
+            RECURSION_LOG_BLOWUP,
+            RECURSION_LOG_BLOWUP,
+            FOLD_ARITY,
             op.n(),
         );
-        emit_point(&derived, topo.recursion_log_blowup);
     }
     println!("@@CAPTURE_DONE");
-}
-
-/// Emits every `@@` line for one point's [`DerivedConfigs`] (leaf shape/root, node_target, per-arity
-/// level1/fold shape+roots, the unpacker) — the format `gen_recursion_consts.py` parses. The layer
-/// shape (`@@{tag}_TRACE`/`@@{tag}_COLS`) is emitted once per node layer (arity 2), roots per arity.
-fn emit_point(d: &DerivedConfigs, node_blowup: u32) {
-    let leaf_root = HashValue::from(hv_words(&d.leaf.preprocessed_root));
-    emit_layer("LEAF", trace_of(&d.leaf, node_blowup), &d.leaf);
-    emit_root("LEAF_ROOT", &leaf_root);
-
-    let nt = &d.node_target;
-    println!(
-        "@@NODE_TARGET {} {} {} {} {}",
-        nt.eq, nt.qm31_ops, nt.m31_to_u32, nt.triple_xor, nt.blake_g_gate
-    );
-
-    for (tag, layer) in [("LEVEL1", &d.level1), ("FOLD", &d.fold)] {
-        for (i, cfg) in layer.iter().enumerate() {
-            let arity = i + 2;
-            if arity == 2 {
-                emit_layer(tag, trace_of(cfg, node_blowup), cfg);
-            }
-            emit_root(&format!("{tag}_ROOT_{arity}"), &cfg.preprocessed_root);
-        }
-    }
-
-    let u = &d.unpacker;
-    let p = &u.config;
-    println!(
-        "@@UNPACKER_PCS {} {} {} {} {} {}",
-        p.pow_bits,
-        p.fri_config.log_blowup_factor,
-        p.fri_config.log_last_layer_degree_bound,
-        p.fri_config.n_queries,
-        p.fri_config.fold_step,
-        p.lifting_log_size.expect("unpacker lifting"),
-    );
-    println!("@@UNPACKER_NOUT {}", u.n_outputs);
-    println!("@@UNPACKER_COLS {}", cols_str(u));
-    emit_root("UNPACKER_ROOT", &u.preprocessed_root);
-}
-
-/// A config's trace log-size = its PCS lifting minus the FRI blowup.
-fn trace_of(cfg: &CircuitConfig, blowup: u32) -> u32 {
-    cfg.config.lifting_log_size.expect("lifting") - blowup
-}
-
-/// Emits a layer's `@@{tag}_TRACE` + `@@{tag}_COLS` lines for the fill generator.
-fn emit_layer(tag: &str, trace_log_size: u32, cfg: &CircuitConfig) {
-    println!("@@{tag}_TRACE {trace_log_size}");
-    println!("@@{tag}_COLS {}", cols_str(cfg));
-}
-
-/// Space-separated `id:log_size` preprocessed-column pairs, in canonical committed order.
-fn cols_str(cfg: &CircuitConfig) -> String {
-    cfg.preprocessed_column_log_sizes
-        .iter()
-        .map(|(id, ls)| format!("{}:{}", id.id, ls))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Emits `@@{tag} w0 w1 .. w7` for an eight-word root.
-fn emit_root(tag: &str, root: &HashValue<SecureField>) {
-    let words: Vec<String> = hv_words(root).iter().map(|w| w.to_string()).collect();
-    println!("@@{tag} {}", words.join(" "));
 }

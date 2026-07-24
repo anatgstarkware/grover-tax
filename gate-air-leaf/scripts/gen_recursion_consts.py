@@ -5,8 +5,10 @@ Usage: gen_recursion_consts.py <capture_log> [<recursion_consts.rs>]
 
 Parses the `@@`-prefixed lines the `capture_all` test prints (all 3 operating points, all layers) and
 replaces the region between the `// <<GENERATED CONSTS BEGIN ...>>` / `// <<GENERATED CONSTS END>>`
-markers with the three full `const K*: PinnedConfigs` definitions (the generic const-friendly type
-from `recursive_aggregate::pinned_configs`). Run `cargo fmt` afterwards.
+markers with the three full `const K*: RecursionConfig` definitions (the single const config type
+from `recursive_aggregate::pinned_configs`). The recursion params are not captured: the blowups/arity
+reference the `RECURSION_LOG_BLOWUP` / `FOLD_ARITY` consts and `n_leaves` is read from the point name
+(`K<k>N<n>`). Run `cargo fmt` afterwards.
 """
 import sys
 import os
@@ -59,7 +61,8 @@ def roots7(d):
 def gen_point(name, p):
     pcs = p["UNPACKER_PCS"]  # pow_bits log_blowup log_last_layer n_queries fold_step lifting
     nt = p["NODE_TARGET"]
-    return f"""const {name}: PinnedConfigs = PinnedConfigs {{
+    n_leaves = int(name.split("N")[-1])  # K<k>N<n> naming convention
+    return f"""const {name}: RecursionConfig = RecursionConfig {{
     leaf: PinnedLayer {{ trace_log_size: {p['LEAF_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEAF_COLS'])}, root: {root(p['LEAF_ROOT'])} }},
     level1: PinnedNodeLayer {{ trace_log_size: {p['LEVEL1_TRACE']}, preprocessed_column_log_sizes: {cols(p['LEVEL1_COLS'])}, roots: {roots7(p['level1_roots'])} }},
     fold: PinnedNodeLayer {{ trace_log_size: {p['FOLD_TRACE']}, preprocessed_column_log_sizes: {cols(p['FOLD_COLS'])}, roots: {roots7(p['fold_roots'])} }},
@@ -70,6 +73,10 @@ def gen_point(name, p):
         preprocessed_column_log_sizes: {cols(p['UNPACKER_COLS'])},
         root: {root(p['UNPACKER_ROOT'])},
     }},
+    recursion_log_blowup: RECURSION_LOG_BLOWUP,
+    leaf_log_blowup: RECURSION_LOG_BLOWUP,
+    fold_arity: FOLD_ARITY,
+    n_leaves: {n_leaves},
 }};"""
 
 

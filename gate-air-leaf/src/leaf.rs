@@ -10,25 +10,19 @@
 
 use circuits::blake::{blake2s, HashValue};
 use circuits::context::{Context, FinalizedContext, Var};
-use circuits::ivalue::{IValue, NoValue};
+use circuits::ivalue::IValue;
 use circuits::ops::Guess;
-use circuits_stark_verifier::proof::{empty_proof, Proof, ProofConfig};
+use circuits_stark_verifier::proof::{Proof, ProofConfig};
 use circuits_stark_verifier::verify::verify;
 
-use circuit_common::finalize::{compute_padded_sizes, ComponentSizes};
 use circuit_common::N_RESERVED;
 
-use recursive_aggregate::precomputes::RecursionPrecompute;
-use recursive_aggregate::AggregateConfig;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 
-use crate::recursion_consts::OperatingPoint;
-use crate::topology::{TopologyConfig, FOLD_ARITY, RECURSION_LOG_BLOWUP};
-
+use crate::air::N_LIMBS;
 use crate::circuit_statement::GateAirStatement;
-use crate::N_LIMBS;
 
 /// Public parameters of the gate_air proof the leaf verifies (everything `GateAirStatement::new`
 /// needs). Identical for the NoValue shape pass and the real QM31 assignment.
@@ -88,6 +82,19 @@ pub fn leaf_pcs_config(trace_log_size: u32, log_blowup_factor: u32) -> PcsConfig
     }
 }
 
+/// Builds the gate_air single-base LEAF circuit: verify one base proof (via [`emit_one_base`]) and
+/// set the reserved outputs to its `H_i`. Generic over `Value` (NoValue shape / QM31 assignment).
+pub fn build_gate_air_leaf_circuit<Value: IValue>(
+    proof: Proof<Value>,
+    cfg: &ProofConfig,
+    params: &GateAirLeafParams,
+) -> FinalizedContext<Value> {
+    let mut context = Context::new(N_RESERVED);
+    let h_i_vars = emit_one_base(&mut context, proof, cfg, params);
+    context.set_outputs(&h_i_vars);
+    context.finalize(false)
+}
+
 /// Verifies ONE gate_air base proof in-circuit and returns the eight `H_i` digest words the leaf
 /// sets as outputs. The whole security-relevant binding lives here.
 fn emit_one_base<Value: IValue>(
@@ -123,78 +130,4 @@ fn emit_one_base<Value: IValue>(
     let output_hash: HashValue<_> = blake2s(context, &preimage, 16 * preimage.len());
     let h_i_vars: Vec<Var> = output_hash.iter().map(|w| *w.get()).collect();
     h_i_vars
-}
-
-/// Builds the gate_air single-base LEAF circuit: verify one base proof (via [`emit_one_base`]) and
-/// set the reserved outputs to its `H_i`. Generic over `Value` (NoValue shape / QM31 assignment).
-pub fn build_gate_air_leaf_circuit<Value: IValue>(
-    proof: Proof<Value>,
-    cfg: &ProofConfig,
-    params: &GateAirLeafParams,
-) -> FinalizedContext<Value> {
-    let mut context = Context::new(N_RESERVED);
-    let h_i_vars = emit_one_base(&mut context, proof, cfg, params);
-    context.set_outputs(&h_i_vars);
-    context.finalize(false)
-}
-
-/// Assembles the gate_air `AggregateConfig` for pinned operating point `op` entirely from the pinned
-/// verifier consts (no derivation), via the same `assemble_aggregate_config` the fresh cascade uses,
-/// so a pinned config is byte-identical to a derived one. The PRODUCTION config source. The pinned
-/// points fix `fold_arity == FOLD_ARITY` and the default node/leaf blowup (asserted); `cfg`/`params`
-/// only compute the leaf's own natural padding target.
-pub fn pinned_aggregate_config(
-    op: OperatingPoint,
-    topo: &TopologyConfig,
-    cfg: &ProofConfig,
-    params: &GateAirLeafParams,
-) -> AggregateConfig {
-    assert_eq!(
-        topo.fold_arity, FOLD_ARITY,
-        "pinned operating points fix fold_arity = {FOLD_ARITY}"
-    );
-    assert_eq!(
-        (topo.recursion_log_blowup, topo.leaf_log_blowup),
-        (RECURSION_LOG_BLOWUP, RECURSION_LOG_BLOWUP),
-        "pinned operating points fix the default node/leaf blowup"
-    );
-    op.pinned().to_aggregate_config(
-        leaf_target_sizes(cfg, params),
-        topo.leaf_log_blowup,
-        topo.recursion_log_blowup,
-        FOLD_ARITY,
-    )
-}
-
-/// Builds the flat leaf/level1/fold [`RecursionPrecompute`]: builds the AIR-specific leaf circuit
-/// (the only gate_air-specific ingredient) and hands it to the generic
-/// [`recursive_aggregate::precomputes::build_recursion_precompute`], which rebuilds every held tree
-/// from `config` and asserts each committed root equals `config`'s pinned root.
-///
-/// `build_all_arities`: production passes `false` → build shapes only for the arities this point's
-/// fold uses ([`op.n()`] leaves); tests pass `true`. See the proving-utils fn for details.
-pub fn build_recursion_precompute(
-    config: &AggregateConfig,
-    op: OperatingPoint,
-    cfg: &ProofConfig,
-    params: &GateAirLeafParams,
-    build_all_arities: bool,
-) -> RecursionPrecompute {
-    recursive_aggregate::precomputes::build_recursion_precompute(
-        build_gate_air_leaf_circuit::<NoValue>(empty_proof(cfg), cfg, params),
-        config,
-        op.n(),
-        build_all_arities,
-    )
-}
-
-/// The leaf's OWN natural padding target, decoupled from the node target so `t_leaf` is pinned
-/// independent of `fold_arity`. The pinned leaf root is the soundness anchor; this padding only sets
-/// the prover's own leaf trace shape (a drift fails the leaf root assert).
-fn leaf_target_sizes(cfg: &ProofConfig, params: &GateAirLeafParams) -> ComponentSizes {
-    compute_padded_sizes(&build_gate_air_leaf_circuit::<NoValue>(
-        empty_proof(cfg),
-        cfg,
-        params,
-    ))
 }

@@ -1,9 +1,33 @@
 //! Unit + integration tests for the gate_air base/leaf/recursion pipeline. CI coverage for the
 //! prover self-checks moved off the release hot path (`assert_tree0_matches_rebuild`, per-shard
-//! claimed-sums balance) plus the CPU/GPU byte-identity and recursion-roundtrip tests. The
+//! claimed-sums balance), the CPU/GPU byte-identity tests, and the per-layer recursion-config drift
+//! tests (`recursion_consts_tests`, gate_air's AIR-specific config). The generic recursion
+//! prove-machinery tests (streaming byte-identity, panic propagation) live in proving-utils. The
 //! `cuda,diag` tests are `#[serial]` (shared-device CUDA module load) and gated off the CPU build.
 
 use super::*;
+// Trace/witness-gen items relocated to `tracegen` (Step-1 reorg). Glob is safe here: tests never
+// name the gate-local `TRACE_COLUMNS`/`GATE_REL_WIDTH` gpu consts, so no ambiguity with the crate-root
+// consts brought in via `use super::*`.
+use crate::tracegen::*;
+// Per-component evals + relation ids (module reorg); imported from their owning component files.
+use crate::components::gate::GateEval;
+use crate::components::program::ProgramEval;
+use crate::components::qubitmem::QubitMemEval;
+use crate::components::range_check::{RangeCheckEval, TAG_RC};
+// stwo trace-column types/traits the tests build columns with. Previously reached transitively through
+// `main`'s imports; imported here directly now that the trace-gen items (Step-1) and the AIR items
+// (Step-2, `air`) live in their own modules.
+use stwo::core::pcs::TreeVec;
+use stwo::prover::backend::simd::SimdBackend as TraceBackend;
+use stwo::prover::backend::Column;
+use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
+// `FrameworkEval` for the eval trait bound in the tests' constraint checks; `assert_constraints_on_trace`
+// for the on-trace constraint helpers (T5).
+use stwo_constraint_framework::{assert_constraints_on_trace, FrameworkEval};
+// Only the `cuda,diag` byte-identity tests name `Proof<QM31>` now (`prove_tiny_base[_on_gpu]`).
+#[cfg(all(feature = "cuda", feature = "diag"))]
 use stwo::core::fields::qm31::QM31;
 // Serializes the concurrent GPU byte-identity tests; only referenced by the `cuda,diag` tests.
 #[cfg(all(feature = "cuda", feature = "diag"))]
@@ -68,7 +92,7 @@ fn shard0_shape(
     let log_n_rows = padded_rows.ilog2();
     let program = build_program_table(gates, cases.len(), k);
     let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
-    let config = leaf::leaf_pcs_config(max_log_size, TopologyConfig::default().base_log_blowup);
+    let config = leaf::leaf_pcs_config(max_log_size, prover::BASE_LOG_BLOWUP);
     (
         rows,
         boundary,
@@ -83,7 +107,9 @@ fn shard0_shape(
 /// Proves ONE tiny gate_air base STARK on the CPU (SimdBackend) for `(gates, cases, k)`, returning
 /// the circuit-form base `Proof<QM31>` + its `GateAirLeafParams` (what `prove_gate_air_leaf` consumes).
 /// Replicates the `--recurse` single-base CPU prove sequence (tree0 commit → witness/interaction
-/// gen → prove_ex → proof_from_stark_proof) for a self-contained test.
+/// gen → prove_ex → proof_from_stark_proof) for a self-contained test. Only the `cuda,diag`
+/// byte-identity tests consume it now, so it is gated with them off the CPU build.
+#[cfg(all(feature = "cuda", feature = "diag"))]
 fn prove_tiny_base(
     gates: &[Gate],
     cases: &[TestCase],
@@ -378,7 +404,7 @@ fn prove_tiny_base_on_gpu(
     let elements = LookupElements::draw(prover_channel);
 
     // Thread the drawn (z, alpha) to the GPU kernel.
-    let (z, alpha_powers) = gpu_tracegen::gate_air_relation_m31x4(&elements.qubitmem);
+    let (z, alpha_powers) = tracegen::gate_air_relation_m31x4(&elements.qubitmem);
     gate_air_cuda_kernel::set_gate_air_relation(z, alpha_powers);
 
     let (main_interaction, main_sum) =
@@ -457,305 +483,6 @@ fn prove_tiny_base_on_gpu(
     let circuit_proof =
         proof_from_stark_proof(&extended, &cfg, claim, interaction_pow_nonce, channel_salt);
     (circuit_proof, params)
-}
-
-/// The leaf-recursion prove→fold→verify→self-verify roundtrip over `n_leaves`
-/// standalone gate_air leaves, using the toy per-base PCS from `prove_tiny_base`: one leaf per base
-/// (`prove_gate_air_leaf`),
-/// a level-0 leaf-verifying (level1-node) layer + shared fold-node up-tree fold (`recursive_aggregate_prove_leaves`),
-/// and the leaf unpacker (`prove_root_verification_leaves` / `LeafBottom`). `n_leaves == 1` is a
-/// lone-leaf root (no level1-node, no fold-node — laptop-safe); `n_leaves >= 2` builds the level-0 level1-node layer (and, at
-/// `n > k`, an fold-node up-tree node) which floors ~2^22 → heavy.
-fn leaf_recursion_roundtrip(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
-    use circuit_verifier::verify::{verify_circuit, CircuitPublicData};
-    use circuits_stark_verifier::proof::Proof;
-    use leaf::{build_gate_air_leaf_circuit, build_recursion_precompute, GateAirLeafParams};
-    use recursion_consts_tests::derive_aggregate_config;
-    use recursive_aggregate::pools::PoolSet;
-    use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
-    use recursive_aggregate::root_prover::{prove_root_verification_leaves, LeafBottom};
-    use recursive_aggregate::test_utils::unpacker_verify_config;
-
-    let (gates, cases, k) = nop_fixture(4, 2, 1);
-    // leaf-recursion uses the leaf preprocessed root (not the base-fanning canonical base root), so the
-    // recomputed canonical base pp root is unused here. Tiny-base tests are NOT a pinned curve point;
-    // they build the (real) config + unpacker config via the recompute helpers, not the pinned consts.
-    let (proof0, params0, cfg, _canonical_base_pp_root) =
-        prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
-    let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (tests recompute their own roots)
-    let config = derive_aggregate_config(
-        &cfg,
-        &params0,
-        fold_arity,
-        log_blowup_factor,
-        log_blowup_factor,
-    );
-    // test: build all arities (placeholder op.n() differs from the small fold N)
-    let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
-
-    let cfg_ref = &cfg;
-    let build = move |(proof, params): (Proof<QM31>, GateAirLeafParams)| {
-        build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
-    };
-    let bases: Vec<(Proof<QM31>, GateAirLeafParams)> = (0..n_leaves)
-        .map(|_| (proof0.clone(), params0.clone()))
-        .collect();
-
-    let cores = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(2);
-    let pools = PoolSet::new(1, cores.max(1));
-    let (leaves, out) = recursive_aggregate_prove_leaves(bases, build, &config, &pre, &pools);
-    assert_eq!(leaves.len(), n_leaves);
-
-    let bottom = LeafBottom { leaves };
-    // Recompute the unpacker config for this tiny config (production supplies the pinned const).
-    let unpacker_config = unpacker_verify_config(n_leaves, &config, log_blowup_factor, None);
-    let rv = prove_root_verification_leaves(&out.root, &bottom, &config, &unpacker_config, None);
-    assert_eq!(
-        rv.leaf_outputs.len(),
-        n_leaves,
-        "root exposes one H_i per leaf"
-    );
-
-    // TRUSTED FINAL VERIFY (step 3): check `rv` against the (recomputed) canonical unpacker config —
-    // its canonical root pins every baked child root; `rv.leaf_outputs` are caller-committed. `None`
-    // blinding matches the unblinded test proof above.
-    let output_values: Vec<SecureField> = rv.leaf_outputs.iter().flatten().copied().collect();
-    verify_circuit(
-        unpacker_config,
-        rv.proof.clone(),
-        CircuitPublicData { output_values },
-    )
-    .expect("trusted gate_air root verification failed (leaf-recursion roundtrip)");
-
-    eprintln!(
-            "gate-air: leaf_recursion roundtrip OK (N={n_leaves}, n_levels={}, root trace 2^{}) [trusted verify OK]",
-            out.n_levels, rv.trace_log_size
-        );
-}
-
-/// End-to-end leaf-recursion correctness gate: ONE standalone leaf that IS the root (no level-0 level1-node,
-/// no fold-node up-tree fold). Validates the leaf-topology WIRING — `derive_aggregate_config`,
-/// `prove_gate_air_leaf`, and the leaf unpacker reconstructing + binding a single-leaf tree
-/// (`prove_root_verification_leaves`'s final `verify_circuit` sanity check). The multi-leaf level1/fold-node
-/// path is exercised by the env-gated heavy variant + proving-utils' restored `smoke_cairo_tree`.
-///
-/// RUN-GUARD (laptop-safety): env-gated to HEAVY_RECURSION so plain `cargo test` never
-/// executes a real recursion prove/verify on a laptop. Run it on the CPU VM with the guard set.
-#[test]
-fn leaf_recursion_end_to_end() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!(
-            "leaf_recursion_end_to_end: SKIPPED (recursion prove/verify). Set \
-                 HEAVY_RECURSION=1 to run."
-        );
-        return;
-    }
-    // N=1: lone leaf is the root; no fold. Blowup 1 keeps the leaf + root-verify proofs minimal.
-    leaf_recursion_roundtrip(1, 1, TopologyConfig::default().fold_arity);
-}
-
-/// HEAVY (box-only): the leaf-recursion roundtrip WITH the level-0 level1-node layer + fold-node up-tree fold. The fold-node floors
-/// ~2^22 (several GB); OOMs a laptop, so env-gated to HEAVY_RECURSION=1. Plain `cargo test`
-/// compiles + SKIPS it.
-#[test]
-fn leaf_recursion_end_to_end_with_fold() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!(
-                "leaf_recursion_end_to_end_with_fold: SKIPPED (heavy: level1/fold-node nodes ~2^22). Set \
-                 HEAVY_RECURSION=1 on the CPU VM to run the with-level1/fold-node roundtrip."
-            );
-        return;
-    }
-    // N=2: two leaves → one level-0 level1-node that IS the root (N <= k, no fold-node). Bump to N > k to
-    // also exercise the fold-node up-tree fold once a box run confirms the level1-node layer.
-    leaf_recursion_roundtrip(2, 3, TopologyConfig::default().fold_arity);
-}
-
-/// SCHEDULING-INDEPENDENCE (byte-identity) roundtrip for the overlapped
-/// [`recursive_aggregate_prove_leaves_streaming`]: prove `n_leaves` tiny gate_air leaves ONCE,
-/// then fold them (a) in order via the collect-then-fold [`recursive_aggregate_prove_leaves`] and
-/// (b) in a SCRAMBLED arrival order via the streaming coordinator (identity `wrap`, so only the
-/// SCHEDULE differs), and assert the root proof (bytes + pp_root + outs), `n_levels`, and the
-/// returned ordered leaves are BIT-EQUAL. Because the only difference is arrival/completion order,
-/// equality proves the streaming path is byte-identical to the sequential one — the acceptance
-/// invariant for "hide the fold behind base-proving". `k` is the default fold arity.
-///
-/// HEAVY (box-only): builds real level1 (and, at `n > k`, fold-node) multiverifier nodes (~2^22, GBs) so it
-/// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
-fn leaf_recursion_streaming_equiv(n_leaves: usize, log_blowup_factor: u32, fold_arity: usize) {
-    use circuits_stark_verifier::proof::Proof;
-    use leaf::{build_gate_air_leaf_circuit, build_recursion_precompute, GateAirLeafParams};
-    use recursion_consts_tests::derive_aggregate_config;
-    use recursive_aggregate::pools::PoolSet;
-    use recursive_aggregate::prove::recursive_aggregate_prove_leaves;
-    use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
-    use recursive_aggregate::{AggregateOutput, TreeProof};
-
-    let (gates, cases, k) = nop_fixture(4, 2, 1);
-    let (proof0, params0, cfg, _canonical_base_pp_root) =
-        prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
-    let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (tests recompute their own roots)
-    let config = derive_aggregate_config(
-        &cfg,
-        &params0,
-        fold_arity,
-        log_blowup_factor,
-        log_blowup_factor,
-    );
-    // test: build all arities (placeholder op.n() differs from the small fold N)
-    let pre = build_recursion_precompute(&config, op, &cfg, &params0, true);
-
-    // The same build closure both paths use per leaf (each proves the identical tiny base): only
-    // the SCHEDULE differs between sequential + streaming, so equal roots prove byte-identity. A
-    // factory hands each call site a fresh owned closure (both borrow only `cfg`).
-    let cfg_ref = &cfg;
-    let make_build = || {
-        move |(proof, params): (Proof<QM31>, GateAirLeafParams)| {
-            build_gate_air_leaf_circuit::<QM31>(proof, cfg_ref, &params)
-        }
-    };
-    let bases = || -> Vec<(Proof<QM31>, GateAirLeafParams)> {
-        (0..n_leaves)
-            .map(|_| (proof0.clone(), params0.clone()))
-            .collect()
-    };
-
-    // Bit-identity signature of a folded root (proof + pp_root + outs) and its leaves. `TreeProof`
-    // is only `Clone`, so compare via the same deterministic `{:?}` canonicalisation the
-    // recursion fingerprint uses.
-    let sig = |leaves: &[TreeProof], out: &AggregateOutput| -> String {
-        let mut s = format!("n_levels={}", out.n_levels);
-        s += &format!("|root.proof={:?}", out.root.proof);
-        s += &format!("|root.pp={:?}", out.root.preprocessed_root);
-        s += &format!("|root.outs={:?}", out.root.output_values);
-        for (i, l) in leaves.iter().enumerate() {
-            s += &format!("|leaf[{i}].proof={:?}", l.proof);
-            s += &format!("|leaf[{i}].pp={:?}", l.preprocessed_root);
-            s += &format!("|leaf[{i}].outs={:?}", l.output_values);
-        }
-        s
-    };
-
-    let cores = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(2);
-    // (a) Sequential collect-then-fold (the reference): build+prove every leaf, then fold.
-    let pools_seq = PoolSet::new(1, cores.max(1));
-    let (leaves_seq, out_seq) =
-        recursive_aggregate_prove_leaves(bases(), make_build(), &config, &pre, &pools_seq);
-    let seq_sig = sig(&leaves_seq, &out_seq);
-
-    // (b) Streaming, SCRAMBLED arrival order (reverse), the SAME build closure (only the schedule
-    // differs). Try n_pools 1 and 2 to cover both worker counts.
-    for n_pools in [1usize, 2] {
-        let pools = PoolSet::new(n_pools, (cores / n_pools).max(1));
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, (Proof<QM31>, GateAirLeafParams))>();
-        let inputs = bases();
-        // Scramble: send indices in reverse (a base-producer never guarantees arrival order).
-        for i in (0..n_leaves).rev() {
-            tx.send((i, inputs[i].clone())).unwrap();
-        }
-        drop(tx);
-        let (leaves_out, out_stream) = recursive_aggregate_prove_leaves_streaming(
-            rx,
-            n_leaves,
-            make_build(),
-            &config,
-            &pre,
-            &pools,
-        );
-        assert_eq!(
-            sig(&leaves_out, &out_stream),
-            seq_sig,
-            "n_leaves={n_leaves} n_pools={n_pools}: streaming fold not bit-identical to sequential"
-        );
-    }
-    eprintln!(
-            "gate-air: leaf_recursion streaming-equiv OK (N={n_leaves}, bit-identical to sequential, scrambled arrival, n_pools 1+2)"
-        );
-}
-
-/// (box-only) Scheduling-independence roundtrip over the required n ∈ {1, 2, k, k+1, ragged
-/// r==1, ~2k+3}. Env-gated (heavy level1/fold-node proving). Proves streaming == sequential byte-for-byte.
-#[test]
-fn leaf_recursion_streaming_equiv_sweep() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!(
-                "leaf_recursion_streaming_equiv_sweep: SKIPPED (heavy: real level1/fold-node proving ~2^22). Set \
-                 HEAVY_RECURSION=1 on the CPU VM to run the out-of-order equivalence sweep."
-            );
-        return;
-    }
-    let k = TopologyConfig::default().fold_arity;
-    // n = k+1 is the ragged r==1 case (splits into k-1 and 2); 2k+3 exercises multi-group + carry.
-    for n in [1usize, 2, k, k + 1, 2 * k + 3] {
-        leaf_recursion_streaming_equiv(n, 1, k);
-    }
-}
-
-/// TERMINATION + PANIC PROPAGATION for the streaming coordinator: a `wrap` closure that panics
-/// must make the coordinator re-panic on the parent (via `thread::scope` join) — no hang, no
-/// silent drop — for BOTH n_pools == 1 and > 1. The panic fires INSIDE `wrap`, before any level1/fold
-/// node proves, so the machinery under test is pure scheduling/termination.
-///
-/// HEAVY (box-only): `derive_aggregate_config` builds the ~2^22 level1/fold-node preprocessed shapes
-/// (heavy REGARDLESS of leaf size — a node verifies `fold_arity` in-circuit STARK proofs), which
-/// OOMs a laptop; env-gated to HEAVY_RECURSION. Plain `cargo test` compiles + SKIPS it.
-#[test]
-fn leaf_recursion_streaming_wrap_panic_propagates() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!(
-            "leaf_recursion_streaming_wrap_panic_propagates: SKIPPED (heavy: config build ~2^22). \
-                 Set HEAVY_RECURSION=1 on the CPU VM to run the panic-propagation test."
-        );
-        return;
-    }
-    use circuits::context::FinalizedContext;
-    use recursive_aggregate::pools::PoolSet;
-    use recursive_aggregate::prove_streaming::recursive_aggregate_prove_leaves_streaming;
-
-    // Build the smallest valid leaf-recursion config from a tiny base. No recursion PROVE runs (the
-    // build closure panics first), but the config build itself is the heavy part gated above.
-    let (gates, cases, k) = nop_fixture(4, 2, 1);
-    let (_p0, params0, cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
-    let fold_arity = TopologyConfig::default().fold_arity;
-    let op = recursion_consts::OperatingPoint::K500N174; // placeholder key (config recomputed for tiny base)
-    let config = recursion_consts_tests::derive_aggregate_config(&cfg, &params0, fold_arity, 1, 1);
-    let pre = leaf::build_recursion_precompute(&config, op, &cfg, &params0, true);
-
-    for n_pools in [1usize, 2] {
-        let config = &config;
-        let pre = &pre;
-        let n_leaves = 2usize; // one level1 group (n <= k); wrap panics before any node proves.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let pools = PoolSet::new(n_pools, 2);
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
-            for i in 0..n_leaves {
-                tx.send((i, i)).unwrap();
-            }
-            drop(tx);
-            // Every `build` panics — a worker panic must re-panic on the coordinator's
-            // `thread::scope` join (not hang, not be silently dropped). The panic fires inside
-            // `build`, before any level1/fold node runs, so no real proving happens (laptop-safe).
-            recursive_aggregate_prove_leaves_streaming(
-                rx,
-                n_leaves,
-                |i: usize| -> FinalizedContext<QM31> {
-                    panic!("intentional build panic at leaf {i}")
-                },
-                config,
-                pre,
-                &pools,
-            );
-        }));
-        assert!(
-                result.is_err(),
-                "n_pools={n_pools}: a panicking wrap must re-panic on the parent (no hang, no silent drop)"
-            );
-    }
-    eprintln!("gate-air: streaming wrap-panic propagation OK (re-panics, no hang; n_pools 1+2)");
 }
 
 /// (#1a) The precompute's cached tree-0 must match an independent rebuild (root + column count +
@@ -885,7 +612,7 @@ fn on_trace_constraints_all() {
         &prog_wit,
         &program_interaction,
         program_sum,
-        ProgramTableEval {
+        ProgramEval {
             log_size: program.log_size,
             elements: elements.program.clone(),
         },
@@ -899,7 +626,7 @@ fn on_trace_constraints_all() {
         &bnd_wit,
         &boundary_interaction,
         boundary_sum,
-        BoundaryTableEval {
+        QubitMemEval {
             log_size: boundary.log_size,
             elements: elements.qubitmem.clone(),
         },
@@ -913,7 +640,7 @@ fn on_trace_constraints_all() {
         &rc_wit,
         &rc_interaction,
         rc_sum,
-        RcTableEval {
+        RangeCheckEval {
             log_size: rc_table.log_size,
             elements: elements.rc.clone(),
         },
@@ -928,7 +655,7 @@ fn on_trace_constraints_all() {
 // ========================================================================
 
 /// (T1a) `k1_trace_identity` — GPU K1 main trace == CPU recompute, cell-by-cell + rc histogram.
-/// Promotes the `gpu_tracegen::k1_byte_identity` harness (formerly reachable only via the removed
+/// Promotes the `tracegen::k1_byte_identity` harness (formerly reachable only via the removed
 /// `GATE_AIR_GPU_TEST=k1` prove-path flag) to a real test.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
@@ -936,19 +663,19 @@ fn on_trace_constraints_all() {
 fn k1_trace_identity() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let rc_lo = build_rc_lo();
-    gpu_tracegen::k1_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
+    tracegen::k1_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
         .expect("GPU K1 main trace != CPU recompute");
 }
 
 /// (T1b) `k4_interaction_identity` — GPU K4 LogUp interaction == CPU recompute. Promotes the
-/// `gpu_tracegen::k4_byte_identity` harness (formerly `GATE_AIR_GPU_TEST=k4`) to a real test.
+/// `tracegen::k4_byte_identity` harness (formerly `GATE_AIR_GPU_TEST=k4`) to a real test.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
 #[serial]
 fn k4_interaction_identity() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let rc_lo = build_rc_lo();
-    gpu_tracegen::k4_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
+    tracegen::k4_byte_identity(&gates, &cases, k, &rc_lo, &rc_lo)
         .expect("GPU K4 interaction != CPU recompute");
 }
 
@@ -959,18 +686,12 @@ fn k4_interaction_identity() {
 /// `fingerprint::base_proof_fingerprint`.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
+#[ignore = "box-only: GPU base prove"]
 #[serial]
 fn base_precompute_identity() {
-    use base::{prove_base_shard, BaseProverPrecompute};
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!(
-            "base_precompute_identity: SKIPPED (GPU base prove). Set HEAVY_RECURSION=1 on the box."
-        );
-        return;
-    }
+    use prover::{prove_base_shard, BaseProverPrecompute};
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
-    let topo = TopologyConfig::default();
     let rc_lo = build_rc_lo();
     let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
         shard0_shape(&gates, &cases, k, RC_LOG);
@@ -993,10 +714,26 @@ fn base_precompute_identity() {
     .expect("precompute new");
 
     // Prove shard 0 both ways and fingerprint the two base proofs; they must be byte-identical.
-    let with_pc = prove_base_shard(Some(&pc), &cases, &gates, k, n_gates, &topo, &rc_lo)
-        .expect("prove_base_shard(Some)");
-    let rebuild = prove_base_shard(None, &cases, &gates, k, n_gates, &topo, &rc_lo)
-        .expect("prove_base_shard(None)");
+    let with_pc = prove_base_shard(
+        Some(&pc),
+        &cases,
+        &gates,
+        k,
+        n_gates,
+        prover::BASE_LOG_BLOWUP,
+        &rc_lo,
+    )
+    .expect("prove_base_shard(Some)");
+    let rebuild = prove_base_shard(
+        None,
+        &cases,
+        &gates,
+        k,
+        n_gates,
+        prover::BASE_LOG_BLOWUP,
+        &rc_lo,
+    )
+    .expect("prove_base_shard(None)");
     assert_eq!(
         fingerprint::base_proof_fingerprint(std::slice::from_ref(&with_pc)),
         fingerprint::base_proof_fingerprint(std::slice::from_ref(&rebuild)),
@@ -1014,6 +751,7 @@ mod recursion_consts_tests;
 /// `hiding_nonce()` (its fixed default is deterministic, so no override is needed here).
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
+#[ignore = "box-only: in-circuit verify build"]
 #[serial]
 fn incircuit_self_verify() {
     use circuit_statement::{gate_air_components, GateAirStatement};
@@ -1023,10 +761,6 @@ fn incircuit_self_verify() {
     use circuits::ops::Guess;
     use circuits_stark_verifier::proof::empty_proof;
     use circuits_stark_verifier::verify::verify as circuit_verify;
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!("incircuit_self_verify: SKIPPED (in-circuit verify build). Set HEAVY_RECURSION=1 on the box.");
-        return;
-    }
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
     // `prove_tiny_base` builds the base + returns the circuit-form config; rebuild the shape
@@ -1097,12 +831,9 @@ fn incircuit_self_verify() {
 /// prover paths ONLY — no core verification is patched.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
+#[ignore = "box-only: GPU base prove"]
 #[serial]
 fn gpu_vs_host_constraints_identity() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!("gpu_vs_host_constraints_identity: SKIPPED (GPU base prove). Set HEAVY_RECURSION=1 on the box.");
-        return;
-    }
     // SimdBackend (host constraint delegate) oracle: `prove_tiny_base` always proves on
     // `TraceBackend` == SimdBackend, so its serialized StarkProof is the host-path proof.
     let (gates, cases, k) = nop_fixture(4, 2, 1);
@@ -1124,12 +855,9 @@ fn gpu_vs_host_constraints_identity() {
 /// `GATE_AIR_PROOF_HASH` cross-backend oracle. Uses the deterministic `hiding_nonce()` default.
 #[cfg(all(feature = "cuda", feature = "diag"))]
 #[test]
+#[ignore = "box-only: GPU base prove"]
 #[serial]
 fn full_proof_gpu_vs_simd_identity() {
-    if std::env::var("HEAVY_RECURSION").is_err() {
-        eprintln!("full_proof_gpu_vs_simd_identity: SKIPPED (GPU base prove). Set HEAVY_RECURSION=1 on the box.");
-        return;
-    }
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let (simd_proof, _p, _cfg, _r) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
     let (gpu_proof, _p2) = prove_tiny_base_on_gpu(&gates, &cases, k, TEST_RC_LOG);
@@ -1137,5 +865,108 @@ fn full_proof_gpu_vs_simd_identity() {
         format!("{:?}", simd_proof),
         format!("{:?}", gpu_proof),
         "full proof GPU (CudaBackend) != SimdBackend"
+    );
+}
+
+/// Component provers bound to `SimdBackend` — the host/SIMD oracle path the cross-backend
+/// byte-identity tests (T6/T7) prove against under a `cuda` build (where `ProverBackend` is the
+/// CudaBackend). `FrameworkComponent<E>` implements `ComponentProver` for both backends. Only
+/// referenced from test code (`prove_tiny_base`), hence `cuda`.
+#[cfg(feature = "cuda")]
+impl super::Components {
+    fn prover_refs_simd(
+        &self,
+    ) -> Vec<&dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::SimdBackend>> {
+        use stwo::prover::backend::simd::SimdBackend;
+        vec![
+            &self.main as &dyn stwo::prover::ComponentProver<SimdBackend>,
+            &self.program as &dyn stwo::prover::ComponentProver<SimdBackend>,
+            &self.qubitmem as &dyn stwo::prover::ComponentProver<SimdBackend>,
+            &self.range_check as &dyn stwo::prover::ComponentProver<SimdBackend>,
+        ]
+    }
+}
+
+/// Assert the main component's AIR constraints (algebraic + logup) directly on the committed trace
+/// columns, pinpointing the first violated constraint index. Builds the trees
+/// `[preprocessed(empty), main, interaction]` the main `GateEval` expects and runs
+/// `assert_constraints_on_trace`. Test-support (drives the `on_trace_constraints_all` test, T5),
+/// out of the prove path.
+fn assert_main_constraints(
+    rows: &[Row],
+    padded_rows: usize,
+    log_n_rows: u32,
+    n_gates: usize,
+    elements: &LookupElements,
+    main_interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    main_sum: SecureField,
+) {
+    // Main trace columns as plain M31 vectors (circle-domain / bit-reversed
+    // order, matching what `assert_constraints_on_trace` expects).
+    let main_cols = generate_main_trace(rows, padded_rows, log_n_rows);
+    let main_vals: Vec<Vec<BaseField>> = main_cols.iter().map(|c| c.values.to_cpu()).collect();
+    let interaction_vals: Vec<Vec<BaseField>> =
+        main_interaction.iter().map(|c| c.values.to_cpu()).collect();
+    // The main component reads four preprocessed columns IN THIS ORDER (matching
+    // `GateEval::evaluate`'s `get_preprocessed_column` calls): enabler, shot_id, pc, pc_in_prog.
+    // `assert_constraints_on_trace` feeds them positionally to the eval's preprocessed reads.
+    let pp_vals: Vec<Vec<BaseField>> = vec![
+        generate_enabler_preprocessed(rows, padded_rows)
+            .values
+            .to_cpu(),
+        generate_shot_id_preprocessed(rows, padded_rows)
+            .values
+            .to_cpu(),
+        generate_pc_preprocessed(rows, padded_rows).values.to_cpu(),
+        generate_pc_in_prog_preprocessed(rows, padded_rows, n_gates)
+            .values
+            .to_cpu(),
+    ];
+
+    // Tree layout: [preprocessed, original, interaction].
+    let preprocessed: Vec<&Vec<BaseField>> = pp_vals.iter().collect();
+    let original: Vec<&Vec<BaseField>> = main_vals.iter().collect();
+    let interaction: Vec<&Vec<BaseField>> = interaction_vals.iter().collect();
+    let trace = TreeVec::new(vec![preprocessed, original, interaction]);
+
+    let eval = GateEval {
+        log_n_rows,
+        elements: elements.clone(),
+    };
+    assert_constraints_on_trace(
+        &trace,
+        log_n_rows,
+        |assert_eval| {
+            eval.evaluate(assert_eval);
+        },
+        main_sum,
+    );
+}
+
+/// Assert a table (supply-side) component's constraints directly on its committed columns. Trees:
+/// `[preprocessed, multiplicity, interaction]`. Test-support (T5), out of the prove path.
+fn assert_table_constraints<Ev: FrameworkEval + Sync>(
+    log_size: u32,
+    preprocessed: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    multiplicity: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    interaction: &[CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>],
+    claimed_sum: SecureField,
+    eval: Ev,
+) {
+    let pp_vals: Vec<Vec<BaseField>> = preprocessed.iter().map(|c| c.values.to_cpu()).collect();
+    let mult_vals: Vec<Vec<BaseField>> = multiplicity.iter().map(|c| c.values.to_cpu()).collect();
+    let int_vals: Vec<Vec<BaseField>> = interaction.iter().map(|c| c.values.to_cpu()).collect();
+    let trace = TreeVec::new(vec![
+        pp_vals.iter().collect::<Vec<_>>(),
+        mult_vals.iter().collect::<Vec<_>>(),
+        int_vals.iter().collect::<Vec<_>>(),
+    ]);
+    assert_constraints_on_trace(
+        &trace,
+        log_size,
+        |assert_eval| {
+            eval.evaluate(assert_eval);
+        },
+        claimed_sum,
     );
 }
