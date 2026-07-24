@@ -5,7 +5,8 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
-use crate::air::{pp_id, GateRel, TS_FINAL};
+use crate::air::{GateRel, TS_FINAL};
+use crate::preprocessed::pp_id;
 
 // Relation id tag (distinct constant; prover and in-circuit verifier must agree). TAG_QUBITMEM =
 // per-qubit chain-lookup relation.

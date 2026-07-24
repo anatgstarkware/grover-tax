@@ -3,20 +3,28 @@
 //! `@@` lines `gen_recursion_consts.py` parses); the per-point drift tests rebuild the real cascade and
 //! `check_configs` asserts each layer/arity equals `op.pinned().to_derived(..)`.
 
-use super::*;
+// Parent module (`recursion_consts`).
+use super::{OperatingPoint, FOLD_ARITY, RECURSION_LOG_BLOWUP};
+// Crate-root items (ancestor privates: fixture parsing + shape/nonce helpers) and sibling modules.
+use crate::air::{INTERACTION_POW_BITS, N_LIMBS, RC_LOG};
+use crate::leaf::{self, build_gate_air_leaf_circuit, GateAirLeafParams};
+use crate::preprocessed::N_PREPROCESSED_COLS;
+use crate::test_utils::shard0_shape;
+use crate::tracegen::state_to_limbs;
+use crate::{hiding_nonce, parse_gtv1, program_rows_from_table, Fixture, TestCase};
 
 use circuit_common::finalize::{compute_padded_sizes, pad_to_targets, ComponentSizes};
 use circuit_common::preprocessed::PreprocessedCircuit;
 use circuits::blake::HashValue;
 use circuits::ivalue::NoValue;
 use circuits_stark_verifier::proof::{empty_proof, ProofConfig};
-use recursion_consts::{OperatingPoint, FOLD_ARITY, RECURSION_LOG_BLOWUP};
-
-use leaf::{build_gate_air_leaf_circuit, GateAirLeafParams};
+use num_traits::Zero;
+use std::fs::File;
+use stwo::core::fields::qm31::SecureField;
 
 /// Builds the leaf preprocessed circuit padded to its OWN natural target (the leaf↔node padding
 /// decoupling), returning it with its PCS and that natural target.
-pub(super) fn build_leaf_pp(
+fn build_leaf_pp(
     cfg: &ProofConfig,
     params: &GateAirLeafParams,
     leaf_log_blowup: u32,
@@ -49,7 +57,7 @@ fn fixtures_dir() -> std::path::PathBuf {
 /// shard-0 shape at production `RC_LOG`). Each point needs its OWN k-matching fixture: `build_rows`
 /// re-simulates the circuit and checks the final qubit state against the fixture's `y`.
 fn leaf_shape(k: usize, shots: usize) -> (ProofConfig, GateAirLeafParams) {
-    use circuit_statement::gate_air_components;
+    use crate::circuit_statement::gate_air_components;
     use circuits::wrappers::U32Wrapper;
 
     let fx_path = fixtures_dir().join(format!("v0.3-iadd256-k{k}-n9024.json"));

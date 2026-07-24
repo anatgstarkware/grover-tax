@@ -10,7 +10,6 @@ use num_traits::Zero;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
-use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::m31::{PackedM31, LOG_N_LANES};
 use stwo::prover::backend::simd::qm31::PackedSecureField;
@@ -19,6 +18,7 @@ use stwo::prover::backend::simd::SimdBackend as TraceBackend;
 use stwo::prover::backend::simd::SimdBackend as ProverBackend;
 #[cfg(feature = "cuda")]
 use stwo::prover::backend::CudaBackend as ProverBackend;
+#[cfg(feature = "cuda")]
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
@@ -31,6 +31,11 @@ use crate::air::{
 use crate::components::program::{TAG_PROGRAM, TAG_PROGRAM_PUB};
 use crate::components::qubitmem::TAG_QUBITMEM;
 use crate::components::range_check::TAG_RC;
+use crate::preprocessed::{
+    col_from_values, generate_boundary_preprocessed, generate_enabler_preprocessed,
+    generate_pc_in_prog_preprocessed, generate_pc_preprocessed, generate_prog_slot_preprocessed,
+    generate_rc_preprocessed, generate_shot_id_preprocessed,
+};
 use crate::prover::ProgramTable;
 use crate::{Gate, TestCase};
 
@@ -487,24 +492,6 @@ pub(crate) fn to_prover(
         .collect()
 }
 
-/// Preprocessed positional columns for the boundary table: (shot, addr) per row.
-pub(crate) fn generate_boundary_preprocessed(
-    bnd: &BoundaryTable,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let shot: Vec<u32> = bnd.rows.iter().map(|r| r.shot_id).collect();
-    let addr: Vec<u32> = bnd.rows.iter().map(|r| r.addr).collect();
-    // Real-row enabler: 1 for the first `n_shots*N_QUBITS` rows, 0 on padding. POSITIONAL /
-    // shard-invariant (depends only on the shot count). Gates the boundary emission so a non-power-of-
-    // two `n_shots*N_QUBITS` (e.g. 9024 shots) does not inject unmatched LogUp terms on padding rows.
-    let real = bnd.n_shots * N_QUBITS;
-    let enabler: Vec<u32> = (0..bnd.rows.len()).map(|i| (i < real) as u32).collect();
-    vec![
-        col_from_values(&shot),
-        col_from_values(&addr),
-        col_from_values(&enabler),
-    ]
-}
-
 /// Boundary-table witness (x, y, ts_last), in the order QubitMemEval reads them.
 pub(crate) fn generate_boundary_witness(
     bnd: &BoundaryTable,
@@ -519,68 +506,6 @@ pub(crate) fn generate_boundary_witness(
     ]
 }
 
-/// Preprocessed `enabler` column: 1 on real rows, 0 on padding. SHARD-INVARIANT and POSITIONAL —
-/// depends only on how many real rows the (k, n_gates, n_shots) shape produces, never on secret
-/// content. Used by the AIR both in the opcode one-hot constraint and as the LogUp numerator.
-pub(crate) fn generate_enabler_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.enabler;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed `shot_id` column: shot index of each row (= row / (k*n_gates)), 0 on padding.
-/// SHARD-INVARIANT and POSITIONAL (positional payload in the state-relation tuple).
-pub(crate) fn generate_shot_id_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.shot_id;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed `pc` column: monotonic per-shot program counter (= row % (k*n_gates)), 0 on
-/// padding. SHARD-INVARIANT and POSITIONAL (positional payload in the state-relation tuple).
-pub(crate) fn generate_pc_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.pc;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed pc_in_prog column for the main trace: pc mod n_gates on real
-/// rows, 0 on padding (inert: padding has enabler 0).
-pub(crate) fn generate_pc_in_prog_preprocessed(
-    rows: &[Row],
-    padded_rows: usize,
-    n_gates: usize,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let ng = n_gates as u32;
-    let mut vals = vec![0u32; padded_rows];
-    for (i, r) in rows.iter().enumerate() {
-        vals[i] = r.pc % ng;
-    }
-    col_from_values(&vals)
-}
-
-/// Preprocessed slot-index column for the program table.
-pub(crate) fn generate_prog_slot_preprocessed(
-    prog: &ProgramTable,
-) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    col_from_values(&prog.slot)
-}
-
 /// Program-table witness (multiplicity tree): op columns then multiplicity, in
 /// the order ProgramEval reads them.
 pub(crate) fn generate_program_witness(
@@ -593,13 +518,6 @@ pub(crate) fn generate_program_witness(
         col_from_values(&prog.ctrl_b),
         col_from_values(&prog.multiplicity),
     ]
-}
-
-/// Preprocessed rc-table membership column (val), the single column RangeCheckEval reads.
-pub(crate) fn generate_rc_preprocessed(
-    rc: &RcTable,
-) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    vec![col_from_values(&rc.val)]
 }
 
 /// rc-table witness (multiplicity tree): a single multiplicity column.
@@ -1093,28 +1011,44 @@ pub(crate) fn build_tree0_columns(
     rc_log: u32,
     boundary: &BoundaryTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
+    // Shape scalars extracted from the staging data (kept out of `preprocessed`, which sees only
+    // shape params): real main rows, shot count, and `k` (= real rows / (n_shots * n_gates)).
+    let n_real = rows.len();
+    let n_shots = boundary.n_shots;
+    let k = n_real / (n_shots.max(1) * n_gates);
     let mut tagged: Vec<(
         u32,
         CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>,
     )> = vec![
-        (program.log_size, generate_prog_slot_preprocessed(program)),
-        (log_n_rows, generate_enabler_preprocessed(rows, padded_rows)),
-        (log_n_rows, generate_shot_id_preprocessed(rows, padded_rows)),
-        (log_n_rows, generate_pc_preprocessed(rows, padded_rows)),
+        (
+            program.log_size,
+            generate_prog_slot_preprocessed(program.log_size),
+        ),
         (
             log_n_rows,
-            generate_pc_in_prog_preprocessed(rows, padded_rows, n_gates),
+            generate_enabler_preprocessed(n_real, padded_rows),
+        ),
+        (
+            log_n_rows,
+            generate_shot_id_preprocessed(n_real, padded_rows, k, n_gates),
+        ),
+        (
+            log_n_rows,
+            generate_pc_preprocessed(n_real, padded_rows, k, n_gates),
+        ),
+        (
+            log_n_rows,
+            generate_pc_in_prog_preprocessed(n_real, padded_rows, k, n_gates),
         ),
     ];
     tagged.extend(
-        generate_boundary_preprocessed(boundary)
+        generate_boundary_preprocessed(n_shots, boundary.log_size)
             .into_iter()
             .map(|c| (boundary.log_size, c)),
     );
     // rc membership table sized at the DYNAMIC rc_log (single [0,2^rc_log) val column).
-    let rc = RcTable::new(rc_log);
     tagged.extend(
-        generate_rc_preprocessed(&rc)
+        generate_rc_preprocessed(rc_log)
             .into_iter()
             .map(|c| (rc_log, c)),
     );
@@ -1187,15 +1121,6 @@ fn do_access(addr: u32, pc: u32, last_ts: &[u32], last_val: &[u32]) -> AccessCol
 #[inline]
 fn qubit_bit(bytes: &[u8], addr: usize) -> u32 {
     ((bytes[addr / 8] >> (addr % 8)) & 1) as u32
-}
-
-fn col_from_values(values: &[u32]) -> CircleEvaluation<TraceBackend, BaseField, BitReversedOrder> {
-    let log_size = values.len().ilog2();
-    let mut col = Col::<TraceBackend, BaseField>::zeros(values.len());
-    for (i, &v) in values.iter().enumerate() {
-        col.set(i, BaseField::from_u32_unchecked(v));
-    }
-    CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
 }
 
 // Interaction traces

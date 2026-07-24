@@ -5,7 +5,8 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
-use crate::air::{pp_id, GateRel};
+use crate::air::GateRel;
+use crate::preprocessed::pp_id;
 
 pub(crate) const TAG_PROGRAM: u32 = 5;
 // H_P program binding. The program table emits `-mult` on TAG_PROGRAM (internal, cancels main's

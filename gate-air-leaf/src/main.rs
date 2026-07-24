@@ -14,6 +14,7 @@ mod circuit_statement; // In-circuit verifier of the gate_air STARK proof.
 mod components; // Per-component FrameworkEvals + their relation ids (gate/program/qubitmem/range_check).
 mod fingerprint; // Proof-fingerprint helpers behind the env-gated hooks (distinct from the `diag` feature).
 mod leaf;
+mod preprocessed; // PUBLIC preprocessed columns (verifier-known, positional): identity/order + shape-derived generators.
 mod prover; // Base (per-shard) gate_air prover, extracted from this file (mirrors `leaf.rs`).
 mod recursion_consts;
 mod tracegen; // Trace / witness generation (CPU column builders + LogUp gens + absorbed GPU trace-gen). // PINNED recursion constants, keyed per operating point.
@@ -50,6 +51,7 @@ use stwo_constraint_framework::Relation;
 
 use air::*;
 use components::range_check::TAG_RC;
+use preprocessed::N_PREPROCESSED_COLS;
 use prover::*;
 
 // Trace/witness-generation items relocated to `tracegen` (Step-1 module reorg). Imported explicitly
@@ -586,7 +588,7 @@ fn prove_folded(
             // path pays nothing. `tests::tree0_precompute_matches_rebuild` gives CI coverage; this call
             // additionally guards the real per-run data (and the cuda tree0 path the test cannot reach).
             #[cfg(debug_assertions)]
-            assert_tree0_matches_rebuild(&pc, &rows0, n_gates);
+            crate::diag::assert_tree0_matches_rebuild(&pc, &rows0, n_gates);
             eprintln!(
                 "gate-air: base precompute built (tree0+twiddles+N1{}) in {:.3}s",
                 if cfg!(feature = "cuda") { "+N3" } else { "" },
@@ -1571,5 +1573,9 @@ fn normalize(path: PathBuf) -> PathBuf {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
+mod diag; // Debug/diag-only runtime self-checks moved off the release prover hot path.
+#[cfg(test)]
+mod test_utils; // Test-only support helpers (fixtures, base-prove oracles, on-trace asserts).
 #[cfg(test)]
 mod tests;

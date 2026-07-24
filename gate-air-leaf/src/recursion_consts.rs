@@ -959,3 +959,9 @@ impl OperatingPoint {
         }
     }
 }
+
+// PINNED recursion-const capture + per-layer DRIFT tests (box-only, `#[ignore]`d); they rebuild the
+// REAL per-layer verifier config and assert it equals the pinned consts.
+#[cfg(test)]
+#[path = "recursion_consts_tests.rs"]
+mod recursion_consts_tests;

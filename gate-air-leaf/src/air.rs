@@ -1,6 +1,7 @@
 //! gate_air AIR assembly: the shared `LookupElements` + `GateRel` relation, the `Components` bundle
-//! (type aliases + `build_components` + component/prover refs + trace_log_sizes), the preprocessed
-//! column layout, and the AIR constants (widths, encoding sizes). The per-component `FrameworkEval`s
+//! (type aliases + `build_components` + component/prover refs + trace_log_sizes), and the AIR
+//! constants (widths, encoding sizes). The preprocessed column layout + generators live in
+//! `crate::preprocessed`. The per-component `FrameworkEval`s
 //! and their relation ids live in `crate::components::{gate,program,qubitmem,range_check}`; this file
 //! is the verifier-facing assembly they are wired into.
 //!
@@ -18,13 +19,13 @@ use stwo::prover::backend::simd::m31::{PackedM31, LOG_N_LANES};
 use stwo::prover::backend::simd::SimdBackend as ProverBackend;
 #[cfg(feature = "cuda")]
 use stwo::prover::backend::CudaBackend as ProverBackend;
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 
 use crate::components::gate::GateEval;
 use crate::components::program::ProgramEval;
 use crate::components::qubitmem::QubitMemEval;
 use crate::components::range_check::RangeCheckEval;
+use crate::preprocessed::{preprocessed_column_ids, N_PREPROCESSED_COLS};
 
 // The single drawn LogUp relation (shared by qubitmem / rc / program via a prepended tag; see
 // `LookupElements`). The `relation!` macro emits a `pub struct`; inside this crate-local `air` module
@@ -104,10 +105,6 @@ pub(crate) const OP_TOFFOLI: u8 = 3;
 pub(crate) const ACCESS_COLS: usize = 3; // addr, prev_ts, v (core access cols; ts inlined = pc+1)
 pub(crate) const ACCESS_BLOCK: usize = ACCESS_COLS + 1; // core cols + the single rc diff col `d`
 pub(crate) const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS_BLOCK + 3; // 4 + 3*4 + 3 = 19
-
-/// Number of preprocessed columns (count-only uses; the order is `preprocessed_column_ids`).
-/// prog_slot + (enabler/shot_id/pc/pc_in_prog) + (bnd_shot/bnd_addr/bnd_enabler) + rc_val = 9.
-pub(crate) const N_PREPROCESSED_COLS: usize = 9;
 
 // rc supply table: a single 2^R-row block enumerating exactly [0, 2^R) with `val[i] = i` (R = rc_log;
 // no pos selector, no split). Main looks up (TAG_RC, d) per active access; the table supplies
@@ -200,53 +197,9 @@ impl Components {
 
 // Free functions
 
-pub(crate) fn pp_id(id: &str) -> PreProcessedColumnId {
-    PreProcessedColumnId { id: id.to_owned() }
-}
-
 /// Packed tag constant for prover-side `combine` tuples.
 pub(crate) fn ptag(tag: u32) -> PackedM31 {
     PackedM31::broadcast(BaseField::from_u32_unchecked(tag))
-}
-
-/// Each preprocessed column paired with its log_size, in canonical order then STABLE-sorted ascending
-/// by size — the committed tree MUST be size-sorted (stwo's lifted Merkle sorts by length; the
-/// in-circuit verifier does not re-sort). `gate_rc_val` is sized at the trusted `rc_log` (see RC_LOG),
-/// never read from the proof — it sizes the [0,2^rc_log) table pinned by the preprocessed root.
-pub(crate) fn preprocessed_columns_sorted(
-    main_log_size: u32,
-    program_log_size: u32,
-    boundary_log_size: u32,
-    rc_log: u32,
-) -> Vec<(PreProcessedColumnId, u32)> {
-    let mut cols = vec![
-        (pp_id("gate_prog_slot"), program_log_size),
-        // Shard-invariant positional main-trace columns (tree0). Sized with the main trace.
-        (pp_id("gate_enabler"), main_log_size),
-        (pp_id("gate_shot_id"), main_log_size),
-        (pp_id("gate_pc"), main_log_size),
-        (pp_id("gate_pc_in_prog"), main_log_size),
-        // Qubit-memory boundary positional columns. Sized with the boundary table.
-        (pp_id("gate_bnd_shot"), boundary_log_size),
-        (pp_id("gate_bnd_addr"), boundary_log_size),
-        (pp_id("gate_bnd_enabler"), boundary_log_size),
-        // ts-ordering range-check table membership (val[i]=i). Sized at the DYNAMIC rc_log.
-        (pp_id("gate_rc_val"), rc_log),
-    ];
-    cols.sort_by_key(|&(_, s)| s); // stable: ties keep the listing order above
-    cols
-}
-
-pub(crate) fn preprocessed_column_ids(
-    main_log_size: u32,
-    program_log_size: u32,
-    boundary_log_size: u32,
-    rc_log: u32,
-) -> Vec<PreProcessedColumnId> {
-    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size, rc_log)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

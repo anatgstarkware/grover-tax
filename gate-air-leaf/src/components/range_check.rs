@@ -5,7 +5,8 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
-use crate::air::{pp_id, GateRel};
+use crate::air::GateRel;
+use crate::preprocessed::pp_id;
 
 // Relation id tag (distinct constant; prover and in-circuit verifier must agree). TAG_RC =
 // ts-ordering range-check (main looks up `d` as (TAG_RC, d), the rc table supplies (TAG_RC, value)

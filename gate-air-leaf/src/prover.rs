@@ -15,10 +15,10 @@ use crate::components::range_check::TAG_RC;
 // glob so `tracegen`'s gate-local `TRACE_COLUMNS`/`GATE_REL_WIDTH` gpu consts don't shadow the
 // crate-root shared consts this module uses via `use crate::*`.
 use crate::tracegen::{
-    boundary_public_term, build_rc_table, build_rows, build_tree0_columns, cell_at,
-    gen_boundary_interaction, gen_program_interaction, gen_table_interaction,
-    generate_boundary_witness, generate_program_witness, generate_rc_witness, pack_seq,
-    program_public_term, state_to_limbs, to_prover, BoundaryTable, RcIndex, Row,
+    build_rc_table, build_rows, build_tree0_columns, cell_at, gen_boundary_interaction,
+    gen_program_interaction, gen_table_interaction, generate_boundary_witness,
+    generate_program_witness, generate_rc_witness, pack_seq, state_to_limbs, to_prover,
+    BoundaryTable, RcIndex, Row,
 };
 // Only the non-cuda base path calls the CPU main-interaction generator (the cuda path uses the GPU
 // K4 kernel), so gate its import to match.
@@ -29,7 +29,7 @@ use crate::tracegen::gpu_flat_inputs;
 
 #[cfg(feature = "cuda")]
 use anyhow::Context;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use circuits_stark_verifier::proof_from_stark_proof::pack_public_claim;
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::fields::m31::BaseField;
@@ -160,20 +160,22 @@ pub(crate) fn generate_main_trace(
 // unread, so allow dead_code in exactly that config.
 #[cfg_attr(not(any(debug_assertions, test, feature = "cuda")), allow(dead_code))]
 pub(crate) struct BaseProverPrecompute {
-    config: stwo::core::pcs::PcsConfig,
+    // `config`/`tree0`/`program`/`boundary`/`padded_rows`/`log_n_rows`/`rc_log` are read by the
+    // debug/test `diag::assert_tree0_matches_rebuild` (a sibling module), hence `pub(crate)`.
+    pub(crate) config: stwo::core::pcs::PcsConfig,
     twiddles: stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
-    tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
+    pub(crate) tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
     /// Shared N1 program table (constant multiplicity across shards).
-    program: ProgramTable,
+    pub(crate) program: ProgramTable,
     /// Shard-invariant boundary table shape: the preprocessed columns depend only on the (shot, addr)
     /// shape (witness x/y/ts_last are per-shard).
-    boundary: BoundaryTable,
+    pub(crate) boundary: BoundaryTable,
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
-    padded_rows: usize,
-    log_n_rows: u32,
+    pub(crate) padded_rows: usize,
+    pub(crate) log_n_rows: u32,
     /// Dynamic rc-table log-size (= ceil(log2(k*n_gates))); shard-invariant. Used to rebuild tree0
     /// (device-n replica / the debug rebuild check) with the same rc membership sizing.
-    rc_log: u32,
+    pub(crate) rc_log: u32,
     /// (cuda) shape needed to rebuild the device-resident parts on a producer's device (device != 0).
     #[cfg(feature = "cuda")]
     max_log_size: u32,
@@ -417,175 +419,6 @@ struct DevicePartsRef<'a> {
     d_gates: &'a cudarc::driver::CudaSlice<u32>,
     d_off_lo: &'a cudarc::driver::CudaSlice<u32>,
     d_off_hi: &'a cudarc::driver::CudaSlice<u32>,
-}
-
-/// Load-bearing soundness check for the base precompute: independently rebuilds shard 0's tree-0 via a
-/// fresh throwaway `CommitmentSchemeProver` and asserts the cached root, column count, and per-column
-/// domain sizes match. A mismatch (wrong column order / blowup / lifting / sort) aborts before any
-/// reused proof is built. Debug/test only (a full duplicate tree0 build), so release pays nothing.
-#[cfg(any(debug_assertions, test))]
-pub(crate) fn assert_tree0_matches_rebuild(
-    pc: &BaseProverPrecompute,
-    rows0: &[Row],
-    n_gates: usize,
-) {
-    // Rebuild via a fresh scheme/channel; columns from the same builder.
-    let twiddles = ProverBackend::precompute_twiddles(
-        CanonicCoset::new(
-            tree0_max_log_size(
-                pc.log_n_rows,
-                pc.rc_log,
-                pc.program.log_size,
-                pc.boundary.log_size,
-            ) + 1
-                + pc.config.fri_config.log_blowup_factor,
-        )
-        .circle_domain()
-        .half_coset,
-    );
-    let mut scheme =
-        CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(pc.config, &twiddles);
-    let cols = build_tree0_columns(
-        &pc.program,
-        rows0,
-        pc.padded_rows,
-        pc.log_n_rows,
-        n_gates,
-        pc.rc_log,
-        &pc.boundary,
-    );
-    let n_cols = cols.len();
-    let mut tb = scheme.tree_builder();
-    tb.extend_evals(to_prover(cols));
-    let mut throwaway_channel = Blake2sM31Channel::default();
-    tb.commit(&mut throwaway_channel);
-
-    let rebuilt = &scheme.trees[0];
-    // Root equality (the value mixed into every shard's transcript).
-    assert_eq!(
-        pc.tree0.commitment.root(),
-        rebuilt.commitment.root(),
-        "base-precompute tree0 root != rebuilt shard-0 root (column order/blowup/lifting mismatch)"
-    );
-    // Column count.
-    assert_eq!(
-        pc.tree0.polynomials.len(),
-        n_cols,
-        "base-precompute tree0 column count != rebuilt"
-    );
-    assert_eq!(
-        rebuilt.polynomials.len(),
-        n_cols,
-        "rebuilt tree0 column count != expected"
-    );
-    assert_eq!(
-        n_cols, N_PREPROCESSED_COLS,
-        "tree0 column count != N_PREPROCESSED_COLS"
-    );
-    // Per-column committed domain sizes (the lifted-Merkle sort order).
-    for (i, (a, b)) in pc
-        .tree0
-        .polynomials
-        .iter()
-        .zip(rebuilt.polynomials.iter())
-        .enumerate()
-    {
-        assert_eq!(
-            a.evals.domain.log_size(),
-            b.evals.domain.log_size(),
-            "base-precompute tree0 column {i} size != rebuilt"
-        );
-    }
-    eprintln!(
-        "gate-air: base-precompute tree0 root-equality OK ({} cols, root matches rebuilt shard-0)",
-        n_cols
-    );
-}
-/// Soundness (base pp-root pin): recompute the canonical base tree0 root at build time purely from the
-/// trusted public config (program table, k, n_gates, shard-invariant row shape, boundary layout,
-/// rc_log = RC_LOG, base blowup), so it can be compared against a forgeable proof value. Must NOT read
-/// the prover's `commitments[0]`. tree0 is shard-invariant (see [`build_tree0_columns`]), so any
-/// shard's rows recompute the same root; the build mirrors [`BaseProverPrecompute::new`] exactly, so the
-/// result equals the honest committed root by construction. A debug/test rebuild-assert (mirrors
-/// [`assert_tree0_matches_rebuild`]) aborts on any column-order/blowup/lifting/sort divergence.
-#[cfg(all(test, feature = "cuda", feature = "diag"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn canonical_base_preprocessed_root(
-    program: &ProgramTable,
-    rows: &[Row],
-    padded_rows: usize,
-    log_n_rows: u32,
-    n_gates: usize,
-    rc_log: u32,
-    boundary: &BoundaryTable,
-    pcs_config: stwo::core::pcs::PcsConfig,
-) -> circuits::blake::HashValue<SecureField> {
-    use circuits::blake::HashValue;
-    use stwo::prover::mempool::BaseColumnPool;
-    use stwo::prover::poly::circle::PolyOps;
-    use stwo::prover::CommitmentTreeProver;
-
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
-    let twiddles = ProverBackend::precompute_twiddles(
-        CanonicCoset::new(max_log_size + 1 + pcs_config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-    let pool = BaseColumnPool::<ProverBackend>::new();
-    // Same tree0 build as `BaseProverPrecompute::new`.
-    let cols = build_tree0_columns(
-        program,
-        rows,
-        padded_rows,
-        log_n_rows,
-        n_gates,
-        rc_log,
-        boundary,
-    );
-    let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
-    let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
-        polys,
-        pcs_config.fri_config.log_blowup_factor,
-        &twiddles,
-        false,
-        pcs_config.lifting_log_size,
-        &pool,
-    );
-    let canonical: HashValue<SecureField> = tree0.commitment.root().into();
-
-    // Rebuild-assert (debug/test only): an independent fresh-scheme rebuild must give the same root.
-    #[cfg(any(debug_assertions, test))]
-    {
-        let twiddles_r = ProverBackend::precompute_twiddles(
-            CanonicCoset::new(max_log_size + 1 + pcs_config.fri_config.log_blowup_factor)
-                .circle_domain()
-                .half_coset,
-        );
-        let mut scheme = CommitmentSchemeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
-            pcs_config,
-            &twiddles_r,
-        );
-        let cols_r = build_tree0_columns(
-            program,
-            rows,
-            padded_rows,
-            log_n_rows,
-            n_gates,
-            rc_log,
-            boundary,
-        );
-        let mut tb = scheme.tree_builder();
-        tb.extend_evals(to_prover(cols_r));
-        let mut throwaway_channel = Blake2sM31Channel::default();
-        tb.commit(&mut throwaway_channel);
-        assert_eq!(
-            tree0.commitment.root(),
-            scheme.trees[0].commitment.root(),
-            "canonical base tree0 root != independent rebuild (column order/blowup/lifting mismatch)"
-        );
-    }
-
-    canonical
 }
 
 /// The base-proof tuple `prove_base_shard` returns (named so the pipeline producer can send it over a
@@ -853,16 +686,17 @@ pub(crate) fn prove_base_shard(
     // -mult/TAG_PROGRAM term cancels main's demand). So the base's claimed sums net to B + P_pub, and
     // the leaf's public_logup_sum supplies −B and −P_pub over guessed values, forcing guessed ==
     // committed. rc demand and supply cancel. (stwo verify does not require Σ = 0; this is a self-check.)
-    // Debug-only prover self-check: the claimed sums must net to B + P_pub. Pure tripwire —
-    // `b_public`/`p_pub` feed nothing downstream, so gating it changes no committed value.
+    // Debug-only prover self-check that the claimed sums net to B + P_pub (see `diag`).
     #[cfg(debug_assertions)]
-    {
-        let b_public = boundary_public_term(&boundary, &elements.qubitmem);
-        let p_pub = program_public_term(program, &elements.program);
-        if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
-            bail!("shard claimed sums do not net to the public terms B + P_pub");
-        }
-    }
+    crate::diag::assert_claimed_sums_net(
+        &boundary,
+        program,
+        &elements,
+        main_sum,
+        program_sum,
+        boundary_sum,
+        rc_sum,
+    )?;
 
     let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
