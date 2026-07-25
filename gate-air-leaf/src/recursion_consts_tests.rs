@@ -68,7 +68,7 @@ fn leaf_shape(k: usize, shots: usize) -> (ProofConfig, GateAirLeafParams) {
     let gates = parse_gtv1(&fixture.circuit_byte_serialisation_hex).expect("parse gtv1");
     let n_gates = gates.len();
     let cases: Vec<TestCase> = fixture.test_cases[..shots].to_vec();
-    let (_rows, boundary, program, _padded, log_n_rows, _mls, base0_config) =
+    let (_rows, qubitmem, program, _padded, log_n_rows, _mls, base0_config) =
         shard0_shape(&gates, &cases, k, RC_LOG);
     let cfg = ProofConfig::new(
         &gate_air_components::<NoValue>(),
@@ -76,7 +76,7 @@ fn leaf_shape(k: usize, shots: usize) -> (ProofConfig, GateAirLeafParams) {
         &base0_config,
         INTERACTION_POW_BITS,
     );
-    let boundary_xy: Vec<([u32; N_LIMBS], [u32; N_LIMBS])> = cases
+    let qubitmem_xy: Vec<([u32; N_LIMBS], [u32; N_LIMBS])> = cases
         .iter()
         .map(|c| {
             let x = state_to_limbs(&hex::decode(&c.x_hex).unwrap());
@@ -90,10 +90,10 @@ fn leaf_shape(k: usize, shots: usize) -> (ProofConfig, GateAirLeafParams) {
     let params = GateAirLeafParams {
         main_log_size: log_n_rows,
         program_log_size: program.log_size,
-        boundary_log_size: boundary.log_size,
+        qubitmem_log_size: qubitmem.log_size,
         rc_log: RC_LOG,
         preprocessed_root: placeholder_root,
-        boundary: boundary_xy,
+        qubitmem: qubitmem_xy,
         total_pc: (k * n_gates) as u32,
         program: program_rows_from_table(&program),
         nonce: hiding_nonce(),

@@ -84,7 +84,7 @@ const GATE_REL_WIDTH: usize = 6;
 // TAG_QUBITMEM = per-qubit chain-lookup relation; TAG_RC = ts-ordering range-check; TAG_PROGRAM /
 // TAG_PROGRAM_PUB = program-consistency (H_P binding). Each supply component owns its own id.
 
-// x/y binding: the boundary's final `y` is re-keyed to a FIXED public ts `TS_FINAL` so it surfaces as
+// x/y binding: the qubitmem's final `y` is re-keyed to a FIXED public ts `TS_FINAL` so it surfaces as
 // an unconsumed public LogUp term (the leaf supplies the matching term over its guessed x/y, forcing
 // guessed == committed). TS_FINAL must exceed every real ts (0..=k*n_gates) and be a valid M31, so the
 // public tuples never alias an interior chain node: 2^30 < p and >> any real ts.
@@ -112,7 +112,7 @@ pub(crate) const TRACE_COLUMNS: usize = 4 + ACCESS_BLOCK + ACCESS_BLOCK + ACCESS
 // no pos selector, no split). Main looks up (TAG_RC, d) per active access; the table supplies
 // -multiplicity / (TAG_RC, value), pinning d < 2^R with no slack (see RC_LOG / TS_RC_BITS above).
 
-// Boundary table: per (shot, addr) emits on TAG_QUBITMEM the INTERNAL final Use[+1](shot,addr,ts_last,y)
+// Qubitmem table: per (shot, addr) emits on TAG_QUBITMEM the INTERNAL final Use[+1](shot,addr,ts_last,y)
 // (cancels main's last chain Yield) and the PUBLIC final Yield[-1](shot,addr,TS_FINAL,y) (re-keys y to
 // the fixed public ts). `shot`/`addr` preprocessed; `x`/`y`/`ts_last` witness (`x` booleanity-only —
 // main carries x publicly via its ts=0 init Use). Nets to the public term B = Σ(+[0,x] − [TS_FINAL,y]),
@@ -208,16 +208,16 @@ pub(crate) fn ptag(tag: u32) -> PackedM31 {
 pub(crate) fn build_components(
     log_n_rows: u32,
     program_log_size: u32,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
     rc_log: u32,
     elements: &LookupElements,
     main_sum: SecureField,
     program_sum: SecureField,
-    boundary_sum: SecureField,
+    qubitmem_sum: SecureField,
     rc_sum: SecureField,
 ) -> Components {
     let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(
-        &preprocessed_column_ids(log_n_rows, program_log_size, boundary_log_size, rc_log),
+        &preprocessed_column_ids(log_n_rows, program_log_size, qubitmem_log_size, rc_log),
     );
     let main = GateComponent::new(
         &mut allocator,
@@ -238,10 +238,10 @@ pub(crate) fn build_components(
     let qubitmem = QubitMemComponent::new(
         &mut allocator,
         QubitMemEval {
-            log_size: boundary_log_size,
+            log_size: qubitmem_log_size,
             elements: elements.qubitmem.clone(),
         },
-        boundary_sum,
+        qubitmem_sum,
     );
     let range_check = RangeCheckComponent::new(
         &mut allocator,

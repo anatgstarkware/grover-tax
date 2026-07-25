@@ -2,7 +2,7 @@
 //!
 //! Holds the base-proof pipeline (trace-gen + commit + `prove_ex`) that produces one
 //! `ExtendedStarkProof` per shard, plus the shard-invariant precompute and the tree-0 program /
-//! boundary / rc supply tables the base proof commits. Mirrors how `leaf.rs` holds the leaf prover.
+//! qubitmem / rc supply tables the base proof commits. Mirrors how `leaf.rs` holds the leaf prover.
 //! Byte-identical to the pre-extraction inline code (pure code move).
 
 use crate::*;
@@ -16,9 +16,9 @@ use crate::air::components::range_check::TAG_RC;
 // crate-root shared consts this module uses via `use crate::*`.
 use crate::tracegen::{
     build_program_table, build_rc_table, build_rows, build_tree0_columns, cell_at,
-    gen_boundary_interaction, gen_program_interaction, gen_table_interaction,
-    generate_boundary_witness, generate_program_witness, generate_rc_witness, pack_seq,
-    program_log_size, state_to_limbs, to_prover, BoundaryTable, ProgramTable, RcIndex, Row,
+    gen_program_interaction, gen_qubitmem_interaction, gen_table_interaction,
+    generate_program_witness, generate_qubitmem_witness, generate_rc_witness, pack_seq,
+    program_log_size, state_to_limbs, to_prover, ProgramTable, QubitMemTable, RcIndex, Row,
 };
 // Only the non-cuda base path calls the CPU main-interaction generator (the cuda path uses the GPU
 // K4 kernel), so gate its import to match.
@@ -94,21 +94,21 @@ pub(crate) fn generate_main_trace(
 /// Merkle-committed once, reused via `commit_tree` which re-mixes the same root into each shard's
 /// channel), twiddles, the N1 program table (constant multiplicity across shards), and (cuda) the N3
 /// device-resident gate-list / RcIndex-offset buffers.
-// `config`/`boundary`/`padded_rows`/`log_n_rows` are read only by the cuda `build_device_parts` and
+// `config`/`qubitmem`/`padded_rows`/`log_n_rows` are read only by the cuda `build_device_parts` and
 // the debug/test `assert_tree0_matches_rebuild`; in a non-cuda release build they are populated-but-
 // unread, so allow dead_code in exactly that config.
 #[cfg_attr(not(any(debug_assertions, test, feature = "cuda")), allow(dead_code))]
 pub(crate) struct BaseProverPrecompute {
-    // `config`/`tree0`/`program`/`boundary`/`padded_rows`/`log_n_rows`/`rc_log` are read by the
+    // `config`/`tree0`/`program`/`qubitmem`/`padded_rows`/`log_n_rows`/`rc_log` are read by the
     // debug/test `diag::assert_tree0_matches_rebuild` (a sibling module), hence `pub(crate)`.
     pub(crate) config: stwo::core::pcs::PcsConfig,
     twiddles: stwo::prover::poly::twiddles::TwiddleTree<ProverBackend>,
     pub(crate) tree0: stwo::prover::CommitmentTreeProver<ProverBackend, Blake2sM31MerkleChannel>,
     /// Shared N1 program table (constant multiplicity across shards).
     pub(crate) program: ProgramTable,
-    /// Shard-invariant boundary table shape: the preprocessed columns depend only on the (shot, addr)
+    /// Shard-invariant qubitmem table shape: the preprocessed columns depend only on the (shot, addr)
     /// shape (witness x/y/ts_last are per-shard).
-    pub(crate) boundary: BoundaryTable,
+    pub(crate) qubitmem: QubitMemTable,
     /// Fixed shard shape (every shard holds `shots_per_shard` shots → same row count).
     pub(crate) padded_rows: usize,
     pub(crate) log_n_rows: u32,
@@ -171,7 +171,7 @@ impl BaseProverPrecompute {
         max_log_size: u32,
         program0: ProgramTable,
         rows0: &[Row],
-        boundary0: BoundaryTable,
+        qubitmem0: QubitMemTable,
         padded_rows: usize,
         log_n_rows: u32,
         n_gates: usize,
@@ -201,7 +201,7 @@ impl BaseProverPrecompute {
             log_n_rows,
             n_gates,
             rc_log,
-            &boundary0,
+            &qubitmem0,
         );
         let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
         let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -233,7 +233,7 @@ impl BaseProverPrecompute {
             twiddles,
             tree0,
             program: program0,
-            boundary: boundary0,
+            qubitmem: qubitmem0,
             padded_rows,
             log_n_rows,
             rc_log,
@@ -284,7 +284,7 @@ impl BaseProverPrecompute {
             self.log_n_rows,
             self.n_gates,
             self.rc_log,
-            &self.boundary,
+            &self.qubitmem,
         );
         let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
         let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -388,7 +388,7 @@ pub(crate) fn prove_base_shard(
     rc_lo_index: &RcIndex,
 ) -> Result<BaseShardOutput> {
     let shard_samples = shard_cases.len();
-    let (rows, boundary) = build_rows(gates, shard_cases, k)?;
+    let (rows, qubitmem) = build_rows(gates, shard_cases, k)?;
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
@@ -403,7 +403,7 @@ pub(crate) fn prove_base_shard(
         log_n_rows,
         rc_log,
         program_log_size(gates.len()),
-        boundary.log_size,
+        qubitmem.log_size,
     );
     let base_blowup: u32 = base_log_blowup;
     let config = leaf::leaf_pcs_config(max_log_size, base_blowup);
@@ -467,7 +467,7 @@ pub(crate) fn prove_base_shard(
                 log_n_rows,
                 n_gates,
                 rc_log,
-                &boundary,
+                &qubitmem,
             );
             let mut tree_builder = commitment_scheme.tree_builder();
             tree_builder.extend_evals(to_prover(pp));
@@ -489,7 +489,7 @@ pub(crate) fn prove_base_shard(
                 log_n_rows,
                 n_gates,
                 rc_log,
-                &boundary,
+                &qubitmem,
             );
             let mut tree_builder = commitment_scheme.tree_builder();
             tree_builder.extend_evals(to_prover(pp));
@@ -503,10 +503,10 @@ pub(crate) fn prove_base_shard(
     // ts-ordering range-check supply table (multiplicity counted from active-access lookups).
     let rc_table = build_rc_table(&rows, rc_log);
 
-    // Tree 1: main trace + program witness + boundary witness + rc multiplicity.
+    // Tree 1: main trace + program witness + qubitmem witness + rc multiplicity.
     let small_main = {
         let mut v = generate_program_witness(program);
-        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_qubitmem_witness(&qubitmem));
         v.extend(generate_rc_witness(&rc_table));
         v
     };
@@ -610,8 +610,8 @@ pub(crate) fn prove_base_shard(
     // H_P binding: program supply carries both an internal (-mult, TAG_PROGRAM) and a public
     // (+mult, TAG_PROGRAM_PUB) term, paired into one batch (still 4 interaction cols).
     let (program_interaction, program_sum) = gen_program_interaction(program, &elements.program);
-    let (boundary_interaction, boundary_sum) =
-        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (qubitmem_interaction, qubitmem_sum) =
+        gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     // rc supply: -multiplicity / combine(TAG_RC, val).
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
@@ -620,7 +620,7 @@ pub(crate) fn prove_base_shard(
         })
     };
 
-    // x/y binding + H_P program binding: the base is NOT internally balanced. Boundary re-keys y to
+    // x/y binding + H_P program binding: the base is NOT internally balanced. Qubitmem re-keys y to
     // TS_FINAL, leaving B = Σ(+[0,x] − [TS_FINAL,y]); program supply adds a public P_pub (its internal
     // -mult/TAG_PROGRAM term cancels main's demand). So the base's claimed sums net to B + P_pub, and
     // the leaf's public_logup_sum supplies −B and −P_pub over guessed values, forcing guessed ==
@@ -628,22 +628,22 @@ pub(crate) fn prove_base_shard(
     // Debug-only prover self-check that the claimed sums net to B + P_pub (see `diag`).
     #[cfg(debug_assertions)]
     crate::diag::assert_claimed_sums_net(
-        &boundary,
+        &qubitmem,
         program,
         &elements,
         main_sum,
         program_sum,
-        boundary_sum,
+        qubitmem_sum,
         rc_sum,
     )?;
 
-    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claimed_sums = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
 
-    // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
+    // Tree 2: interaction (same component order as the claimed sums): main, program, qubitmem, rc.
     let small_interaction = {
         let mut v = program_interaction;
-        v.extend(boundary_interaction);
+        v.extend(qubitmem_interaction);
         v.extend(rc_interaction);
         v
     };
@@ -665,12 +665,12 @@ pub(crate) fn prove_base_shard(
     let components = build_components(
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         rc_log,
         &elements,
         main_sum,
         program_sum,
-        boundary_sum,
+        qubitmem_sum,
         rc_sum,
     );
     let prover_refs = components.prover_refs();
@@ -681,14 +681,14 @@ pub(crate) fn prove_base_shard(
         false,
     )?;
 
-    // Per-shard boundary (x->y per shard shot) for the leaf's GateAirStatement + output hash.
+    // Per-shard qubitmem (x->y per shard shot) for the leaf's GateAirStatement + output hash.
     let mut shard_boundary = Vec::with_capacity(shard_cases.len());
     for case in shard_cases {
         let x = state_to_limbs(&hex::decode(&case.x_hex)?);
         let y = state_to_limbs(&hex::decode(&case.y_hex)?);
         shard_boundary.push((x, y));
     }
-    let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claim: Vec<SecureField> = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     Ok((
         extended,
         claim,

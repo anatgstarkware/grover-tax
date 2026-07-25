@@ -4,7 +4,7 @@
 //!
 //! Output: `H_i = blake( H_P ‖ x_limbs ‖ y_limbs )`, where `H_P = blake( program_table ‖ nonce )` is
 //! the hiding secret-circuit commitment. Program and x/y are guessed witness AND bound to the base
-//! proof via `public_logup_sum` (TAG_PROGRAM_PUB + boundary public terms), so `H_i` commits to a
+//! proof via `public_logup_sum` (TAG_PROGRAM_PUB + qubitmem public terms), so `H_i` commits to a
 //! genuine `x→y` execution of the committed hidden circuit; the verifier recomputes every `H_i` from
 //! the one published `H_P`, enforcing same-program across shards.
 
@@ -30,13 +30,13 @@ use crate::circuit_statement::GateAirStatement;
 pub struct GateAirLeafParams {
     pub main_log_size: u32,
     pub program_log_size: u32,
-    pub boundary_log_size: u32,
+    pub qubitmem_log_size: u32,
     /// The rc supply-table log-size `R` this base was proved with — a TRUSTED construction value the
     /// leaf statement must reuse (production: `RC_LOG`; tests: the test's chosen value). The base
     /// prover's `R` and this MUST be equal (see `GateAirStatement::new`); NEVER read from the proof.
     pub rc_log: u32,
     pub preprocessed_root: HashValue<QM31>,
-    pub boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
+    pub qubitmem: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     pub total_pc: u32,
     /// H_P program commitment (OPEN #3, Fork A). The committed program table this leaf's base proof
     /// ran: one entry per padded slot `(slot, opcode_scalar, target, ctrl_a, ctrl_b, multiplicity)`.
@@ -107,10 +107,10 @@ fn emit_one_base<Value: IValue>(
         context,
         params.main_log_size,
         params.program_log_size,
-        params.boundary_log_size,
+        params.qubitmem_log_size,
         params.rc_log,
         params.preprocessed_root.clone(),
-        params.boundary.clone(),
+        params.qubitmem.clone(),
         params.total_pc,
         params.program.clone(),
         params.nonce,
@@ -124,7 +124,7 @@ fn emit_one_base<Value: IValue>(
     // secret circuit. Everything stays witness (not constant) so `leaf_preprocessed_root` is shard-invariant.
     let h_p = statement.compute_h_p(context);
     let mut preimage: Vec<_> = h_p.iter().map(|w| *w.get()).collect();
-    for (x, y) in statement.boundary_vars() {
+    for (x, y) in statement.qubitmem_vars() {
         preimage.extend(x.iter().chain(y.iter()).copied());
     }
     let output_hash: HashValue<_> = blake2s(context, &preimage, 16 * preimage.len());

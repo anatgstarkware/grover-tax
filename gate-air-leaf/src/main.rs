@@ -59,11 +59,11 @@ use prover::*;
 // (not a glob) so the gate-local `tracegen::{TRACE_COLUMNS,GATE_REL_WIDTH}` gpu consts don't collide
 // with the crate-root shared consts of the same name.
 use tracegen::{
-    boundary_public_sum, boundary_public_term, build_program_table, build_rc_lo, build_rc_table,
-    build_rows, build_tree0_columns, gen_boundary_interaction, gen_program_interaction,
-    gen_table_interaction, generate_boundary_witness, generate_program_witness,
-    generate_rc_witness, pack_seq, program_claimed_sum, program_public_term, state_to_limbs,
-    table_public_sum, to_prover, BoundaryTable, ProgramTable, RcIndex, Row,
+    build_program_table, build_rc_lo, build_rc_table, build_rows, build_tree0_columns,
+    gen_program_interaction, gen_qubitmem_interaction, gen_table_interaction,
+    generate_program_witness, generate_qubitmem_witness, generate_rc_witness, pack_seq,
+    program_claimed_sum, program_public_term, qubitmem_public_sum, qubitmem_public_term,
+    state_to_limbs, table_public_sum, to_prover, ProgramTable, QubitMemTable, RcIndex, Row,
 };
 // The CPU main-interaction generator is used only on the non-cuda prove path (the cuda path uses the
 // GPU K4 kernel), so gate its import to match.
@@ -83,22 +83,22 @@ fn parse_env<T: std::str::FromStr>(k: &str) -> Option<T> {
 
 /// Log-size of the tree-0 twiddle / eval (committed) domain: the MAX over every committed column's
 /// log-size (`main` = `log_n_rows`, the `rc` membership table = `rc_log`, the `program` table, the
-/// `boundary` table). The tree-0 columns are interpolated on twiddles of this size, so the twiddle
+/// `qubitmem` table). The tree-0 columns are interpolated on twiddles of this size, so the twiddle
 /// tree MUST cover the LARGEST committed column — not just `log_n_rows.max(rc_log)`. For a REAL large
-/// shard (`k*n_gates >= 512`, so `main >> boundary = shots*512` and `program = n_gates` are tiny) this
+/// shard (`k*n_gates >= 512`, so `main >> qubitmem = shots*512` and `program = n_gates` are tiny) this
 /// reduces to `log_n_rows` (dynamic-rc_log property preserved: NO domain inflation). It only differs
-/// for TINY fixtures where `k*n_gates < 512`, so `boundary` / `program` outsize the main trace and the
+/// for TINY fixtures where `k*n_gates < 512`, so `qubitmem` / `program` outsize the main trace and the
 /// old fixed `RC_LOG_SIZE=16` floor used to (incidentally) cover them.
 pub(crate) fn tree0_max_log_size(
     log_n_rows: u32,
     rc_log: u32,
     program_log_size: u32,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
 ) -> u32 {
     log_n_rows
         .max(rc_log)
         .max(program_log_size)
-        .max(boundary_log_size)
+        .max(qubitmem_log_size)
 }
 
 // CLI / fixture
@@ -460,7 +460,7 @@ fn prove_folded(
     // verify (a self-check, not prover output). This is the SP1-comparable prover time.
     let t_prove_window = Instant::now();
     #[allow(clippy::type_complexity)]
-    let (base_precompute, cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce): (
+    let (base_precompute, cfg, recursion_pre, qubitmem_log_size, leaf_program, leaf_nonce): (
         Option<std::sync::Arc<BaseProverPrecompute>>,
         ProofConfig,
         RecursionPrecompute,
@@ -471,10 +471,10 @@ fn prove_folded(
         // --- SPAWNED (CPU): recursion config + precompute, from PUBLIC params only. ---
         let cpu_build = scope.spawn(|| -> Result<_> {
     // Shard-0 shape (identical to what `prove_base_shard` computes for shard 0, and to the shape
-    // block inside `BaseProverPrecompute::new`): program table, rows, boundary, row/rc log sizes.
+    // block inside `BaseProverPrecompute::new`): program table, rows, qubitmem, row/rc log sizes.
     // `total_pc = k*n_gates` and `preprocessed_root` are PUBLIC (never a proof field).
     let shape_program0 = build_program_table(gates, shots_per_shard, k);
-    let (shape_rows0, _shape_boundary0) = build_rows(gates, &shard_case_sets[0], k)?;
+    let (shape_rows0, _shape_qubitmem0) = build_rows(gates, &shard_case_sets[0], k)?;
     let shape_real_rows0 = shape_rows0.len();
     let shape_padded_rows0 =
         shape_real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
@@ -492,15 +492,15 @@ fn prove_folded(
         &base0_config,
         INTERACTION_POW_BITS,
     );
-    // The per-shard boundary SHAPE (n_shots * 512 rows, padded) is shard-invariant.
-    let boundary_log_size = BoundaryTable::new(shots_per_shard).log_size;
+    // The per-shard qubitmem SHAPE (n_shots * 512 rows, padded) is shard-invariant.
+    let qubitmem_log_size = QubitMemTable::new(shots_per_shard).log_size;
     // Shard-invariant program table + one shared hiding nonce, hashed into H_P by every leaf.
     let leaf_program = program_rows_from_table(&shape_program0);
     let leaf_nonce = hiding_nonce();
-    // Shard-0 boundary (x->y limb pairs per shot), identical to what `prove_base_shard` builds for
+    // Shard-0 qubitmem (x->y limb pairs per shot), identical to what `prove_base_shard` builds for
     // shard 0. Only its SHAPE feeds the NoValue config derivation, but we build the real pairs so
     // `shape_params` is byte-identical to the old (proved-base-sourced) value.
-    let shape_boundary_pairs: Vec<([u32; N_LIMBS], [u32; N_LIMBS])> = {
+    let shape_qubitmem_pairs: Vec<([u32; N_LIMBS], [u32; N_LIMBS])> = {
         let mut v = Vec::with_capacity(shard_case_sets[0].len());
         for case in &shard_case_sets[0] {
             let x = state_to_limbs(&hex::decode(&case.x_hex)?);
@@ -518,10 +518,10 @@ fn prove_folded(
     let shape_params = GateAirLeafParams {
         main_log_size: shape_log_n_rows0,
         program_log_size: shape_program0.log_size,
-        boundary_log_size,
+        qubitmem_log_size,
         rc_log: RC_LOG,
         preprocessed_root: placeholder_base_pp_root,
-        boundary: shape_boundary_pairs,
+        qubitmem: shape_qubitmem_pairs,
         total_pc: (k * n_gates) as u32,
         program: leaf_program.clone(),
         nonce: leaf_nonce,
@@ -547,7 +547,7 @@ fn prove_folded(
         );
         pre
     };
-        Ok((cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce))
+        Ok((cfg, recursion_pre, qubitmem_log_size, leaf_program, leaf_nonce))
     });
 
         // --- MAIN THREAD (GPU): base precompute build (unconditional). ---
@@ -555,13 +555,13 @@ fn prove_folded(
             let t_pc = Instant::now();
             // Shard 0's shape (every shard shares it: equal shot count, same program + k).
             let program0 = build_program_table(gates, shots_per_shard, k);
-            let (rows0, boundary0) = build_rows(gates, &shard_case_sets[0], k)?;
+            let (rows0, qubitmem0) = build_rows(gates, &shard_case_sets[0], k)?;
             let real_rows0 = rows0.len();
             let padded_rows0 = real_rows0.next_power_of_two().max(1 << (LOG_N_LANES + 2));
             let log_n_rows0 = padded_rows0.ilog2();
             let rc_log0 = RC_LOG;
             let max_log_size0 =
-                tree0_max_log_size(log_n_rows0, rc_log0, program0.log_size, boundary0.log_size);
+                tree0_max_log_size(log_n_rows0, rc_log0, program0.log_size, qubitmem0.log_size);
             let base_blowup: u32 = base_log_blowup;
             let config0 = leaf::leaf_pcs_config(max_log_size0, base_blowup);
             #[cfg(feature = "cuda")]
@@ -572,7 +572,7 @@ fn prove_folded(
                 max_log_size0,
                 program0,
                 &rows0,
-                boundary0,
+                qubitmem0,
                 padded_rows0,
                 log_n_rows0,
                 n_gates,
@@ -599,14 +599,14 @@ fn prove_folded(
         };
 
         // --- JOIN: both precomputes complete here, before any proving. ---
-        let (cfg, recursion_pre, boundary_log_size, leaf_program, leaf_nonce) = cpu_build
+        let (cfg, recursion_pre, qubitmem_log_size, leaf_program, leaf_nonce) = cpu_build
             .join()
             .expect("recursion config/precompute thread panicked")?;
         Ok((
             base_precompute,
             cfg,
             recursion_pre,
-            boundary_log_size,
+            qubitmem_log_size,
             leaf_program,
             leaf_nonce,
         ))
@@ -750,7 +750,7 @@ fn prove_folded(
     let pool_nice = std::env::var("RECURSION_POOL_NICE").ok();
     let pools = PoolSet::new(n_pools, threads_per_pool, pool_nice);
 
-    // Per-shard distinct leaf: build the GateAirLeafParams for THIS shard (its own boundary +
+    // Per-shard distinct leaf: build the GateAirLeafParams for THIS shard (its own qubitmem +
     // preprocessed root), convert THIS shard's base proof to circuit values, and prove the leaf.
     // The leaves are now DISTINCT (each commits to its shard's own shots' (x,y) outputs).
     let n_shards_bases = n_shards;
@@ -767,17 +767,17 @@ fn prove_folded(
             salt_i,
             log_n_rows_i,
             prog_log_i,
-            boundary_i,
+            qubitmem_i,
             total_pc_i,
         ) = base;
         let pp_root_i: HashValue<SecureField> = extended_i.proof.commitments[0].into();
         let params_i = GateAirLeafParams {
             main_log_size: *log_n_rows_i,
             program_log_size: *prog_log_i,
-            boundary_log_size,
+            qubitmem_log_size,
             rc_log: RC_LOG,
             preprocessed_root: pp_root_i,
-            boundary: boundary_i.clone(),
+            qubitmem: qubitmem_i.clone(),
             total_pc: *total_pc_i,
             // Shard-invariant program + shared nonce (same for every base).
             program: leaf_program.clone(),
@@ -1135,7 +1135,7 @@ fn prove_folded(
 }
 
 /// Monolithic single-proof path (extracted from `main`'s non-fold `else` branch).
-/// Pure code move: builds `rows`/`boundary` (the former `else`-arm), honors `--no-prove`,
+/// Pure code move: builds `rows`/`qubitmem` (the former `else`-arm), honors `--no-prove`,
 /// then runs the single prove+verify path verbatim (param-threaded).
 #[allow(clippy::too_many_arguments)]
 fn prove_monolithic(
@@ -1172,7 +1172,7 @@ fn prove_monolithic(
         );
     }
     let build_start = Instant::now();
-    let (rows, boundary) = build_rows(gates, cases, k)?;
+    let (rows, qubitmem) = build_rows(gates, cases, k)?;
     let build_elapsed = build_start.elapsed();
 
     eprintln!(
@@ -1194,7 +1194,7 @@ fn prove_monolithic(
     // Fixed rc-table log-size = RC_LOG; rc_log <= log_n_rows so the .max reduces to log_n_rows (the
     // rc table never raises the FRI/twiddle domain floor).
     let rc_log = RC_LOG;
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, qubitmem.log_size);
     // SECURE base config (~96-bit) instead of PcsConfig::default() (which is a 13-bit TOY: blowup 1,
     // n_queries 3). leaf_pcs_config sets n_queries/pow_bits/fold_step=4 + lifting = trace+blowup so
     // the base proof passes the privacy-verifier security test. The in-circuit verifier replays this
@@ -1237,7 +1237,7 @@ fn prove_monolithic(
         log_n_rows,
         n_gates,
         rc_log,
-        &boundary,
+        &qubitmem,
     );
     tree_builder.extend_evals(to_prover(pp));
     tree_builder.commit(prover_channel);
@@ -1246,7 +1246,7 @@ fn prove_monolithic(
         t_phase.elapsed().as_secs_f64()
     );
 
-    // Public claim (empty for gate_air; the boundary is reconstructed by the verifier).
+    // Public claim (empty for gate_air; the qubitmem is reconstructed by the verifier).
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
 
@@ -1261,11 +1261,11 @@ fn prove_monolithic(
     // lookups). Shard-invariant membership (val) lives in tree0; only the multiplicity is witness.
     let rc_table = build_rc_table(&rows, rc_log);
 
-    // Tree 1: main trace + program witness (op cols+mult) + boundary witness + rc multiplicity.
+    // Tree 1: main trace + program witness (op cols+mult) + qubitmem witness + rc multiplicity.
     let t_phase = Instant::now();
     let small_main = {
         let mut v = generate_program_witness(&program);
-        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_qubitmem_witness(&qubitmem));
         v.extend(generate_rc_witness(&rc_table));
         v
     };
@@ -1374,8 +1374,8 @@ fn prove_monolithic(
     // H_P binding (Fork A): program supply carries internal (-mult, TAG_PROGRAM) + public (+mult,
     // TAG_PROGRAM_PUB) terms, paired => 4 interaction cols (see gen_program_interaction).
     let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
-    let (boundary_interaction, boundary_sum) =
-        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (qubitmem_interaction, qubitmem_sum) =
+        gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     // rc supply: -multiplicity / combine(TAG_RC, val).
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
@@ -1395,24 +1395,24 @@ fn prove_monolithic(
     // dangling terms surface:
     //   B     = Σ_{shot,addr} ( +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) )  [x/y],
     //   P_pub = Σ_slot mult/combine(TAG_PROGRAM_PUB, slot, op, t, a, b)                         [program],
-    // so the identity is `main + program + boundary + rc == B + P_pub`. The leaf's `public_logup_sum`
+    // so the identity is `main + program + qubitmem + rc == B + P_pub`. The leaf's `public_logup_sum`
     // equals −(B + P_pub) over its guessed x/y AND program Vars, so the in-circuit balance forces
     // guessed == committed (the x/y recursion binding + the H_P program binding — the same program Vars
     // feed H_P, so it commits to the LogUp-bound program). The preprocessed `shot_id` forbids cross-shot
     // chain mixing; rc demand (main) and supply (rc_sum) cancel. We ALSO recompute the supply sums
     // independently below, so a mistranscribed term is caught before FRI.
-    let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+    let b_public = qubitmem_public_term(&qubitmem, &elements.qubitmem);
     let p_pub = program_public_term(&program, &elements.program);
-    if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+    if main_sum + program_sum + qubitmem_sum + rc_sum != b_public + p_pub {
         bail!("claimed sums do not net to the public terms B + P_pub");
     }
     let program_expected = program_claimed_sum(&program, &elements.program);
     if program_sum != program_expected {
         bail!("program claimed sum mismatch");
     }
-    let boundary_expected = boundary_public_sum(&boundary, &elements.qubitmem);
-    if boundary_sum != boundary_expected {
-        bail!("boundary claimed sum mismatch");
+    let qubitmem_expected = qubitmem_public_sum(&qubitmem, &elements.qubitmem);
+    if qubitmem_sum != qubitmem_expected {
+        bail!("qubitmem claimed sum mismatch");
     }
     let rc_expected = table_public_sum(&rc_table.multiplicity, &elements.rc, TAG_RC, |i| {
         vec![BaseField::from_u32_unchecked(rc_table.val[i])]
@@ -1422,18 +1422,18 @@ fn prove_monolithic(
     }
 
     // Order MUST match the verifier's reconstruction below and build_components.
-    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claimed_sums = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
 
     eprintln!(
         "gate-air: [phase] interaction witness gen+sumcheck {:.3}s",
         t_phase.elapsed().as_secs_f64()
     );
-    // Tree 2: interaction (same component order as the claimed sums): main, program, boundary, rc.
+    // Tree 2: interaction (same component order as the claimed sums): main, program, qubitmem, rc.
     let t_phase = Instant::now();
     let small_interaction = {
         let mut v = program_interaction;
-        v.extend(boundary_interaction);
+        v.extend(qubitmem_interaction);
         v.extend(rc_interaction);
         v
     };
@@ -1459,12 +1459,12 @@ fn prove_monolithic(
     let components = build_components(
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         rc_log,
         &elements,
         main_sum,
         program_sum,
-        boundary_sum,
+        qubitmem_sum,
         rc_sum,
     );
     let sizes = components.trace_log_sizes();
@@ -1520,27 +1520,27 @@ fn prove_monolithic(
     verifier_channel.mix_u64(interaction_pow_nonce);
     let v_elements = LookupElements::draw(verifier_channel);
     // Supply sums the verifier recomputes (same-process native verify: it has the committed
-    // multiplicities + boundary witness + rc table). PHASE-3: the base is no longer internally balanced
-    // — the global identity is main + program + boundary + rc == B (the public dangling boundary term),
+    // multiplicities + qubitmem witness + rc table). PHASE-3: the base is no longer internally balanced
+    // — the global identity is main + program + qubitmem + rc == B (the public dangling qubitmem term),
     // so the main component's claimed sum is v_main = B − v_program − v_boundary − v_rc (the rc demand
     // in main cancels the rc supply).
     // H_P (Fork A): the program claimed sum now carries the internal -mult/TAG_PROGRAM AND the public
     // +mult/TAG_PROGRAM_PUB term (`program_claimed_sum`).
     let v_program = program_claimed_sum(&program, &v_elements.program);
-    let v_boundary = boundary_public_sum(&boundary, &v_elements.qubitmem);
+    let v_boundary = qubitmem_public_sum(&qubitmem, &v_elements.qubitmem);
     let v_rc = table_public_sum(&rc_table.multiplicity, &v_elements.rc, TAG_RC, |i| {
         vec![BaseField::from_u32_unchecked(rc_table.val[i])]
     });
-    let v_b_public = boundary_public_term(&boundary, &v_elements.qubitmem);
+    let v_b_public = qubitmem_public_term(&qubitmem, &v_elements.qubitmem);
     let v_p_pub = program_public_term(&program, &v_elements.program);
-    // main_sum = (B + P_pub) − program − boundary − rc. mix_felts ORDER must match the prover's exactly.
+    // main_sum = (B + P_pub) − program − qubitmem − rc. mix_felts ORDER must match the prover's exactly.
     let v_main = (v_b_public + v_p_pub) - v_program - v_boundary - v_rc;
     let v_claimed = vec![v_main, v_program, v_boundary, v_rc];
     verifier_channel.mix_felts(&v_claimed);
     let v_components = build_components(
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         rc_log,
         &v_elements,
         v_main,

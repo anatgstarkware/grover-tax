@@ -24,7 +24,7 @@ use crate::test_utils::{
 use crate::test_utils::{prove_tiny_base, prove_tiny_base_on_gpu};
 // Preprocessed column generators (relocated to `preprocessed`) still named by the remaining tests.
 use crate::preprocessed::{
-    generate_boundary_preprocessed, generate_prog_slot_preprocessed, generate_rc_preprocessed,
+    generate_prog_slot_preprocessed, generate_qubitmem_preprocessed, generate_rc_preprocessed,
 };
 // Per-component evals + relation ids (module reorg); imported from their owning component files.
 use crate::air::components::program::ProgramEval;
@@ -47,7 +47,7 @@ const TEST_RC_LOG: u32 = LOG_N_LANES;
 fn tree0_precompute_matches_rebuild() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
-    let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
+    let (rows0, qubitmem0, program0, padded_rows, log_n_rows, max_log_size, config) =
         shard0_shape(&gates, &cases, k, TEST_RC_LOG);
     // Must match the R `shard0_shape` sized `config`/`max_log_size` with (same base construction).
     let rc_log = TEST_RC_LOG;
@@ -63,7 +63,7 @@ fn tree0_precompute_matches_rebuild() {
         max_log_size,
         program0,
         &rows0,
-        boundary0,
+        qubitmem0,
         padded_rows,
         log_n_rows,
         n_gates,
@@ -87,7 +87,7 @@ fn tree0_precompute_matches_rebuild() {
 fn shard_claimed_sums_net_to_public() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
-    let (rows, boundary, program, padded_rows, log_n_rows, _max_log_size, _config) =
+    let (rows, qubitmem, program, padded_rows, log_n_rows, _max_log_size, _config) =
         shard0_shape(&gates, &cases, k, TEST_RC_LOG);
     let rc_table = build_rc_table(&rows, TEST_RC_LOG);
 
@@ -100,7 +100,7 @@ fn shard_claimed_sums_net_to_public() {
 
     let (_mi, main_sum) = gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (_pi, program_sum) = gen_program_interaction(&program, &elements.program);
-    let (_bi, boundary_sum) = gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (_bi, qubitmem_sum) = gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     let (_ri, rc_sum) = {
         let el = elements.rc.clone();
         gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
@@ -108,17 +108,17 @@ fn shard_claimed_sums_net_to_public() {
         })
     };
 
-    let b_public = boundary_public_term(&boundary, &elements.qubitmem);
+    let b_public = qubitmem_public_term(&qubitmem, &elements.qubitmem);
     let p_pub = program_public_term(&program, &elements.program);
     assert_eq!(
-        main_sum + program_sum + boundary_sum + rc_sum,
+        main_sum + program_sum + qubitmem_sum + rc_sum,
         b_public + p_pub,
         "base claimed sums must net to B + P_pub"
     );
 }
 
 /// (T5) `on_trace_constraints_all` — ALL FOUR components' AIR constraints (main, program,
-/// boundary, rc) evaluate to zero on the committed trace (no FRI / proof). Extends the main-only
+/// qubitmem, rc) evaluate to zero on the committed trace (no FRI / proof). Extends the main-only
 /// `main_explicit_constraints_zero_on_valid_rows` to the missing 3 table components, via the
 /// `assert_main_constraints` / `assert_table_constraints` helpers the removed `GATE_AIR_ASSERT`
 /// prove-path hook used. Laptop `cargo test` (CPU/Simd fixture). A violated constraint panics
@@ -127,7 +127,7 @@ fn shard_claimed_sums_net_to_public() {
 fn on_trace_constraints_all() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
-    let (rows, boundary, program, padded_rows, log_n_rows, _max_log_size, _config) =
+    let (rows, qubitmem, program, padded_rows, log_n_rows, _max_log_size, _config) =
         shard0_shape(&gates, &cases, k, TEST_RC_LOG);
     let rc_table = build_rc_table(&rows, TEST_RC_LOG);
 
@@ -139,8 +139,8 @@ fn on_trace_constraints_all() {
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
-    let (boundary_interaction, boundary_sum) =
-        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (qubitmem_interaction, qubitmem_sum) =
+        gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
         gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
@@ -173,17 +173,17 @@ fn on_trace_constraints_all() {
             elements: elements.program.clone(),
         },
     );
-    // (3) qubit-memory boundary table.
-    let bnd_pp = generate_boundary_preprocessed(boundary.n_shots, boundary.log_size);
-    let bnd_wit = generate_boundary_witness(&boundary);
+    // (3) qubit-memory qubitmem table.
+    let qmem_pp = generate_qubitmem_preprocessed(qubitmem.n_shots, qubitmem.log_size);
+    let qmem_wit = generate_qubitmem_witness(&qubitmem);
     assert_table_constraints(
-        boundary.log_size,
-        &bnd_pp,
-        &bnd_wit,
-        &boundary_interaction,
-        boundary_sum,
+        qubitmem.log_size,
+        &qmem_pp,
+        &qmem_wit,
+        &qubitmem_interaction,
+        qubitmem_sum,
         QubitMemEval {
-            log_size: boundary.log_size,
+            log_size: qubitmem.log_size,
             elements: elements.qubitmem.clone(),
         },
     );
@@ -249,7 +249,7 @@ fn base_precompute_identity() {
     let (gates, cases, k) = nop_fixture(4, 2, 1);
     let n_gates = gates.len();
     let rc_lo = build_rc_lo();
-    let (rows0, boundary0, program0, padded_rows, log_n_rows, max_log_size, config) =
+    let (rows0, qubitmem0, program0, padded_rows, log_n_rows, max_log_size, config) =
         shard0_shape(&gates, &cases, k, RC_LOG);
     let (gates_flat0, _x0, off_lo0, off_hi0) =
         gpu_flat_inputs(&gates, &cases, &rc_lo, &rc_lo).expect("gpu_flat_inputs");
@@ -258,7 +258,7 @@ fn base_precompute_identity() {
         max_log_size,
         program0,
         &rows0,
-        boundary0,
+        qubitmem0,
         padded_rows,
         log_n_rows,
         n_gates,
@@ -317,11 +317,11 @@ fn incircuit_self_verify() {
     let n_gates = gates.len();
     // `prove_tiny_base` builds the base + returns the circuit-form config; rebuild the shape
     // scalars it used so the statement matches.
-    let (_rows, boundary, program, _padded, log_n_rows, _mls, _cfg_pcs) =
+    let (_rows, qubitmem, program, _padded, log_n_rows, _mls, _cfg_pcs) =
         shard0_shape(&gates, &cases, k, TEST_RC_LOG);
     let (circuit_proof, params, cfg, _canon) = prove_tiny_base(&gates, &cases, k, TEST_RC_LOG);
     let pp_root: HashValue<SecureField> = params.preprocessed_root.clone();
-    let boundary_xy = params.boundary.clone();
+    let qubitmem_xy = params.qubitmem.clone();
     let total_pc = params.total_pc;
 
     // NoValue circuit shape.
@@ -333,10 +333,10 @@ fn incircuit_self_verify() {
             &mut nv,
             log_n_rows,
             program.log_size,
-            boundary.log_size,
+            qubitmem.log_size,
             params.rc_log,
             pp_root.clone(),
-            boundary_xy.clone(),
+            qubitmem_xy.clone(),
             total_pc,
             program_rows_from_table(&program),
             hiding_nonce(),
@@ -356,10 +356,10 @@ fn incircuit_self_verify() {
         &mut ctx,
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         params.rc_log,
         pp_root,
-        boundary_xy,
+        qubitmem_xy,
         total_pc,
         program_rows_from_table(&program),
         hiding_nonce(),

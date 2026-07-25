@@ -34,7 +34,7 @@ pub(crate) fn pp_id(id: &str) -> PreProcessedColumnId {
 pub(crate) fn preprocessed_columns_sorted(
     main_log_size: u32,
     program_log_size: u32,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
     rc_log: u32,
 ) -> Vec<(PreProcessedColumnId, u32)> {
     let mut cols = vec![
@@ -44,10 +44,10 @@ pub(crate) fn preprocessed_columns_sorted(
         (pp_id("gate_shot_id"), main_log_size),
         (pp_id("gate_pc"), main_log_size),
         (pp_id("gate_pc_in_prog"), main_log_size),
-        // Qubit-memory boundary positional columns. Sized with the boundary table.
-        (pp_id("gate_bnd_shot"), boundary_log_size),
-        (pp_id("gate_bnd_addr"), boundary_log_size),
-        (pp_id("gate_bnd_enabler"), boundary_log_size),
+        // Qubit-memory positional columns. Sized with the qubitmem table.
+        (pp_id("gate_bnd_shot"), qubitmem_log_size),
+        (pp_id("gate_bnd_addr"), qubitmem_log_size),
+        (pp_id("gate_bnd_enabler"), qubitmem_log_size),
         // ts-ordering range-check table membership (val[i]=i). Sized at the DYNAMIC rc_log.
         (pp_id("gate_rc_val"), rc_log),
     ];
@@ -58,10 +58,10 @@ pub(crate) fn preprocessed_columns_sorted(
 pub(crate) fn preprocessed_column_ids(
     main_log_size: u32,
     program_log_size: u32,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
     rc_log: u32,
 ) -> Vec<PreProcessedColumnId> {
-    preprocessed_columns_sorted(main_log_size, program_log_size, boundary_log_size, rc_log)
+    preprocessed_columns_sorted(main_log_size, program_log_size, qubitmem_log_size, rc_log)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -142,14 +142,14 @@ pub(crate) fn generate_pc_in_prog_preprocessed(
     col_from_values(&vals)
 }
 
-/// Preprocessed positional columns for the boundary table: (shot, addr, enabler) per row. Real rows
+/// Preprocessed positional columns for the qubitmem table: (shot, addr, enabler) per row. Real rows
 /// are the first `n_shots * N_QUBITS`; each real row `i` carries `shot = i / N_QUBITS`,
 /// `addr = i % N_QUBITS`, `enabler = 1`; padding rows carry (0, 0, 0).
-pub(crate) fn generate_boundary_preprocessed(
+pub(crate) fn generate_qubitmem_preprocessed(
     n_shots: usize,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let padded = 1usize << boundary_log_size;
+    let padded = 1usize << qubitmem_log_size;
     let real = n_shots * N_QUBITS;
     let nq = N_QUBITS as u32;
     let shot: Vec<u32> = (0..padded)
@@ -159,7 +159,7 @@ pub(crate) fn generate_boundary_preprocessed(
         .map(|i| if i < real { i as u32 % nq } else { 0 })
         .collect();
     // Real-row enabler: 1 for the first `n_shots*N_QUBITS` rows, 0 on padding. POSITIONAL /
-    // shard-invariant (depends only on the shot count). Gates the boundary emission so a non-power-of-
+    // shard-invariant (depends only on the shot count). Gates the qubitmem emission so a non-power-of-
     // two `n_shots*N_QUBITS` (e.g. 9024 shots) does not inject unmatched LogUp terms on padding rows.
     let enabler: Vec<u32> = (0..padded).map(|i| (i < real) as u32).collect();
     vec![

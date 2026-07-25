@@ -75,7 +75,7 @@ impl crate::Components {
 
 /// A tiny self-consistent fixture: an all-NOP circuit (every gate leaves the state unchanged, so
 /// `y == x`), `k` reps, `n_shots` shots. NOP gates still ACCESS their target qubit, so the
-/// memory-chain / rc-table / boundary / program machinery is fully exercised. Distinct targets
+/// memory-chain / rc-table / qubitmem / program machinery is fully exercised. Distinct targets
 /// per gate keep the per-address ts chains simple. Returns (gates, cases, k).
 pub(crate) fn nop_fixture(
     n_gates: usize,
@@ -109,7 +109,7 @@ pub(crate) fn nop_fixture(
 }
 
 /// Shape params shared by the base-pipeline tests and the recursion-const drift tests: build shard-0
-/// rows/boundary/program + pcs config for the fixture, matching the precompute setup above.
+/// rows/qubitmem/program + pcs config for the fixture, matching the precompute setup above.
 #[allow(clippy::type_complexity)]
 pub(crate) fn shard0_shape(
     gates: &[Gate],
@@ -118,23 +118,23 @@ pub(crate) fn shard0_shape(
     rc_log: u32,
 ) -> (
     Vec<Row>,
-    BoundaryTable,
+    QubitMemTable,
     ProgramTable,
     usize,
     u32,
     u32,
     stwo::core::pcs::PcsConfig,
 ) {
-    let (rows, boundary) = build_rows(gates, cases, k).expect("build_rows");
+    let (rows, qubitmem) = build_rows(gates, cases, k).expect("build_rows");
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
     let program = build_program_table(gates, cases.len(), k);
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, qubitmem.log_size);
     let config = crate::leaf::leaf_pcs_config(max_log_size, BASE_LOG_BLOWUP);
     (
         rows,
-        boundary,
+        qubitmem,
         program,
         padded_rows,
         log_n_rows,
@@ -173,14 +173,14 @@ pub(crate) fn prove_tiny_base(
     use stwo::prover::{prove_ex, CommitmentSchemeProver};
 
     let n_gates = gates.len();
-    let (rows, boundary) = build_rows(gates, cases, k).expect("build_rows");
+    let (rows, qubitmem) = build_rows(gates, cases, k).expect("build_rows");
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
     // `rc_log` (R) is a test-chosen construction input: the base proof and the leaf statement fed
     // this base MUST use the SAME R (see `GateAirLeafParams::rc_log`).
     let program = build_program_table(gates, cases.len(), k);
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, qubitmem.log_size);
     // TOY (INSECURE) base PCS: blowup 1, ONE FRI query, no grind. This is a LAPTOP-SAFETY lever:
     // the in-circuit STARK verifier (`emit_one_base`) builds a decommit circuit whose size scales
     // with `n_queries`, so a 1-query base makes the base-NODE trace ~2^15 instead of the
@@ -222,7 +222,7 @@ pub(crate) fn prove_tiny_base(
         log_n_rows,
         n_gates,
         rc_log,
-        &boundary,
+        &qubitmem,
     );
     // Oracle prove is on `TraceBackend` (== SimdBackend) — the column builders already return
     // `TraceBackend` evals, so they feed the scheme directly (NOT via `to_prover`, which under
@@ -233,10 +233,10 @@ pub(crate) fn prove_tiny_base(
     let public_claim = pack_public_claim(&[]);
     prover_channel.mix_felts(&public_claim);
 
-    // Tree 1: main + program/boundary/rc witness.
+    // Tree 1: main + program/qubitmem/rc witness.
     let small_main = {
         let mut v = generate_program_witness(&program);
-        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_qubitmem_witness(&qubitmem));
         v.extend(generate_rc_witness(&rc_table));
         v
     };
@@ -253,21 +253,21 @@ pub(crate) fn prove_tiny_base(
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
-    let (boundary_interaction, boundary_sum) =
-        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (qubitmem_interaction, qubitmem_sum) =
+        gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
         gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
             el.combine(&[ptag(TAG_RC), pack_seq(&rc_table.val, vec_row)])
         })
     };
-    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claimed_sums = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
 
-    // Tree 2: interaction (main, program, boundary, rc).
+    // Tree 2: interaction (main, program, qubitmem, rc).
     let small_interaction = {
         let mut v = program_interaction;
-        v.extend(boundary_interaction);
+        v.extend(qubitmem_interaction);
         v.extend(rc_interaction);
         v
     };
@@ -280,12 +280,12 @@ pub(crate) fn prove_tiny_base(
     let components = build_components(
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         rc_log,
         &elements,
         main_sum,
         program_sum,
-        boundary_sum,
+        qubitmem_sum,
         rc_sum,
     );
     // `prove_tiny_base` is the SIMD (`TraceBackend`) oracle even under `cuda`, so it needs
@@ -307,25 +307,25 @@ pub(crate) fn prove_tiny_base(
         INTERACTION_POW_BITS,
     );
     let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
-    let mut boundary_xy = Vec::with_capacity(cases.len());
+    let mut qubitmem_xy = Vec::with_capacity(cases.len());
     for case in cases {
         let x = state_to_limbs(&hex::decode(&case.x_hex).unwrap());
         let y = state_to_limbs(&hex::decode(&case.y_hex).unwrap());
-        boundary_xy.push((x, y));
+        qubitmem_xy.push((x, y));
     }
     let total_pc = (n_gates * k) as u32;
     let params = crate::leaf::GateAirLeafParams {
         main_log_size: log_n_rows,
         program_log_size: program.log_size,
-        boundary_log_size: boundary.log_size,
+        qubitmem_log_size: qubitmem.log_size,
         rc_log,
         preprocessed_root: pp_root,
-        boundary: boundary_xy,
+        qubitmem: qubitmem_xy,
         total_pc,
         program: program_rows_from_table(&program),
         nonce: hiding_nonce(),
     };
-    let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claim: Vec<SecureField> = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     let circuit_proof =
         proof_from_stark_proof(&extended, &cfg, claim, interaction_pow_nonce, channel_salt);
     // Canonical base preprocessed root recomputed from the trusted shape + toy config (step 1).
@@ -338,7 +338,7 @@ pub(crate) fn prove_tiny_base(
         log_n_rows,
         n_gates,
         rc_log,
-        &boundary,
+        &qubitmem,
         config,
     );
     (circuit_proof, params, cfg, canonical_base_pp_root)
@@ -373,12 +373,12 @@ pub(crate) fn prove_tiny_base_on_gpu(
     use stwo::prover::{prove_ex, CommitmentSchemeProver};
 
     let n_gates = gates.len();
-    let (rows, boundary) = build_rows(gates, cases, k).expect("build_rows");
+    let (rows, qubitmem) = build_rows(gates, cases, k).expect("build_rows");
     let real_rows = rows.len();
     let padded_rows = real_rows.next_power_of_two().max(1 << (LOG_N_LANES + 2));
     let log_n_rows = padded_rows.ilog2();
     let program = build_program_table(gates, cases.len(), k);
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, qubitmem.log_size);
     let config = PcsConfig {
         pow_bits: 0,
         fri_config: FriConfig {
@@ -416,7 +416,7 @@ pub(crate) fn prove_tiny_base_on_gpu(
         log_n_rows,
         n_gates,
         rc_log,
-        &boundary,
+        &qubitmem,
     );
     tree_builder.extend_evals(to_prover(pp));
     tree_builder.commit(prover_channel);
@@ -427,7 +427,7 @@ pub(crate) fn prove_tiny_base_on_gpu(
     // Tree 1.
     let small_main = {
         let mut v = generate_program_witness(&program);
-        v.extend(generate_boundary_witness(&boundary));
+        v.extend(generate_qubitmem_witness(&qubitmem));
         v.extend(generate_rc_witness(&rc_table));
         v
     };
@@ -448,21 +448,21 @@ pub(crate) fn prove_tiny_base_on_gpu(
     let (main_interaction, main_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);
     let (program_interaction, program_sum) = gen_program_interaction(&program, &elements.program);
-    let (boundary_interaction, boundary_sum) =
-        gen_boundary_interaction(&boundary, &elements.qubitmem);
+    let (qubitmem_interaction, qubitmem_sum) =
+        gen_qubitmem_interaction(&qubitmem, &elements.qubitmem);
     let (rc_interaction, rc_sum) = {
         let el = elements.rc.clone();
         gen_table_interaction(&rc_table.multiplicity, rc_table.log_size, |vec_row| {
             el.combine(&[ptag(TAG_RC), pack_seq(&rc_table.val, vec_row)])
         })
     };
-    let claimed_sums = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claimed_sums = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     prover_channel.mix_felts(&claimed_sums);
 
     // Tree 2.
     let small_interaction = {
         let mut v = program_interaction;
-        v.extend(boundary_interaction);
+        v.extend(qubitmem_interaction);
         v.extend(rc_interaction);
         v
     };
@@ -475,12 +475,12 @@ pub(crate) fn prove_tiny_base_on_gpu(
     let components = build_components(
         log_n_rows,
         program.log_size,
-        boundary.log_size,
+        qubitmem.log_size,
         rc_log,
         &elements,
         main_sum,
         program_sum,
-        boundary_sum,
+        qubitmem_sum,
         rc_sum,
     );
     let prover_refs = components.prover_refs();
@@ -499,32 +499,32 @@ pub(crate) fn prove_tiny_base_on_gpu(
         INTERACTION_POW_BITS,
     );
     let pp_root: HashValue<SecureField> = extended.proof.commitments[0].into();
-    let mut boundary_xy = Vec::with_capacity(cases.len());
+    let mut qubitmem_xy = Vec::with_capacity(cases.len());
     for case in cases {
         let x = state_to_limbs(&hex::decode(&case.x_hex).unwrap());
         let y = state_to_limbs(&hex::decode(&case.y_hex).unwrap());
-        boundary_xy.push((x, y));
+        qubitmem_xy.push((x, y));
     }
     let total_pc = (n_gates * k) as u32;
     let params = crate::leaf::GateAirLeafParams {
         main_log_size: log_n_rows,
         program_log_size: program.log_size,
-        boundary_log_size: boundary.log_size,
+        qubitmem_log_size: qubitmem.log_size,
         rc_log,
         preprocessed_root: pp_root,
-        boundary: boundary_xy,
+        qubitmem: qubitmem_xy,
         total_pc,
         program: program_rows_from_table(&program),
         nonce: hiding_nonce(),
     };
-    let claim: Vec<SecureField> = vec![main_sum, program_sum, boundary_sum, rc_sum];
+    let claim: Vec<SecureField> = vec![main_sum, program_sum, qubitmem_sum, rc_sum];
     let circuit_proof =
         proof_from_stark_proof(&extended, &cfg, claim, interaction_pow_nonce, channel_salt);
     (circuit_proof, params)
 }
 
 /// Soundness (base pp-root pin): recompute the canonical base tree0 root at build time purely from the
-/// trusted public config (program table, k, n_gates, shard-invariant row shape, boundary layout,
+/// trusted public config (program table, k, n_gates, shard-invariant row shape, qubitmem layout,
 /// rc_log = RC_LOG, base blowup), so it can be compared against a forgeable proof value. Must NOT read
 /// the prover's `commitments[0]`. tree0 is shard-invariant (see [`build_tree0_columns`]), so any
 /// shard's rows recompute the same root; the build mirrors [`BaseProverPrecompute::new`] exactly, so the
@@ -539,7 +539,7 @@ pub(crate) fn canonical_base_preprocessed_root(
     log_n_rows: u32,
     n_gates: usize,
     rc_log: u32,
-    boundary: &BoundaryTable,
+    qubitmem: &QubitMemTable,
     pcs_config: stwo::core::pcs::PcsConfig,
 ) -> circuits::blake::HashValue<SecureField> {
     use circuits::blake::HashValue;
@@ -548,7 +548,7 @@ pub(crate) fn canonical_base_preprocessed_root(
     use stwo::prover::poly::circle::PolyOps;
     use stwo::prover::{CommitmentSchemeProver, CommitmentTreeProver};
 
-    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, boundary.log_size);
+    let max_log_size = tree0_max_log_size(log_n_rows, rc_log, program.log_size, qubitmem.log_size);
     let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_log_size + 1 + pcs_config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -563,7 +563,7 @@ pub(crate) fn canonical_base_preprocessed_root(
         log_n_rows,
         n_gates,
         rc_log,
-        boundary,
+        qubitmem,
     );
     let polys = ProverBackend::interpolate_columns(to_prover(cols), &twiddles);
     let tree0 = CommitmentTreeProver::<ProverBackend, Blake2sM31MerkleChannel>::new(
@@ -595,7 +595,7 @@ pub(crate) fn canonical_base_preprocessed_root(
             log_n_rows,
             n_gates,
             rc_log,
-            boundary,
+            qubitmem,
         );
         let mut tb = scheme.tree_builder();
         tb.extend_evals(to_prover(cols_r));

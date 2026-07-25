@@ -2,7 +2,7 @@
 //! `CircuitEval` components for the generic `circuits_stark_verifier`. gate_air's LogUp uses ONE
 //! shared relation with a constant id tag prepended to each tuple (see `TAG_*` in main.rs), so each
 //! `add_to_relation` here prepends the same tag the prover used. Components: main gate, program
-//! (hidden-program consistency via H_P), boundary (per (shot,addr) anchoring), rc (ts-ordering
+//! (hidden-program consistency via H_P), qubitmem (per (shot,addr) anchoring), rc (ts-ordering
 //! range-check supply). Same-row; `ts = pc+1` and the target `v_after` are inlined, not columns.
 #![allow(dead_code)]
 
@@ -82,12 +82,12 @@ impl<Value: IValue> CircuitEval<Value> for ProgramTable {
     }
 }
 
-/// Qubit-memory boundary table (supply). `shot`/`addr` preprocessed; `x`/`y`/`ts_last` witness.
-/// PHASE-3 re-keyed boundary (mirrors `components::qubitmem::QubitMemEval`): emits on TAG_QUBITMEM the internal
+/// Qubit-memory table (supply). `shot`/`addr` preprocessed; `x`/`y`/`ts_last` witness.
+/// PHASE-3 re-keyed qubitmem (mirrors `components::qubitmem::QubitMemEval`): emits on TAG_QUBITMEM the internal
 /// final Use[+1](shot,addr,ts_last,y) + the PUBLIC final Yield[-1](shot,addr,TS_FINAL,y). `x` is
 /// booleanity-checked only (main carries x publicly at ts=0). Two terms/row => 1 batch => 4 cols.
-pub struct BoundaryTable;
-impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
+pub struct QubitMemTable;
+impl<Value: IValue> CircuitEval<Value> for QubitMemTable {
     fn name(&self) -> String {
         "gate_boundary_table".to_string()
     }
@@ -110,15 +110,15 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
         acc: &mut CompositionConstraintAccumulator,
     ) {
         let [x, y, ts_last] = *component_data.trace_columns() else {
-            panic!("boundary table: expected 3 trace columns")
+            panic!("qubitmem table: expected 3 trace columns")
         };
         let shot = acc.get_preprocessed_column(&pp_id("gate_bnd_shot"));
         let addr = acc.get_preprocessed_column(&pp_id("gate_bnd_addr"));
         // Real-row enabler (1 real, 0 padding): gates the emission so non-power-of-two n_shots*512
         // padding rows inject no unmatched LogUp terms. Mirrors QubitMemEval.
-        let bnd_enabler = acc.get_preprocessed_column(&pp_id("gate_bnd_enabler"));
+        let qmem_enabler = acc.get_preprocessed_column(&pp_id("gate_bnd_enabler"));
         let one = context.one();
-        // Booleanity of the boundary values.
+        // Booleanity of the qubitmem values.
         let c = eval!(context, (x) * ((x) - (one)));
         acc.add_constraint(context, c);
         let c = eval!(context, (y) * ((y) - (one)));
@@ -126,11 +126,11 @@ impl<Value: IValue> CircuitEval<Value> for BoundaryTable {
 
         let tag = context.constant(qm31_from_u32s(TAG_QUBITMEM, 0, 0, 0));
         let ts_final = context.constant(qm31_from_u32s(TS_FINAL, 0, 0, 0));
-        let _ = x; // booleanity-checked above; not emitted by the boundary (main carries x at ts=0).
-                   // (B) internal final Use[+bnd_enabler] / (shot, addr, ts_last, y).
-        acc.add_to_relation(context, bnd_enabler, &[tag, shot, addr, ts_last, y]);
-        // (D) public final Yield[-bnd_enabler] / (shot, addr, TS_FINAL, y).
-        let neg_enabler = eval!(context, -(bnd_enabler));
+        let _ = x; // booleanity-checked above; not emitted by the qubitmem (main carries x at ts=0).
+                   // (B) internal final Use[+qmem_enabler] / (shot, addr, ts_last, y).
+        acc.add_to_relation(context, qmem_enabler, &[tag, shot, addr, ts_last, y]);
+        // (D) public final Yield[-qmem_enabler] / (shot, addr, TS_FINAL, y).
+        let neg_enabler = eval!(context, -(qmem_enabler));
         acc.add_to_relation(context, neg_enabler, &[tag, shot, addr, ts_final, y]);
     }
 }
@@ -352,7 +352,7 @@ impl<Value: IValue> CircuitEval<Value> for MainGate {
     }
 }
 
-/// The 4 statement components in prover order: main, program, boundary, rc.
+/// The 4 statement components in prover order: main, program, qubitmem, rc.
 pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn CircuitEval<Value>>> {
     IndexMap::from([
         (
@@ -365,7 +365,7 @@ pub fn gate_air_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn Ci
         ),
         (
             "gate_boundary",
-            Box::new(BoundaryTable) as Box<dyn CircuitEval<Value>>,
+            Box::new(QubitMemTable) as Box<dyn CircuitEval<Value>>,
         ),
         ("gate_rc", Box::new(RcTable) as Box<dyn CircuitEval<Value>>),
     ])
@@ -382,13 +382,13 @@ pub struct GateAirStatement<Value: IValue> {
     ///
     /// PHASE-3: these guessed limbs are now BOUND to the verified base proof. `public_logup_sum`
     /// bit-decomposes them (addr = limb*16 + bit, LSB-first) and forms the matching qubit-memory
-    /// LogUp term over (shot, addr, ts, bit); the base's re-keyed boundary leaves a public term B and
+    /// LogUp term over (shot, addr, ts, bit); the base's re-keyed qubitmem leaves a public term B and
     /// the in-circuit verifier balance `public_logup_sum + Σ claimed_sums == 0` forces these guessed
     /// x/y to equal the base's committed x/y. The output hash then commits to the BOUND values.
-    boundary: Vec<([Var; N_LIMBS], [Var; N_LIMBS])>,
-    /// Raw u32 limbs (same values as `boundary`, pre-guess) — the host source the bit-decomposition in
+    qubitmem: Vec<([Var; N_LIMBS], [Var; N_LIMBS])>,
+    /// Raw u32 limbs (same values as `qubitmem`, pre-guess) — the host source the bit-decomposition in
     /// `public_logup_sum` guesses from. For NoValue (shape) the bit values are irrelevant.
-    boundary_u32: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
+    qubitmem_u32: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
     total_pc: u32,
     /// H_P program commitment (OPEN #3, Fork A). Per-slot Vars used BOTH to bind the program to the
     /// base (via `public_logup_sum`'s TAG_PROGRAM_PUB term) AND to form `H_P = blake(program ‖ nonce)`.
@@ -400,7 +400,7 @@ pub struct GateAirStatement<Value: IValue> {
     /// Log sizes needed to reproduce the preprocessed column order.
     main_log_size: u32,
     program_log_size: u32,
-    boundary_log_size: u32,
+    qubitmem_log_size: u32,
     /// The rc supply-table log-size `R`, a TRUSTED construction input (production: `RC_LOG`; tests: the
     /// test's chosen value). NEVER read from the proof — see the soundness note in `new`.
     rc_log: u32,
@@ -423,15 +423,15 @@ impl<Value: IValue> GateAirStatement<Value> {
         context: &mut Context<Value>,
         main_log_size: u32,
         program_log_size: u32,
-        boundary_log_size: u32,
+        qubitmem_log_size: u32,
         rc_log: u32,
         preprocessed_root: HashValue<QM31>,
-        boundary: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
+        qubitmem: Vec<([u32; N_LIMBS], [u32; N_LIMBS])>,
         total_pc: u32,
         program: ProgramRows,
         nonce: [u32; 2],
     ) -> Self {
-        // Component order: main, program, boundary, rc. The rc component's log_size is `R = rc_log`,
+        // Component order: main, program, qubitmem, rc. The rc component's log_size is `R = rc_log`,
         // the native size of its [0,2^R) supply table.
         //
         // SOUNDNESS-CRITICAL: R is a FIXED TRUSTED CONSTRUCTION INPUT (the public `RC_LOG` in
@@ -444,7 +444,7 @@ impl<Value: IValue> GateAirStatement<Value> {
             rc_log <= 30,
             "rc_log {rc_log} exceeds M31 field bound (2^rc_log must be < p)"
         );
-        let log_sizes = [main_log_size, program_log_size, boundary_log_size, rc_log];
+        let log_sizes = [main_log_size, program_log_size, qubitmem_log_size, rc_log];
         let n_components = log_sizes.len();
         let packed = pack_into_qm31s(log_sizes.iter().cloned())
             .into_iter()
@@ -459,7 +459,7 @@ impl<Value: IValue> GateAirStatement<Value> {
             U32Wrapper::new_unsafe(Value::from_qm31(*preprocessed_root[i].get()))
         }))
         .guess(context);
-        let boundary_vars = boundary
+        let qubitmem_vars = qubitmem
             .iter()
             .map(|(x_limbs, y_limbs)| {
                 let x =
@@ -521,14 +521,14 @@ impl<Value: IValue> GateAirStatement<Value> {
             components: gate_air_components(),
             component_log_sizes,
             preprocessed_root,
-            boundary: boundary_vars,
-            boundary_u32: boundary,
+            qubitmem: qubitmem_vars,
+            qubitmem_u32: qubitmem,
             total_pc,
             program: program_vars,
             nonce: nonce_vars,
             main_log_size,
             program_log_size,
-            boundary_log_size,
+            qubitmem_log_size,
             rc_log,
         }
     }
@@ -538,9 +538,9 @@ impl<Value: IValue> GateAirStatement<Value> {
         &self.preprocessed_root
     }
 
-    /// The guessed boundary (x, y) limb Vars per shot (for the leaf's output-hash preimage).
-    pub fn boundary_vars(&self) -> &[([Var; N_LIMBS], [Var; N_LIMBS])] {
-        &self.boundary
+    /// The guessed qubitmem (x, y) limb Vars per shot (for the leaf's output-hash preimage).
+    pub fn qubitmem_vars(&self) -> &[([Var; N_LIMBS], [Var; N_LIMBS])] {
+        &self.qubitmem
     }
 
     /// H_P = blake2s( program_table ‖ nonce ) over the SAME guessed program Vars that `public_logup_sum`
@@ -587,7 +587,7 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         preprocessed_column_ids(
             self.main_log_size,
             self.program_log_size,
-            self.boundary_log_size,
+            self.qubitmem_log_size,
             rc_log,
         )
     }
@@ -599,11 +599,11 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
         context: &mut Context<Value>,
         interaction_elements: [Var; 2],
     ) -> Var {
-        // x/y binding. The base's re-keyed boundary leaves a PUBLIC dangling term
+        // x/y binding. The base's re-keyed qubitmem leaves a PUBLIC dangling term
         // B = Σ_{shot,addr} ( +[shot,addr,0,x] − [shot,addr,TS_FINAL,y] ) in its claimed sums, and
         // `verify` enforces `public_logup_sum + Σ claimed_sums == 0`, so this must return −B over the
         // GUESSED x/y bits. Distinct tuples (ts=0 vs TS_FINAL, value in {0,1}) mean the balance holds at
-        // random (z,α) only if x_bit/y_bit == the committed boundary, binding the guessed limbs (which
+        // random (z,α) only if x_bit/y_bit == the committed qubitmem, binding the guessed limbs (which
         // also feed the output hash). addr = limb*16 + bit (LSB-first), matching the base's encoding.
         let tag = konst(context, TAG_QUBITMEM);
         let ts0 = context.zero();
@@ -613,9 +613,9 @@ impl<Value: IValue> Statement<Value> for GateAirStatement<Value> {
 
         let mut acc_sum = context.zero();
         for (shot, ((x_limbs, y_limbs), (x_u32, y_u32))) in self
-            .boundary
+            .qubitmem
             .iter()
-            .zip(self.boundary_u32.iter())
+            .zip(self.qubitmem_u32.iter())
             .enumerate()
         {
             let shot_c = konst(context, shot as u32);

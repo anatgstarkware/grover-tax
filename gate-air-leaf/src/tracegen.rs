@@ -32,8 +32,8 @@ use crate::air::{
     N_LIMBS, N_QUBITS, OP_CNOT, OP_NOP, OP_NOT, OP_TOFFOLI, STATE_BYTES, TS_FINAL, TS_RC_BITS,
 };
 use crate::preprocessed::{
-    col_from_values, generate_boundary_preprocessed, generate_enabler_preprocessed,
-    generate_pc_in_prog_preprocessed, generate_pc_preprocessed, generate_prog_slot_preprocessed,
+    col_from_values, generate_enabler_preprocessed, generate_pc_in_prog_preprocessed,
+    generate_pc_preprocessed, generate_prog_slot_preprocessed, generate_qubitmem_preprocessed,
     generate_rc_preprocessed, generate_shot_id_preprocessed,
 };
 use crate::{Gate, TestCase};
@@ -106,12 +106,12 @@ impl Row {
     }
 }
 
-// Data tables (trace-side): the boundary / rc supply tables the base proof commits. These are built and
+// Data tables (trace-side): the qubitmem / rc supply tables the base proof commits. These are built and
 // consumed by `tracegen` / the base prover (they hold NO constraint logic); they sit here beside
 // `AccessCols`/`Row` (the trace data they count over) and the GPU trace glue.
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct BoundaryRow {
+pub(crate) struct QubitMemRow {
     pub(crate) shot_id: u32, // preprocessed
     pub(crate) addr: u32,    // preprocessed (Seq 0..511, repeating per shot)
     pub(crate) x: u32,       // witness (init value, 1 bit)
@@ -119,18 +119,18 @@ pub(crate) struct BoundaryRow {
     pub(crate) ts_last: u32, // witness (last ts at this addr this shot; 0 if untouched)
 }
 
-/// Flat list of `n_shots * N_QUBITS` boundary rows, plus the padded power-of-two size.
-pub(crate) struct BoundaryTable {
-    pub(crate) rows: Vec<BoundaryRow>,
+/// Flat list of `n_shots * N_QUBITS` qubitmem rows, plus the padded power-of-two size.
+pub(crate) struct QubitMemTable {
+    pub(crate) rows: Vec<QubitMemRow>,
     pub(crate) log_size: u32,
     pub(crate) n_shots: usize,
 }
 
-impl BoundaryTable {
+impl QubitMemTable {
     pub(crate) fn new(n_shots: usize) -> Self {
         let real = n_shots * N_QUBITS;
         let padded = real.next_power_of_two().max(LANE_COUNT);
-        let mut rows = vec![BoundaryRow::default(); padded];
+        let mut rows = vec![QubitMemRow::default(); padded];
         // Pre-fill positional (shot, addr) for real rows so untouched-simulation shots still
         // carry a valid tuple; simulate_shot overwrites the witness fields (x, y, ts_last).
         for (i, r) in rows.iter_mut().enumerate().take(real) {
@@ -145,7 +145,7 @@ impl BoundaryTable {
     }
 
     /// Mutable per-shot chunks of exactly `N_QUBITS` rows (for parallel simulation fill).
-    pub(crate) fn per_shot_mut(&mut self) -> Vec<&mut [BoundaryRow]> {
+    pub(crate) fn per_shot_mut(&mut self) -> Vec<&mut [QubitMemRow]> {
         let real = self.n_shots * N_QUBITS;
         self.rows[..real].chunks_mut(N_QUBITS).collect()
     }
@@ -306,7 +306,7 @@ pub(crate) fn build_rows(
     gates: &[Gate],
     cases: &[TestCase],
     k: usize,
-) -> Result<(Vec<Row>, BoundaryTable)> {
+) -> Result<(Vec<Row>, QubitMemTable)> {
     use rayon::prelude::*;
 
     let n_gates = gates.len();
@@ -326,25 +326,25 @@ pub(crate) fn build_rows(
 
     // Pre-allocate the full scalar row buffer; each shot fills a disjoint block.
     let mut rows = vec![Row::padding(); total_rows];
-    // Per-shot boundary rows: 512 entries per shot, holding init/final (x, y, ts_last).
-    let mut boundary = BoundaryTable::new(cases.len());
+    // Per-shot qubitmem rows: 512 entries per shot, holding init/final (x, y, ts_last).
+    let mut qubitmem = QubitMemTable::new(cases.len());
 
     // Phase 1: simulate every shot in parallel into its own disjoint row block +
-    // boundary block. Returns Err on the first shot whose simulation fails or whose
+    // qubitmem block. Returns Err on the first shot whose simulation fails or whose
     // final state mismatches y_hex.
     let per_shot: Vec<Result<()>> = rows
         .par_chunks_mut(shot_rows)
-        .zip(boundary.per_shot_mut().par_iter_mut())
+        .zip(qubitmem.per_shot_mut().par_iter_mut())
         .zip(cases.par_iter())
         .enumerate()
-        .map(|(shot_id, ((block, bnd), case))| simulate_shot(gates, k, shot_id, case, block, bnd))
+        .map(|(shot_id, ((block, qmem), case))| simulate_shot(gates, k, shot_id, case, block, qmem))
         .collect();
 
     for result in per_shot {
         result?;
     }
 
-    Ok((rows, boundary))
+    Ok((rows, qubitmem))
 }
 
 /// Simulate a single shot sequentially, filling its row block: the chain (K reps * n_gates gates) is
@@ -355,7 +355,7 @@ pub(crate) fn simulate_shot(
     shot_id: usize,
     case: &TestCase,
     block: &mut [Row],
-    bnd: &mut [BoundaryRow],
+    qmem: &mut [QubitMemRow],
 ) -> Result<()> {
     let n_gates = gates.len();
     let x = hex::decode(&case.x_hex).context("decoding x_hex")?;
@@ -363,7 +363,7 @@ pub(crate) fn simulate_shot(
     if x.len() != STATE_BYTES || y.len() != STATE_BYTES {
         bail!("state must be {STATE_BYTES} bytes");
     }
-    debug_assert_eq!(bnd.len(), N_QUBITS);
+    debug_assert_eq!(qmem.len(), N_QUBITS);
 
     // Per-shot qubit-memory state: last[addr] = (ts, value). Reset each shot.
     // `ts` is the PROGRAM-ORDER timestamp `pc + 1`: an affine function of the preprocessed pc, so an
@@ -448,7 +448,7 @@ pub(crate) fn simulate_shot(
     }
     debug_assert_eq!(row_idx, k * n_gates);
 
-    // Boundary rows: init x, final y (== last_val), ts_last (0 if untouched).
+    // Qubitmem rows: init x, final y (== last_val), ts_last (0 if untouched).
     for addr in 0..N_QUBITS {
         let y_bit = qubit_bit(&y, addr);
         // Self-check: simulated final value equals y's bit at this addr.
@@ -459,7 +459,7 @@ pub(crate) fn simulate_shot(
                 y_bit
             );
         }
-        bnd[addr] = BoundaryRow {
+        qmem[addr] = QubitMemRow {
             shot_id: shot_id as u32,
             addr: addr as u32,
             x: x_bit(addr),
@@ -553,13 +553,13 @@ pub(crate) fn to_prover(
         .collect()
 }
 
-/// Boundary-table witness (x, y, ts_last), in the order QubitMemEval reads them.
-pub(crate) fn generate_boundary_witness(
-    bnd: &BoundaryTable,
+/// Qubitmem-table witness (x, y, ts_last), in the order QubitMemEval reads them.
+pub(crate) fn generate_qubitmem_witness(
+    qmem: &QubitMemTable,
 ) -> ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
-    let x: Vec<u32> = bnd.rows.iter().map(|r| r.x).collect();
-    let y: Vec<u32> = bnd.rows.iter().map(|r| r.y).collect();
-    let ts_last: Vec<u32> = bnd.rows.iter().map(|r| r.ts_last).collect();
+    let x: Vec<u32> = qmem.rows.iter().map(|r| r.x).collect();
+    let y: Vec<u32> = qmem.rows.iter().map(|r| r.y).collect();
+    let ts_last: Vec<u32> = qmem.rows.iter().map(|r| r.ts_last).collect();
     vec![
         col_from_values(&x),
         col_from_values(&y),
@@ -807,23 +807,23 @@ pub(crate) fn gen_table_interaction(
     (cols, sum)
 }
 
-/// Boundary component interaction trace: per (shot, addr) row emit the internal final
+/// Qubitmem component interaction trace: per (shot, addr) row emit the internal final
 /// Use[+1](shot, addr, ts_last, y) and the PUBLIC final Yield[-1](shot, addr, TS_FINAL, y) on
 /// TAG_QUBITMEM. Two terms per row -> one batch (paired), matching `QubitMemEval`. CPU-only in
 /// both the CPU and cuda paths (the CUDA kernel covers only the gate_air MAIN component).
-pub(crate) fn gen_boundary_interaction(
-    bnd: &BoundaryTable,
+pub(crate) fn gen_qubitmem_interaction(
+    qmem: &QubitMemTable,
     el: &GateRel,
 ) -> (
     ColumnVec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>>,
     SecureField,
 ) {
-    let mut gen = LogupTraceGenerator::new(bnd.log_size);
+    let mut gen = LogupTraceGenerator::new(qmem.log_size);
     let mut col = gen.new_col();
-    let n_vec = 1usize << (bnd.log_size - LOG_N_LANES);
-    let pack_f = |vec_row: usize, f: &dyn Fn(&BoundaryRow) -> u32| pack_boundary(bnd, vec_row, f);
+    let n_vec = 1usize << (qmem.log_size - LOG_N_LANES);
+    let pack_f = |vec_row: usize, f: &dyn Fn(&QubitMemRow) -> u32| pack_qubitmem(qmem, vec_row, f);
     let ts_final = PackedM31::broadcast(BaseField::from_u32_unchecked(TS_FINAL));
-    let real = bnd.n_shots * N_QUBITS;
+    let real = qmem.n_shots * N_QUBITS;
     for vec_row in 0..n_vec {
         let tag = ptag(TAG_QUBITMEM);
         let shot = pack_f(vec_row, &|r| r.shot_id);
@@ -835,7 +835,7 @@ pub(crate) fn gen_boundary_interaction(
             BaseField::from_u32_unchecked(((vec_row << LOG_N_LANES) + lane < real) as u32)
         }));
         let enabler = PackedSecureField::from(enabler);
-        // Phase-3 re-keyed boundary (mirrors QubitMemEval), gated by the real-row enabler:
+        // Phase-3 re-keyed qubitmem (mirrors QubitMemEval), gated by the real-row enabler:
         //   (B) internal final Use[+enabler] / (shot, addr, ts_last, y).
         let d_use: PackedSecureField = el.combine(&[tag, shot, addr, ts_last, y]);
         //   (D) public   final Yield[-enabler] / (shot, addr, TS_FINAL, y).
@@ -848,14 +848,14 @@ pub(crate) fn gen_boundary_interaction(
     (cols, sum)
 }
 
-/// Program-table interaction (H_P binding, Fork A). Mirrors `gen_boundary_interaction`'s two-term/
+/// Program-table interaction (H_P binding, Fork A). Mirrors `gen_qubitmem_interaction`'s two-term/
 /// one-batch shape so the program component stays 4 interaction columns. Per real slot row emits:
 ///   (internal, -mult) / combine(TAG_PROGRAM,     slot, op, t, a, b)  — cancels main's demand,
 ///   (public,   +mult) / combine(TAG_PROGRAM_PUB, slot, op, t, a, b)  — the dangling P_pub.
 /// Padding rows carry multiplicity 0, so both fractions vanish (numerator 0). The returned claimed
 /// sum is `program_sum` = Σ_slot [ -mult/d_int + mult/d_pub ] = P_pub (the internal part is cancelled
 /// by main's demand only in the GLOBAL sum, not within this component; `program_sum` itself carries
-/// BOTH terms, and the global identity becomes main + program + boundary + rc == B + P_pub, where the
+/// BOTH terms, and the global identity becomes main + program + qubitmem + rc == B + P_pub, where the
 /// `-mult/d_int` inside program_sum cancels main's `+enabler/d_int`, leaving net P_pub).
 pub(crate) fn gen_program_interaction(
     prog: &ProgramTable,
@@ -954,16 +954,16 @@ pub(crate) fn program_claimed_sum(prog: &ProgramTable, el: &GateRel) -> SecureFi
     internal + program_public_term(prog, el)
 }
 
-/// Boundary component claimed sum (supply side): Σ_rows [ +1/combine(ts_last,y) − 1/combine(TS_FINAL,y) ]
-/// — the re-keyed final terms (B)+(D). Must equal `boundary_sum`; recomputed from the committed
-/// boundary table (y/ts_last witness) so a mistranscribed term is caught before FRI.
-pub(crate) fn boundary_public_sum(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
+/// Qubitmem component claimed sum (supply side): Σ_rows [ +1/combine(ts_last,y) − 1/combine(TS_FINAL,y) ]
+/// — the re-keyed final terms (B)+(D). Must equal `qubitmem_sum`; recomputed from the committed
+/// qubitmem table (y/ts_last witness) so a mistranscribed term is caught before FRI.
+pub(crate) fn qubitmem_public_sum(qmem: &QubitMemTable, el: &GateRel) -> SecureField {
     let mut sum = SecureField::zero();
     let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
     let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
     // Only REAL rows emit (gated by gate_bnd_enabler); padding rows contribute nothing.
-    let real = bnd.n_shots * N_QUBITS;
-    for r in &bnd.rows[..real] {
+    let real = qmem.n_shots * N_QUBITS;
+    for r in &qmem.rows[..real] {
         let shot = BaseField::from_u32_unchecked(r.shot_id);
         let addr = BaseField::from_u32_unchecked(r.addr);
         let y = BaseField::from_u32_unchecked(r.y);
@@ -976,22 +976,22 @@ pub(crate) fn boundary_public_sum(bnd: &BoundaryTable, el: &GateRel) -> SecureFi
     sum
 }
 
-/// Phase-3 PUBLIC boundary term B = Σ_rows [ +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ].
+/// Phase-3 PUBLIC qubitmem term B = Σ_rows [ +1/combine(shot,addr,0,x) − 1/combine(shot,addr,TS_FINAL,y) ].
 /// This is exactly the base's total dangling (unconsumed) LogUp sum: main leaves +[0,x] & −[ts_last,y]
-/// per touched (shot,addr), the boundary consumes [ts_last,y] and re-emits −[TS_FINAL,y], so the net is
+/// per touched (shot,addr), the qubitmem consumes [ts_last,y] and re-emits −[TS_FINAL,y], so the net is
 /// +[0,x] − [TS_FINAL,y]. The base's committed claimed sums must satisfy
-/// `main_sum + program_sum + boundary_sum == B` (was `== 0`), and the LEAF's `public_logup_sum` equals
+/// `main_sum + program_sum + qubitmem_sum == B` (was `== 0`), and the LEAF's `public_logup_sum` equals
 /// `−B` over its GUESSED x/y — so the verifier balance `public_logup_sum + Σ claimed_sums == 0` forces
 /// guessed == committed. For UNTOUCHED addrs (ts_last=0) the prover's `x == y`, so the ts=0 term here
 /// (using `x`) faithfully matches the actual dangling +[0,y]; the equality thus also checks x==y there.
-pub(crate) fn boundary_public_term(bnd: &BoundaryTable, el: &GateRel) -> SecureField {
+pub(crate) fn qubitmem_public_term(qmem: &QubitMemTable, el: &GateRel) -> SecureField {
     let mut sum = SecureField::zero();
     let tag = BaseField::from_u32_unchecked(TAG_QUBITMEM);
     let zero = BaseField::zero();
     let ts_final = BaseField::from_u32_unchecked(TS_FINAL);
-    // Only REAL rows are dangling; padding rows emit no main NOR boundary term (gated by enablers).
-    let real = bnd.n_shots * N_QUBITS;
-    for r in &bnd.rows[..real] {
+    // Only REAL rows are dangling; padding rows emit no main NOR qubitmem term (gated by enablers).
+    let real = qmem.n_shots * N_QUBITS;
+    for r in &qmem.rows[..real] {
         let shot = BaseField::from_u32_unchecked(r.shot_id);
         let addr = BaseField::from_u32_unchecked(r.addr);
         let x = BaseField::from_u32_unchecked(r.x);
@@ -1060,7 +1060,7 @@ pub(crate) fn gpu_flat_inputs(
 /// per-shard rebuild path AND the precompute build, so the committed column order/sizes are
 /// IDENTICAL by construction. tree-0 is SHARD-INVARIANT: every column is POSITIONAL
 /// (enabler/shot_id/pc/pc_in_prog from row index, prog_slot/program witness from the shared program
-/// with constant multiplicity = shots_per_shard*k, bnd_shot/bnd_addr from the boundary layout), so
+/// with constant multiplicity = shots_per_shard*k, bnd_shot/bnd_addr from the qubitmem layout), so
 /// for a fixed (k, n_gates, shots_per_shard) shape these columns are the same for every shard. The
 /// rc-table membership columns (pos, val) are also shard-invariant (fixed [0,range) table).
 pub(crate) fn build_tree0_columns(
@@ -1070,12 +1070,12 @@ pub(crate) fn build_tree0_columns(
     log_n_rows: u32,
     n_gates: usize,
     rc_log: u32,
-    boundary: &BoundaryTable,
+    qubitmem: &QubitMemTable,
 ) -> Vec<CircleEvaluation<TraceBackend, BaseField, BitReversedOrder>> {
     // Shape scalars extracted from the staging data (kept out of `preprocessed`, which sees only
     // shape params): real main rows, shot count, and `k` (= real rows / (n_shots * n_gates)).
     let n_real = rows.len();
-    let n_shots = boundary.n_shots;
+    let n_shots = qubitmem.n_shots;
     let k = n_real / (n_shots.max(1) * n_gates);
     let mut tagged: Vec<(
         u32,
@@ -1103,9 +1103,9 @@ pub(crate) fn build_tree0_columns(
         ),
     ];
     tagged.extend(
-        generate_boundary_preprocessed(n_shots, boundary.log_size)
+        generate_qubitmem_preprocessed(n_shots, qubitmem.log_size)
             .into_iter()
-            .map(|c| (boundary.log_size, c)),
+            .map(|c| (qubitmem.log_size, c)),
     );
     // rc membership table sized at the DYNAMIC rc_log (single [0,2^rc_log) val column).
     tagged.extend(
@@ -1192,14 +1192,14 @@ fn pack(lane: &[&Row; LANE_COUNT], get: impl Fn(&Row) -> u32) -> PackedM31 {
     }))
 }
 
-/// Packs one boundary field over a vec_row's lanes.
-fn pack_boundary(
-    bnd: &BoundaryTable,
+/// Packs one qubitmem field over a vec_row's lanes.
+fn pack_qubitmem(
+    qmem: &QubitMemTable,
     vec_row: usize,
-    f: &dyn Fn(&BoundaryRow) -> u32,
+    f: &dyn Fn(&QubitMemRow) -> u32,
 ) -> PackedM31 {
     PackedM31::from_array(std::array::from_fn(|lane| {
-        BaseField::from_u32_unchecked(f(&bnd.rows[(vec_row << LOG_N_LANES) + lane]))
+        BaseField::from_u32_unchecked(f(&qmem.rows[(vec_row << LOG_N_LANES) + lane]))
     }))
 }
 

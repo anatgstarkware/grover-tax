@@ -331,9 +331,9 @@ pub fn k1_byte_identity(
         .next_power_of_two()
         .max(1 << (crate::LOG_N_LANES + 2)); // matches main.rs
 
-    // CPU reference; boundary is a separate component not covered by K1, so ignore it. `build_rc_table`
+    // CPU reference; qubitmem is a separate component not covered by K1, so ignore it. `build_rc_table`
     // gives the CPU rc multiplicity histogram the K1 device histogram must match.
-    let (rows, _boundary) = build_rows(gates, cases, k).map_err(|e| e.to_string())?;
+    let (rows, _qubitmem) = build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     if rows.len() != real_rows {
         return Err(format!(
             "rows.len()={} != real_rows={}",
@@ -710,7 +710,7 @@ pub fn k4_byte_identity(
     let log_n_rows = padded_rows.ilog2();
 
     // CPU reference: build rows + fixed dummy elements + gen_main_interaction.
-    let (rows, _boundary) = build_rows(gates, cases, k).map_err(|e| e.to_string())?;
+    let (rows, _qubitmem) = build_rows(gates, cases, k).map_err(|e| e.to_string())?;
     let elements = crate::LookupElements::dummy();
     let (cpu_cols, cpu_sum) =
         gen_main_interaction(&rows, padded_rows, log_n_rows, n_gates, &elements);

@@ -21,7 +21,7 @@ fn main_explicit_constraints_zero_on_valid_rows() {
     let n_gates = gates.len() as u32;
     let k = fx.repetitions;
     let cases = &fx.test_cases[..1];
-    let (rows, _boundary) = build_rows(&gates, cases, k).unwrap();
+    let (rows, _qubitmem) = build_rows(&gates, cases, k).unwrap();
 
     let dummy_interaction = vec![qm31_from_u32s(0, 0, 0, 0); 16];
     for (ri, row) in rows.iter().enumerate() {

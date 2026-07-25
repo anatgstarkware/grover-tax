@@ -34,7 +34,7 @@ pub(crate) fn assert_tree0_matches_rebuild(
                 pc.log_n_rows,
                 pc.rc_log,
                 pc.program.log_size,
-                pc.boundary.log_size,
+                pc.qubitmem.log_size,
             ) + 1
                 + pc.config.fri_config.log_blowup_factor,
         )
@@ -50,7 +50,7 @@ pub(crate) fn assert_tree0_matches_rebuild(
         pc.log_n_rows,
         n_gates,
         pc.rc_log,
-        &pc.boundary,
+        &pc.qubitmem,
     );
     let n_cols = cols.len();
     let mut tb = scheme.tree_builder();
@@ -102,21 +102,21 @@ pub(crate) fn assert_tree0_matches_rebuild(
 }
 
 /// Debug-only prover self-check: the base shard's claimed LogUp sums must net to the public terms
-/// `B + P_pub` (boundary + program-public). Pure tripwire — the recomputed publics feed nothing
+/// `B + P_pub` (qubitmem + program-public). Pure tripwire — the recomputed publics feed nothing
 /// downstream. Returns `Err` (not a panic) to match the prover's error path.
 #[cfg(debug_assertions)]
 pub(crate) fn assert_claimed_sums_net(
-    boundary: &crate::tracegen::BoundaryTable,
+    qubitmem: &crate::tracegen::QubitMemTable,
     program: &crate::tracegen::ProgramTable,
     elements: &crate::air::LookupElements,
     main_sum: SecureField,
     program_sum: SecureField,
-    boundary_sum: SecureField,
+    qubitmem_sum: SecureField,
     rc_sum: SecureField,
 ) -> anyhow::Result<()> {
-    let b_public = crate::tracegen::boundary_public_term(boundary, &elements.qubitmem);
+    let b_public = crate::tracegen::qubitmem_public_term(qubitmem, &elements.qubitmem);
     let p_pub = crate::tracegen::program_public_term(program, &elements.program);
-    if main_sum + program_sum + boundary_sum + rc_sum != b_public + p_pub {
+    if main_sum + program_sum + qubitmem_sum + rc_sum != b_public + p_pub {
         anyhow::bail!("shard claimed sums do not net to the public terms B + P_pub");
     }
     Ok(())
