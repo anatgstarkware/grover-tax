@@ -8,11 +8,13 @@ license = "MIT"
 # `scarb execute` runs the `#[executable]` function and produces a
 # Cairo PIE / standard-output file that `stwo-cairo`'s prover can
 # consume. See `docs/apples-to-apples-v0.1.md`.
-[executable]
-
 [[target.executable]]
 name = "grover_tax_executable"
 function = "grover_tax_circuit::apples_to_apples_executable"
+
+[[target.executable]]
+name = "iadd_sim_executable"
+function = "grover_tax_circuit::qsim::iadd_sim_executable"
 
 [cairo]
 enable-gas = false

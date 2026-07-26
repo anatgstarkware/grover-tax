@@ -1,0 +1,32 @@
+[package]
+name = "gate-air-cuda-kernel"
+version = "0.1.0"
+edition = "2021"
+# Device-resident gate_air constraint kernel: the per-AIR CUDA kernel + the registration hook that
+# installs it into the generic stwo CudaBackend prover (stwo-cuda-backend). Compiled only under
+# `--features cuda`; the .cu native build needs nvcc (GPU box).
+#
+# The gate_air CUDA sources now live HERE (cuda/evaluate_gate_air.cu + cuda/gate_air_entry.cu),
+# extracted from libstwo_cuda so that backend is generic. build.rs (cuda feature only) nvcc-compiles
+# them into libgate_air_cuda.a and HOST-LINKS against libstwo_cuda (the only cross-lib symbol,
+# generic_constraint_quotients_finalize_kernel, is host-launched -> resolves at host-link; no -rdc
+# against libstwo_cuda). See build.rs for the exact flag mirror of stwo's CMakeLists.
+build = "build.rs"
+
+[features]
+default = []
+# Turns on the vendored stwo-cuda-backend's CudaBackend + gate_air constraint kernel. This crate is
+# pulled ONLY under gate-air-leaf's `cuda` feature (`gate-air-cuda-kernel/cuda`), so the default/CPU
+# leaf build never enables it. The stwo [patch] -> stwo-cuda-backend (in gate-air-leaf/Cargo.toml)
+# provides the `cuda` feature these forward to.
+cuda = ["stwo/cuda", "stwo-constraint-framework/cuda"]
+
+[dependencies]
+# Bumped 74951f79 -> 5ea05973 (#1425) to match gate-air-leaf + the local stwo-circuits branch (CPU build).
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "a095feab", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "a095feab", features = ["prover", "parallel"] }
+# build.rs (cuda feature only): nvcc-compiles cuda/evaluate_gate_air.cu + cuda/gate_air_entry.cu into
+# libgate_air_cuda.a and emits the link flags. `stwo` (patched -> stwo-cuda-backend, links="stwo_cuda")
+# is a DIRECT dependency so its build.rs DEP_STWO_CUDA_INCLUDE / DEP_STWO_CUDA_LIB_DIR reach OUR
+# build.rs; the `evaluate_gate_air_entry` symbol is defined by our archive, and the one external
+# device kernel resolves from libstwo_cuda (linked via `stwo`) at the leaf's final host-link.

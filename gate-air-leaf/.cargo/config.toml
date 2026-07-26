@@ -1,0 +1,4 @@
+# Prover builds always use native codegen (build + run happen on the same machine).
+# Applies to every cargo invocation from this crate, so RUSTFLAGS never needs to be typed.
+[build]
+rustflags = ["-C", "target-cpu=native"]

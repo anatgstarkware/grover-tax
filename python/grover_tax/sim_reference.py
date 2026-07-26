@@ -160,7 +160,15 @@ def _verify_fixture(path: Path) -> None:
         # is intentionally skipped — run(C, x) == x != y (EC add result).
         return
 
-    # v0.2+: real circuit; full sim cross-check.
+    if version == "v0.3-iadd":
+        # The adopted canonical workload (KB-2, #114): K-repeated iadd64.
+        # x_hex / y_hex are the *full* register-encoded states (KB-3), so the
+        # simulator runs over the whole state — no [:32] truncation.
+        _verify_iadd_fixture(fixture)
+        return
+
+    # v0.2: random GTV1 circuit; the prover consumes only x_hex[:32] (P.X).
+    # Retained for regression / T0 continuity (KB-2 keeps the random path).
     circuit = deserialise(bytes.fromhex(fixture["circuit_byte_serialisation_hex"]))
     for i, case in enumerate(fixture["test_cases"]):
         x_bytes = bytes.fromhex(case["x_hex"])  # 64 bytes = P.X || Q.X
@@ -170,6 +178,34 @@ def _verify_fixture(path: Path) -> None:
             raise FixtureError(
                 FixtureSubcode.CROSS_VALIDATION_FAIL,
                 f"test case {i}: run(C, x[:32]) = {y_got.hex()} != y = {y_expected.hex()}",
+            )
+
+
+def _verify_iadd_fixture(fixture: dict[str, object]) -> None:
+    """Cross-validate a `v0.3-iadd` fixture: ``run(C^K, x_state) == y_state``.
+
+    Each test case carries the full register-encoded input/output state, so the
+    reference simulator runs over the entire state and must reproduce the
+    fixture's `y_hex` exactly — the F-INV-4 oracle for the adopted adder.
+    The serialised circuit stores ONE adder repetition; `repetitions` (K)
+    scales the workload, so the gate list is applied K times per case (KB-15).
+    """
+    circuit = deserialise(bytes.fromhex(str(fixture["circuit_byte_serialisation_hex"])))
+    reps_raw = fixture.get("repetitions", 1)
+    repetitions = reps_raw if isinstance(reps_raw, int) else int(str(reps_raw))
+    cases = fixture["test_cases"]
+    assert isinstance(cases, list)
+    for i, case in enumerate(cases):
+        x_bytes = bytes.fromhex(case["x_hex"])
+        y_expected = bytes.fromhex(case["y_hex"])
+        y_got = x_bytes
+        for _ in range(repetitions):
+            y_got = run(circuit, y_got)
+        if y_got != y_expected:
+            raise FixtureError(
+                FixtureSubcode.CROSS_VALIDATION_FAIL,
+                f"test case {i} (r0_in={case.get('r0_in')}, r1_in={case.get('r1_in')}): "
+                f"run(C^{repetitions}, x) = {y_got.hex()} != y = {y_expected.hex()}",
             )
 
 

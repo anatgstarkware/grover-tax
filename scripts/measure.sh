@@ -93,7 +93,7 @@ fi
 RESULTS_DIR="${REPO_ROOT}/results"
 mkdir -p "${RESULTS_DIR}"
 BASE="${RESULTS_DIR}/${PROVER}_v0.1_${RUN_ID}"
-FIXTURE="${REPO_ROOT}/fixtures/v0.1.json"
+FIXTURE="${REPO_ROOT}/fixtures/v0.2.json"
 if [[ ! -f "${FIXTURE}" ]]; then
   echo "MEASUREMENT.ENV_VAR_MISS: ${FIXTURE} missing; run gen-fixtures first" >&2
   exit 5

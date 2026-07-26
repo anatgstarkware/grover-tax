@@ -71,6 +71,9 @@ class FixtureSubcode(str, Enum):
     WORKLOAD_NOT_PINNED = "FIXTURE.WORKLOAD_NOT_PINNED"
     SEED_DRIFT = "FIXTURE.SEED_DRIFT"
     DRIFT = "FIXTURE.DRIFT"
+    # KB-1 (#113): the .kmx → GTV1 transpiler rejects out-of-subset input.
+    UNSUPPORTED_INSTRUCTION = "FIXTURE.UNSUPPORTED_INSTRUCTION"
+    KMX_PARSE_ERROR = "FIXTURE.KMX_PARSE_ERROR"
 
 
 class ProverSubcode(str, Enum):
