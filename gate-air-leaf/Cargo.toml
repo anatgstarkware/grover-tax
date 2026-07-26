@@ -1,0 +1,101 @@
+[package]
+name = "gate-air-leaf"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace, pinned to the recursion's stwo rev (74951f79) + nightly-2026-01-15 so the
+# gate_air STARK proof is in the exact form circuits_stark_verifier (stwo-circuits 041ec6101ba782aa00e325433929cda6ef15c1b9) consumes
+# in-circuit. Milestone 1: rev-align gate_air (native prove+verify on 74951f79). Milestone 2 adds
+# the in-circuit verifier (circuits_stark_verifier).
+[workspace]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+itertools = "0.12"
+num-traits = "0.2"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+# CPU-vs-GPU full-proof byte-identity fingerprint (GATE_AIR_PROOF_HASH): stable SHA-256 over the
+# serde-serialized StarkProof.
+sha2 = "0.10"
+
+# stwo: bumped 74951f79 -> 5ea05973 (#1425) to match the local stwo-circuits branch for CPU build.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "09cdfb73a6cd7f594e29aa30083aecde99d8d9df", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "09cdfb73a6cd7f594e29aa30083aecde99d8d9df", features = ["prover", "parallel"] }
+
+# Milestone 2: in-circuit verification of the gate_air STARK proof (stwo-circuits 041ec6101ba782aa00e325433929cda6ef15c1b9 — same
+# rev the recursion uses). Mirrors crates/stark_verifier_examples' deps.
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+indexmap = "2"
+
+# Milestone 3: turn the verification circuit into a foldable leaf (a circuit-prover proof) and fold
+# N leaves with the multiverifier tree. Same pattern + revs as iadd-recursion (the cairo leaf-gen).
+recursive-aggregate = { git = "https://github.com/starkware-libs/proving-utils", rev = "63ba4786fdcedd9ca78bb7cb73350a1e6bf2b021" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8", features = ["prover"] }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "847802d70876001ff2832e9e1246f532d8976ac8" }
+
+# Device-resident gate_air GPU constraint kernel (registers into the generic CudaBackend prover).
+gate-air-cuda-kernel = { path = "../gate-air-cuda-kernel", optional = true }
+
+# Test-only: serialize the GPU `cuda,diag` byte-identity tests. cargo runs tests in parallel threads,
+# and those tests concurrently load CUDA modules on the same device — a cudarc device-module-map race
+# (surfaced once the AOT fatbin load became fast enough to overlap). `#[serial]` makes them run one at
+# a time regardless of how they're invoked. Dev-only: never in the shipped prover.
+[dev-dependencies]
+serial_test = "3"
+# Enable proving-utils' `test-utils` for the gate-air tests so they reach `recursive_aggregate::
+# test_utils` (capture/drift derivations + `check_*`). Merges with the normal `recursive-aggregate`
+# dependency for test/dev builds only; the shipped binary never pulls `test-utils`.
+recursive-aggregate = { git = "https://github.com/starkware-libs/proving-utils", rev = "63ba4786fdcedd9ca78bb7cb73350a1e6bf2b021", features = ["test-utils"] }
+
+[features]
+# K1/K4 GPU trace-gen kernels (gpu_tracegen.rs). Kernels are compiled AOT by build.rs (nvcc) from
+# cuda/*.cu into $OUT_DIR fatbins and loaded via cudarc. `gpu-cuda` gates the module, drives the
+# build.rs native compile (CARGO_FEATURE_GPU_CUDA), and pulls in the cudarc runtime (GPU box).
+gpu-cuda = ["dep:cudarc"]
+# Byte-identity / diagnostic hooks (GATE_AIR_GPU_TEST, GATE_AIR_PROOF_HASH, k1/k4 byte-identity
+# harnesses). Validation-only — production `cuda` builds deliberately do NOT pull this, so the
+# shipped prover stays clean. Use `--features cuda,diag` for the byte-identity validation runs.
+diag = []
+# Device-resident CUDA prover backend: swaps ProverBackend -> CudaBackend (commit + prove_ex on the
+# device) and installs the gate_air constraint kernel. Pulls gpu-cuda for the K1/K4 trace-gen glue.
+cuda = [
+    # The vendored stwo-cuda-backend has ABSORBED #1425 (afba117d "adopt non-reduced 8-word Blake2s
+    # Merkle hasher (#1425)"), so its `cuda` feature (device-resident CudaBackend + the co-compiled
+    # gate_air constraint kernel) is what `--features cuda` turns on. These refs live INSIDE the
+    # `cuda` feature, so a default/CPU build (no --features cuda) never enables them and never needs
+    # an nvcc toolchain. Paired with the always-on stwo [patch] -> stwo-cuda-backend below, a plain
+    # `--features cuda` build now wires the GPU fast path with NO hand-uncommenting.
+    "stwo/cuda",
+    "stwo-constraint-framework/cuda",
+    "gpu-cuda",
+    "dep:gate-air-cuda-kernel",
+    "gate-air-cuda-kernel/cuda",
+]
+
+# cudarc for the K1/K4 trace-gen launch glue (gpu_tracegen.rs). MUST match stwo's cudarc (0.11).
+# `nvrtc` is retained NOT for `compile_ptx` (kernels are now AOT fatbins) but for the `Ptx` type:
+# `Ptx` lives in cudarc's `nvrtc` module and `driver::load_ptx` takes it, so loading a fatbin via
+# `Ptx::from_file` still requires the `nvrtc` feature.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
+
+# stwo -> vendored stwo-cuda-backend, ALWAYS ON (both the CPU and the --features cuda build). The
+# vendored copy has ABSORBED #1425 (afba117d "adopt non-reduced 8-word Blake2s Merkle hasher
+# (#1425)"; post-#1425 Blake2sM31MerkleChannel::H = standard <false>), so it now agrees with the
+# 5ea05973 the local stwo-circuits branch pins and type-checks the CPU build too. The vendored
+# crate's `cuda` feature is OFF unless `--features cuda` turns it on (see the `cuda` feature above),
+# so the default/CPU build gets the SimdBackend stwo with no nvcc toolchain. Making this patch
+# unconditional is what removes the manual [patch]-uncommenting gymnastics for the GPU build.
+# (The `.cu` native compile only runs under `CARGO_FEATURE_CUDA`; a CPU `cargo build` never invokes
+# nvcc. `STWO_CUDA_SKIP_BUILD=1` type-checks a `--features cuda` build without nvcc.)
